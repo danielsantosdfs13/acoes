@@ -53,6 +53,22 @@ logging.basicConfig(
 log = logging.getLogger("scraper")
 
 
+def _deployed_version() -> str:
+    """Lê o VERSION do DEPLOY-INFO que o `make release-scraper` grava na raiz
+    do diretório de deploy. Serve pro log do serviço dizer sozinho qual versão
+    está rodando — é o equivalente da tag de imagem do lado do k3s.
+
+    Ausente quando se roda direto do checkout, o que é normal e não é erro."""
+    info = Path(__file__).resolve().parent.parent / "DEPLOY-INFO"
+    try:
+        for line in info.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("VERSION="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return "desconhecida (sem DEPLOY-INFO)"
+
+
 def _headers() -> dict[str, str]:
     headers = {}
     if ACOES_API_KEY:
@@ -105,8 +121,8 @@ def _post_candles(symbol: str, timeframe: str) -> None:
 
 def main() -> None:
     log.info(
-        "Iniciando scraper MT5 — processor=%s, intervalo=%ss, timeframes=%s",
-        PROCESSOR_URL, POLL_INTERVAL_SECONDS, SCRAPER_TIMEFRAMES,
+        "Iniciando scraper MT5 — versao=%s, processor=%s, intervalo=%ss, timeframes=%s",
+        _deployed_version(), PROCESSOR_URL, POLL_INTERVAL_SECONDS, SCRAPER_TIMEFRAMES,
     )
     watchlist = _refresh_watchlist(fallback=DEFAULT_SYMBOLS.copy())
     last_refresh = time.monotonic()

@@ -1,9 +1,10 @@
 # Build + release do stack `acoes` no k3s do homelab.
 #
 # Uso:
-#   make db-init   cria role/database `daytrade` no TimescaleDB compartilhado
-#   make release   build, importa no containerd, carimba as tags no repo
-#                  homelab e publica — o ArgoCD sincroniza sozinho
+#   make db-init          cria role/database `daytrade` no TimescaleDB compartilhado
+#   make release          build, importa no containerd, carimba as tags no repo
+#                         homelab e publica — o ArgoCD sincroniza sozinho
+#   make release-scraper  copia o scraper pra VM Windows e reinicia o serviço
 #
 # Este host é o próprio node do k3s, então não há registry: imagens buildadas
 # localmente vão direto pro containerd via `k3s ctr images import`, são
@@ -26,8 +27,16 @@
 #   - build de imagem + `k3s ctr images import` — não há registry, e GitOps
 #     não builda imagem
 #   - `db-init` — cria role/database, precisa de superusuário do Postgres
+#   - `release-scraper` e os alvos `scraper-*` — o scraper roda na VM Windows
+#     porque depende do MetaTrader5, que é DLL de Windows. Não há container,
+#     logo não há imagem, logo o Argo não alcança. É o único componente
+#     entregue por PUSH (ssh/scp) em vez de pull.
 # A migration do schema NÃO roda aqui: no homelab ela é um Job com
 # `argocd.argoproj.io/hook: PreSync` e dispara sozinha a cada sync.
+#
+# `release` e `release-scraper` são deliberadamente SEPARADOS — mesmo
+# precedente de `release`/`release-vm` no platform-fcar. O deploy no cluster
+# não pode falhar porque a VM Windows estava desligada.
 
 KUBECONFIG ?= $(CURDIR)/../../homelab/k3s/kubeconfig/homelab.yaml
 export KUBECONFIG
@@ -38,6 +47,34 @@ ARGO_APP := acoes
 
 DB_NAME ?= daytrade
 DB_USER ?= daytrade
+
+# --- VM Windows do scraper (MT5) ---
+# O IP é fixo por reserva DHCP na rede `default` do libvirt (MAC
+# 52:54:00:c6:88:12 -> .50), não por config dentro do Windows. E é pela NIC2
+# que ele responde: a NIC1 é macvtap, que isola o guest do próprio host.
+VM_SSH_KEY ?= $(HOME)/ssh-winvm/id_ed25519
+VM_USER    ?= daniel
+VM_ADDR    ?= 192.168.122.50
+VM_HOST    := $(VM_USER)@$(VM_ADDR)
+VM_APP_DIR ?= C:/acoes
+VM_SERVICE ?= AcoesScraper
+
+# ConnectTimeout + BatchMode vêm do padrão de backup/scripts/backup-oracle-postgres.sh,
+# não do Makefile do fcar: lá o ssh roda pelado e trava esperando quando o
+# destino some. Com uma VM que pode estar desligada, travar é o pior caso.
+SSH_VM = ssh -i $(VM_SSH_KEY) -o ConnectTimeout=10 -o BatchMode=yes $(VM_HOST)
+SCP_VM = scp -i $(VM_SSH_KEY) -o ConnectTimeout=10 -o BatchMode=yes
+
+# Fechamento do que o scraper precisa pra rodar. `daytrade_smc.py` não importa
+# nenhum módulo de primeira parte (só stdlib + numpy/pandas), então a lista
+# para aqui — backend/ e streamlit_app.py não têm nada a ver com a VM.
+#
+# O layout de DOIS NÍVEIS é obrigatório: scraper.py faz
+# sys.path.insert(0, parent.parent) pra achar daytrade_smc. Copiar só a pasta
+# scraper/ quebra o import.
+SCRAPER_ROOT_FILES := daytrade_smc.py
+SCRAPER_SUB_FILES  := scraper/scraper.py scraper/config.py
+SCRAPER_REQS       := requirements.txt requirements-local.txt scraper/requirements.txt
 
 # Tag = sha curto do HEAD, mais `-dirty.<timestamp>` se a árvore tiver mudança
 # não commitada. `latest` não serve: com tag fixa o manifest nunca muda, o Argo
@@ -50,6 +87,13 @@ STREAMLIT_TAG ?= $(call tag_of)
 BACKEND_IMAGE := acoes-backend:$(BACKEND_TAG)
 STREAMLIT_IMAGE := acoes-streamlit:$(STREAMLIT_TAG)
 
+# O mesmo `tag_of` serve de versão do scraper — é o equivalente da tag de
+# imagem do lado do k3s, só que gravada num arquivo na VM em vez de no
+# manifest. Diferente de RELEASE_TAGS abaixo, aqui NÃO há corrida: o
+# release-scraper calcula a versão uma vez e grava, sem encadear sub-makes.
+SCRAPER_VERSION ?= $(call tag_of)
+SCRAPER_REQS_HASH := $(shell cat $(SCRAPER_REQS) | md5sum | cut -c1-32)
+
 # ⚠️ As tags são repassadas explicitamente a cada sub-make, e isso é
 # OBRIGATÓRIO. Cada `$(MAKE)` reparseia este arquivo, o que reexecuta o
 # `$(shell ...)` de `tag_of` — e o `date +%Y%m%d%H%M%S` do sufixo `-dirty`
@@ -59,14 +103,22 @@ STREAMLIT_IMAGE := acoes-streamlit:$(STREAMLIT_TAG)
 # atribuição do arquivo, então isso congela a tag pro release inteiro.
 RELEASE_TAGS = BACKEND_TAG='$(BACKEND_TAG)' STREAMLIT_TAG='$(STREAMLIT_TAG)'
 
-.PHONY: help build-backend build-streamlit import-all db-init manifests publish sync release
+.PHONY: help build-backend build-streamlit import-all db-init manifests publish sync release \
+        scraper-check scraper-push scraper-deps scraper-status release-scraper
 
 help:
-	@echo "make db-init   cria role/database '$(DB_NAME)' no timescaledb compartilhado"
-	@echo "make release   build -> import -> manifests -> publish (Argo sincroniza sozinho)"
-	@echo "make sync      força o sync agora, sem esperar o poll de 3min do Argo"
+	@echo "k3s (ArgoCD):"
+	@echo "  make db-init          cria role/database '$(DB_NAME)' no timescaledb compartilhado"
+	@echo "  make release          build -> import -> manifests -> publish (Argo sincroniza sozinho)"
+	@echo "  make sync             força o sync agora, sem esperar o poll de 3min do Argo"
+	@echo
+	@echo "VM Windows (scraper, push por ssh):"
+	@echo "  make release-scraper  copia o codigo e reinicia o servico $(VM_SERVICE)"
+	@echo "  make scraper-deps     pip install remoto (lento, so quando requirements mudam)"
+	@echo "  make scraper-status   versao implantada + estado do servico"
 	@echo
 	@echo "tags deste build:  $(BACKEND_IMAGE)  $(STREAMLIT_IMAGE)"
+	@echo "scraper:           $(SCRAPER_VERSION) -> $(VM_HOST):$(VM_APP_DIR)"
 
 build-backend:
 	docker build -t "$(BACKEND_IMAGE)" backend/
@@ -132,3 +184,83 @@ release:
 	$(MAKE) manifests $(RELEASE_TAGS)
 	$(MAKE) publish $(RELEASE_TAGS)
 	@echo ">> release publicado. O Argo sincroniza em ate 3min, ou rode 'make sync'."
+
+# ===========================================================================
+# Scraper na VM Windows — entrega por PUSH (ssh/scp), fora do ArgoCD
+# ===========================================================================
+
+# Guardas antes de qualquer coisa destrutiva. Cada falha diz o que fazer, em
+# vez de deixar o ssh/scp cuspir erro cru mais adiante.
+scraper-check:
+	@test -f "$(VM_SSH_KEY)" || { \
+		echo "ERRO: chave $(VM_SSH_KEY) nao existe."; \
+		echo "      gere com: ssh-keygen -t ed25519 -f $(VM_SSH_KEY) -C acoes-scraper -N ''"; \
+		exit 1; }
+	@$(SSH_VM) "exit" 2>/dev/null || { \
+		printf '%s\n' \
+		  "ERRO: nao consegui abrir ssh em $(VM_HOST)." \
+		  "      confira: VM ligada, OpenSSH Server habilitado, e a chave publica" \
+		  "      instalada. Se o usuario for admin, ela vai em" \
+		  '      C:\ProgramData\ssh\administrators_authorized_keys (ACL so' \
+		  "      Administrators+SYSTEM) - o ~/.ssh/authorized_keys e IGNORADO." \
+		  "      ver scraper/README.md"; \
+		exit 1; }
+	@$(SSH_VM) "echo %COMSPEC%" 2>/dev/null | grep -qi 'cmd.exe' || { \
+		printf '%s\n' \
+		  "ERRO: o shell padrao do sshd na VM nao e o cmd.exe." \
+		  "      Os alvos scraper-* usam sintaxe de cmd ('&', 'if not exist', 'type');" \
+		  "      com PowerShell como shell padrao eles quebram com erro incompreensivel." \
+		  "      Volte ao padrao removendo a chave DefaultShell:" \
+		  '        Remove-ItemProperty "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell'; \
+		exit 1; }
+	@$(SSH_VM) "nssm status $(VM_SERVICE)" >/dev/null 2>&1 || { \
+		echo "ERRO: servico $(VM_SERVICE) nao existe na VM (ou nssm nao esta no PATH)."; \
+		echo "      registre uma vez seguindo scraper/README.md"; \
+		exit 1; }
+	@echo ">> VM $(VM_HOST) ok, shell cmd, servico $(VM_SERVICE) registrado"
+
+# Para o servico antes de copiar: o scp grava arquivo a arquivo, e um
+# scraper.py novo importando um daytrade_smc.py velho pode explodir no meio do
+# loop. A parada custa nada - o scraper reenvia as ultimas TRAILING_WINDOW
+# velas a cada ciclo (ver scraper/scraper.py), entao a lacuna se fecha sozinha
+# no primeiro loop depois de voltar. E a mesma propriedade que ja cobre
+# reinicio de VM e loop perdido.
+scraper-push:
+	@echo ">> parando $(VM_SERVICE)"
+	@$(SSH_VM) "nssm stop $(VM_SERVICE)" >/dev/null 2>&1 || true
+	@$(SSH_VM) "if not exist $(subst /,\\,$(VM_APP_DIR))\\scraper mkdir $(subst /,\\,$(VM_APP_DIR))\\scraper"
+	@echo ">> copiando $(SCRAPER_ROOT_FILES) $(SCRAPER_SUB_FILES) $(SCRAPER_REQS)"
+	@$(SCP_VM) $(SCRAPER_ROOT_FILES) requirements.txt requirements-local.txt $(VM_HOST):$(VM_APP_DIR)/
+	@$(SCP_VM) $(SCRAPER_SUB_FILES) scraper/requirements.txt $(VM_HOST):$(VM_APP_DIR)/scraper/
+	@$(SSH_VM) "(echo VERSION=$(SCRAPER_VERSION)& echo REQS_HASH=$(SCRAPER_REQS_HASH)& echo DEPLOYED_AT=$$(date -Is)) > $(subst /,\\,$(VM_APP_DIR))\\DEPLOY-INFO"
+	@echo ">> subindo $(VM_SERVICE)"
+	@$(SSH_VM) "nssm start $(VM_SERVICE)" >/dev/null 2>&1 || { \
+		echo "ERRO: nao consegui iniciar $(VM_SERVICE). Rode 'make scraper-status'."; \
+		exit 1; }
+	@echo ">> scraper $(SCRAPER_VERSION) em $(VM_HOST):$(VM_APP_DIR)"
+
+# Lento (pip resolve tudo), por isso fica fora do release-scraper. Rode quando
+# o release avisar que os requirements mudaram.
+scraper-deps:
+	@echo ">> instalando dependencias na VM (pode demorar)"
+	@$(SSH_VM) "cd /d $(subst /,\\,$(VM_APP_DIR)) && python -m pip install -r requirements.txt -r requirements-local.txt -r scraper\\requirements.txt"
+	@$(SSH_VM) "(echo VERSION=$(SCRAPER_VERSION)& echo REQS_HASH=$(SCRAPER_REQS_HASH)& echo DEPLOYED_AT=$$(date -Is)) > $(subst /,\\,$(VM_APP_DIR))\\DEPLOY-INFO"
+	@echo ">> dependencias em dia (hash $(SCRAPER_REQS_HASH))"
+
+scraper-status:
+	@echo "=== servico ==="
+	@$(SSH_VM) "nssm status $(VM_SERVICE)" 2>&1 || true
+	@echo "=== versao implantada ==="
+	@$(SSH_VM) "type $(subst /,\\,$(VM_APP_DIR))\\DEPLOY-INFO" 2>&1 || echo "  (sem DEPLOY-INFO - nunca teve deploy)"
+	@echo "=== versao aqui ==="
+	@echo "  VERSION=$(SCRAPER_VERSION)"
+	@echo "  REQS_HASH=$(SCRAPER_REQS_HASH)"
+
+release-scraper:
+	@$(MAKE) --no-print-directory scraper-check
+	@REMOTE=$$($(SSH_VM) "type $(subst /,\\,$(VM_APP_DIR))\\DEPLOY-INFO" 2>/dev/null | tr -d '\r' | sed -n 's/^REQS_HASH=//p'); \
+	$(MAKE) --no-print-directory scraper-push SCRAPER_VERSION='$(SCRAPER_VERSION)'; \
+	if [ -n "$$REMOTE" ] && [ "$$REMOTE" != "$(SCRAPER_REQS_HASH)" ]; then \
+		echo ">> AVISO: os requirements mudaram desde o ultimo deploy"; \
+		echo "          ($$REMOTE -> $(SCRAPER_REQS_HASH)). Rode 'make scraper-deps'."; \
+	fi

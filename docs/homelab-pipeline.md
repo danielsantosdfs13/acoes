@@ -168,6 +168,51 @@ Role e database são criados fora do GitOps por `scripts/init-tenant-db.sh`
 (`make db-init`), porque exigem superusuário — e o `pg_hba` da instância
 bloqueia `postgres` remoto justamente pra isso não virar rotina.
 
+### Dois caminhos de entrega
+
+O `scraper` não cabe no modelo acima: ele depende do MetaTrader5, que é DLL de
+Windows, então não há imagem, não há container e o Argo não o alcança. É o
+único componente entregue por **push**.
+
+```
+                    ┌──────────────────────────────────────┐
+   make release ───▶│ docker build → k3s ctr images import │
+   (PULL, k3s)      │ sed da tag → git push (repo homelab) │
+                    └──────────────────┬───────────────────┘
+                                       │  ArgoCD faz o pull
+                                       ▼
+                          processor · api · streamlit
+
+                    ┌──────────────────────────────────────┐
+   make release-    │ scp dos arquivos → C:\acoes          │
+   scraper          │ nssm stop/start AcoesScraper         │
+   (PUSH, ssh)      └──────────────────┬───────────────────┘
+                                       │  ssh 192.168.122.50
+                                       ▼
+                             VM Windows · scraper
+```
+
+Os dois são **deliberadamente separados** — mesmo precedente de
+`release`/`release-vm` no `platform-fcar`. O deploy no cluster não pode falhar
+porque a VM Windows estava desligada.
+
+O alvo usa `BatchMode=yes` e `ConnectTimeout=10` (padrão herdado de
+`homelab/backup/scripts/backup-oracle-postgres.sh`, não do Makefile do fcar,
+que roda `ssh` pelado e trava quando o destino some). O IP `192.168.122.50` é
+fixo por **reserva DHCP na rede `default` do libvirt** (MAC
+`52:54:00:c6:88:12`), não por configuração dentro do Windows — assim a VM
+continua em DHCP e o endereço não depende de nada lá dentro.
+
+O equivalente da tag de imagem, do lado da VM, é o arquivo `C:\acoes\DEPLOY-INFO`
+(`VERSION`, `REQS_HASH`, `DEPLOYED_AT`), gravado a cada push. O `scraper.py` lê
+o `VERSION` e o loga no start, então o log do serviço diz sozinho qual versão
+está rodando. O `REQS_HASH` faz o `release-scraper` avisar quando os
+`requirements*.txt` mudaram e o `make scraper-deps` precisa rodar — em vez de
+rodar `pip` toda vez (lento) ou quebrar em silêncio.
+
+Bootstrap da VM (OpenSSH Server, chave pública, NSSM) está em
+`scraper/README.md` — é manual e roda uma vez só.
+
 ## Status da implementação
 
 **Código pronto, neste repo:**
@@ -184,19 +229,27 @@ bloqueia `postgres` remoto justamente pra isso não virar rotina.
 | Watchlist via API | `daytrade_smc.py` (`load_symbols`/`save_symbols`, `_load_symbols_api`/`_save_symbols_api`) | `GET`/`PUT /watchlist` quando `ACOES_API_URL` está configurada; cai pro arquivo local senão |
 | Streamlit | `streamlit_app.py` (injeção de `ACOES_API_URL`, `_cached_mtf_api`, `SOURCE_LABELS`) | Sidebar mostra "Homelab (API)" como 4ª opção |
 | Imagens | `backend/Dockerfile`, `Dockerfile.streamlit` | `acoes-backend` (3 entrypoints) e `acoes-streamlit` (sem driver de banco) |
-| Release | `Makefile`, `scripts/init-tenant-db.sh` | build → containerd → tag nos manifests → push |
+| Release k3s | `Makefile`, `scripts/init-tenant-db.sh` | build → containerd → tag nos manifests → push |
+| Release scraper | `Makefile` (alvos `scraper-*`) | scp pra `C:\acoes` + restart do serviço, com `DEPLOY-INFO` de versão |
 
-**Ainda depende de execução no seu ambiente:**
+**Já feito no cluster:**
 
 - [x] Rede VM Windows ↔ cluster: segunda NIC na rede `default` do libvirt
-- [ ] Provisionar a VM Windows com MT5 instalado, aberto e logado
-- [ ] `make db-init` — criar role e database `daytrade`
-- [ ] Criar e aplicar `secrets/acoes/acoes-db.enc.yaml`
-- [ ] `make release` e commitar `bootstrap/applications/acoes.yaml`
-- [ ] Adicionar os DNS e sincronizar `cloudflare-ddns` (é manual: aquele app não tem `syncPolicy`)
-- [ ] Entrada em `hosts` na VM + `PROCESSOR_URL`/`ACOES_API_KEY`
-- [ ] Instalar o scraper na VM e rodar manualmente uma vez pra validar
-- [ ] Empacotar o scraper como serviço NSSM (sobrevive a reboot)
+- [x] IP da VM fixado em `192.168.122.50` por reserva DHCP no libvirt
+- [x] `make db-init` — role e database `daytrade` criados
+- [x] `secrets/acoes/acoes-db.enc.yaml` criado (SOPS+age) e aplicado
+- [x] `make release` + `bootstrap/applications/acoes.yaml` — Application `Synced`/`Healthy`
+- [x] Migration PreSync rodou: `candles` (hypertable) + `watchlist` com 11 símbolos
+- [x] DNS de `acoes` e `acoes-api` — hoje por **Cloudflare Tunnel** (`cloudflared` como serviço systemd no host); o `cloudflare-ddns` está em `replicas: 0`
+
+**Falta, tudo do lado da VM Windows:**
+
+- [ ] MT5 instalado, aberto e logado
+- [ ] Bootstrap SSH: OpenSSH Server + chave pública (ver `scraper/README.md`)
+- [ ] Entrada em `hosts`: `192.168.122.1  acoes-processor.dondon.services`
+- [ ] Registrar o serviço NSSM `AcoesScraper` apontando pra `C:\acoes`
+- [ ] `make release-scraper` e confirmar `make scraper-status`
+- [ ] Confirmar que o serviço sobrevive a um reboot da VM
 - [ ] Testar ponta a ponta: "Homelab (API)" na sidebar e o gráfico atualizando
 
 ## Por que sem "watermark" de última vela enviada
