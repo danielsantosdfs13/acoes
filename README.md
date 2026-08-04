@@ -1,6 +1,6 @@
 # Day Trade SMC — versão web (Streamlit)
 
-## O que mudou em relação à sua versão
+## O que mudou em relação à sua versã0
 
 - `daytrade_smc.py` — **seu arquivo original, sem nenhuma alteração**. Todo o motor de análise (SMC, Price Action, Médias, VWAP, Confluência, alvos alternativos) continua exatamente como você construiu.
 - `streamlit_app.py` — **novo**. É a camada visual: importa as funções do seu arquivo e desenha um gráfico de candles real (Plotly) com EMAs, VWAP, swings e marcações de BOS/CHoCH, mais os painéis das 5 leituras.
