@@ -242,15 +242,37 @@ Bootstrap da VM (OpenSSH Server, chave pública, NSSM) está em
 - [x] Migration PreSync rodou: `candles` (hypertable) + `watchlist` com 11 símbolos
 - [x] DNS de `acoes` e `acoes-api` — hoje por **Cloudflare Tunnel** (`cloudflared` como serviço systemd no host); o `cloudflare-ddns` está em `replicas: 0`
 
-**Falta, tudo do lado da VM Windows:**
+**Já feito na VM Windows:**
 
-- [ ] MT5 instalado, aberto e logado
-- [ ] Bootstrap SSH: OpenSSH Server + chave pública (ver `scraper/README.md`)
-- [ ] Entrada em `hosts`: `192.168.122.1  acoes-processor.dondon.services`
-- [ ] Registrar o serviço NSSM `AcoesScraper` apontando pra `C:\acoes`
-- [ ] `make release-scraper` e confirmar `make scraper-status`
+- [x] MT5 instalado, aberto e logado (`C:\Program Files\Clear Investimentos MT5 Terminal\`)
+- [x] Bootstrap SSH: OpenSSH Server + chave em `administrators_authorized_keys`, conta `admin`
+- [x] Entrada em `hosts`: `192.168.122.1  acoes-processor.dondon.services`
+- [x] `make scraper-files` + `make scraper-deps` — código e dependências em `C:\acoes`
+- [x] **Pipeline validado ponta a ponta**: scraper → processor → TimescaleDB → api
+
+**Falta:**
+
+- [ ] Instalar o NSSM na VM (e deixá-lo no `PATH`) e registrar o `AcoesScraper`
 - [ ] Confirmar que o serviço sobrevive a um reboot da VM
-- [ ] Testar ponta a ponta: "Homelab (API)" na sidebar e o gráfico atualizando
+- [ ] Conferir "Homelab (API)" na sidebar do Streamlit com o gráfico atualizando
+
+Enquanto o serviço não existe, o scraper só roda à mão
+(`python scraper\scraper.py` em `C:\acoes`) e o `make scraper-check` falha na
+última guarda, de propósito.
+
+### Detalhes descobertos na VM
+
+- A conta do SSH precisa estar no grupo **Administradores** — só assim o sshd
+  lê o `administrators_authorized_keys`. Aqui é a `admin`; `daniel` não existe
+  e o `Administrador` embutido está desabilitado.
+- **`BRA50` não existe na corretora** (Clear Investimentos) e gera warning a
+  cada ciclo. Os outros 10 ativos do seed funcionam. Vale removê-lo da
+  watchlist pela sidebar, ou trocar pelo código correto do índice.
+- Python 3.14 na VM, com wheel de `MetaTrader5 5.0.6090` disponível — não foi
+  preciso rebaixar a versão.
+- O `requirements.txt` arrasta `streamlit`, `plotly` e `yfinance` pra VM, que o
+  scraper nunca usa. Funciona, mas é peso morto; separar um
+  `requirements-scraper.txt` é uma limpeza possível, não feita ainda.
 
 ## Por que sem "watermark" de última vela enviada
 

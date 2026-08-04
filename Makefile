@@ -53,7 +53,11 @@ DB_USER ?= daytrade
 # 52:54:00:c6:88:12 -> .50), não por config dentro do Windows. E é pela NIC2
 # que ele responde: a NIC1 é macvtap, que isola o guest do próprio host.
 VM_SSH_KEY ?= $(HOME)/ssh-winvm/id_ed25519
-VM_USER    ?= daniel
+# `admin`, não `daniel`: é a conta que existe na VM e está no grupo
+# Administradores — o que importa porque só para membros desse grupo o sshd lê
+# C:\ProgramData\ssh\administrators_authorized_keys. Para os demais ele iria em
+# C:\Users\<conta>\.ssh\authorized_keys e ignoraria a chave instalada lá.
+VM_USER    ?= admin
 VM_ADDR    ?= 192.168.122.50
 VM_HOST    := $(VM_USER)@$(VM_ADDR)
 VM_APP_DIR ?= C:/acoes
@@ -104,7 +108,7 @@ SCRAPER_REQS_HASH := $(shell cat $(SCRAPER_REQS) | md5sum | cut -c1-32)
 RELEASE_TAGS = BACKEND_TAG='$(BACKEND_TAG)' STREAMLIT_TAG='$(STREAMLIT_TAG)'
 
 .PHONY: help build-backend build-streamlit import-all db-init manifests publish sync release \
-        scraper-check scraper-push scraper-deps scraper-status release-scraper
+        scraper-check scraper-files scraper-push scraper-deps scraper-status release-scraper
 
 help:
 	@echo "k3s (ArgoCD):"
@@ -114,6 +118,7 @@ help:
 	@echo
 	@echo "VM Windows (scraper, push por ssh):"
 	@echo "  make release-scraper  copia o codigo e reinicia o servico $(VM_SERVICE)"
+	@echo "  make scraper-files    so copia, sem mexer no servico (use no 1o deploy)"
 	@echo "  make scraper-deps     pip install remoto (lento, so quando requirements mudam)"
 	@echo "  make scraper-status   versao implantada + estado do servico"
 	@echo
@@ -225,14 +230,24 @@ scraper-check:
 # velas a cada ciclo (ver scraper/scraper.py), entao a lacuna se fecha sozinha
 # no primeiro loop depois de voltar. E a mesma propriedade que ja cobre
 # reinicio de VM e loop perdido.
-scraper-push:
-	@echo ">> parando $(VM_SERVICE)"
-	@$(SSH_VM) "nssm stop $(VM_SERVICE)" >/dev/null 2>&1 || true
+# Só a cópia, sem tocar no serviço. Existe pro primeiro deploy: o NSSM precisa
+# apontar pra um scraper.py que ainda não está lá, e o `scraper-check` exige o
+# serviço registrado — sem este alvo, os dois ficariam se esperando.
+#   1. make scraper-files      <- arquivos chegam em C:\acoes
+#   2. registra o NSSM na VM   <- ver scraper/README.md
+#   3. make release-scraper    <- daqui em diante, o fluxo normal
+scraper-files:
 	@$(SSH_VM) "if not exist $(subst /,\\,$(VM_APP_DIR))\\scraper mkdir $(subst /,\\,$(VM_APP_DIR))\\scraper"
 	@echo ">> copiando $(SCRAPER_ROOT_FILES) $(SCRAPER_SUB_FILES) $(SCRAPER_REQS)"
 	@$(SCP_VM) $(SCRAPER_ROOT_FILES) requirements.txt requirements-local.txt $(VM_HOST):$(VM_APP_DIR)/
 	@$(SCP_VM) $(SCRAPER_SUB_FILES) scraper/requirements.txt $(VM_HOST):$(VM_APP_DIR)/scraper/
 	@$(SSH_VM) "(echo VERSION=$(SCRAPER_VERSION)& echo REQS_HASH=$(SCRAPER_REQS_HASH)& echo DEPLOYED_AT=$$(date -Is)) > $(subst /,\\,$(VM_APP_DIR))\\DEPLOY-INFO"
+	@echo ">> arquivos em $(VM_HOST):$(VM_APP_DIR) (versao $(SCRAPER_VERSION))"
+
+scraper-push:
+	@echo ">> parando $(VM_SERVICE)"
+	@$(SSH_VM) "nssm stop $(VM_SERVICE)" >/dev/null 2>&1 || true
+	@$(MAKE) --no-print-directory scraper-files SCRAPER_VERSION='$(SCRAPER_VERSION)'
 	@echo ">> subindo $(VM_SERVICE)"
 	@$(SSH_VM) "nssm start $(VM_SERVICE)" >/dev/null 2>&1 || { \
 		echo "ERRO: nao consegui iniciar $(VM_SERVICE). Rode 'make scraper-status'."; \

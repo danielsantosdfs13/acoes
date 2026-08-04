@@ -133,11 +133,41 @@ pip install -r C:\acoes\scraper\requirements.txt
 
 Depois do bootstrap isso vira `make scraper-deps`, rodado do host.
 
-### 4. Registrar o serviço (ver seção NSSM abaixo)
+### 4. Primeiro deploy e registro do serviço
 
-Registre **antes** do primeiro `make release-scraper` — o `scraper-check` exige
-que o serviço exista. O NSSM aceita registrar apontando pra um caminho que
-ainda não tem arquivo; o primeiro `release-scraper` preenche e dá start.
+Nesta ordem, porque o `scraper-check` exige o serviço registrado e o serviço
+aponta pra arquivos que ainda não estão lá:
+
+```bash
+make scraper-files    # so copia, nao mexe em servico nenhum
+make scraper-deps     # instala as dependencias na VM
+```
+
+Depois registre o NSSM (seção abaixo) e, daí em diante, o fluxo normal é
+`make release-scraper`.
+
+### Conta usada pelo SSH
+
+Tem que ser uma conta **no grupo Administradores** — só para membros desse
+grupo o sshd lê o `administrators_authorized_keys`. Nesta VM é a `admin`
+(`VM_USER` no `Makefile`). Confira com:
+
+```powershell
+whoami
+net localgroup Administradores
+```
+
+O `Administrador` embutido não serve: vem desabilitado de fábrica, e o sintoma
+é a conexão ser **resetada antes** de negociar autenticação — diferente do
+`Permission denied` que uma conta válida sem chave produz.
+
+Se der `Permission denied`, o Event Log diz o motivo exato:
+
+```powershell
+Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 15 | Format-List TimeCreated,Message
+```
+
+`Invalid user X` significa que a conta não existe — não é problema de chave.
 
 ## Configuração
 
