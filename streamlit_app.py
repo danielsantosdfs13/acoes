@@ -62,15 +62,19 @@ except Exception:
     daytrade_smc.GITHUB_BRIDGE_REPO = None
     daytrade_smc.GITHUB_BRIDGE_TOKEN = None
 
-# Configura o banco do homelab (Postgres/TimescaleDB alimentado pelo
-# coletor MT5 contínuo). O fallback em variável de ambiente existe porque
-# o container Docker do homelab não popula st.secrets a menos que monte um
-# secrets.toml — sem nenhum dos dois configurado, a fonte "Homelab
-# (Postgres)" dá erro claro em vez de travar, mesmo padrão da ponte GitHub.
+# Configura a API do homelab (serviço `api`, que serve o TimescaleDB
+# alimentado pelo acoes-scraper). O fallback em variável de ambiente existe
+# porque o container no k3s não popula st.secrets a menos que monte um
+# secrets.toml — sem nenhum dos dois configurado, a fonte "Homelab (API)"
+# dá erro claro em vez de travar, mesmo padrão da ponte GitHub.
+#
+# Note que aqui não há mais DSN nenhum: este processo não fala SQL, só HTTP.
 try:
-    daytrade_smc.HOMELAB_DB_DSN = st.secrets.get("homelab_db_dsn") or os.environ.get("HOMELAB_DB_DSN")
+    daytrade_smc.ACOES_API_URL = st.secrets.get("acoes_api_url") or os.environ.get("ACOES_API_URL")
+    daytrade_smc.ACOES_API_KEY = st.secrets.get("acoes_api_key") or os.environ.get("ACOES_API_KEY")
 except Exception:
-    daytrade_smc.HOMELAB_DB_DSN = os.environ.get("HOMELAB_DB_DSN")
+    daytrade_smc.ACOES_API_URL = os.environ.get("ACOES_API_URL")
+    daytrade_smc.ACOES_API_KEY = os.environ.get("ACOES_API_KEY")
 
 STYLES = {
     "Day Trade": {
@@ -97,7 +101,7 @@ SOURCE_LABELS = {
     "Yahoo Finance": "Yahoo Finance (atraso ~15-20min)",
     "MetaTrader 5": "MT5 (tempo real)",
     "GitHub (MT5 de casa)": "GitHub (MT5 de casa)",
-    "Homelab (Postgres)": "Homelab (Postgres, quase em tempo real)",
+    "Homelab (API)": "Homelab (API, quase em tempo real)",
 }
 
 
@@ -123,23 +127,23 @@ def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], c
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def _cached_mtf_homelab(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
+def _cached_mtf_api(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
     counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Homelab (Postgres)")
+    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Homelab (API)")
 
 
 def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str):
     """
     Cacheia o pacote de timeframes. Yahoo Finance usa 60s de cache (tem
-    rate limit); MetaTrader 5 direto e Homelab (Postgres) usam 3s (dado
+    rate limit); MetaTrader 5 direto e Homelab (API) usam 3s (dado
     quase em tempo real nos dois casos); GitHub (MT5 de casa) usa 10s (só
     muda quando você clica em "Atualizar via MT5", então não precisa ser
     tão curto). Funções fixas em vez de decoradas dinamicamente, pelo
     mesmo motivo dos fragmentos de auto-refresh: evita o bug de identidade
     de widget no React já corrigido antes neste projeto.
     """
-    if source == "Homelab (Postgres)":
-        return _cached_mtf_homelab(symbol, count, confirmation, context, modality)
+    if source == "Homelab (API)":
+        return _cached_mtf_api(symbol, count, confirmation, context, modality)
     if source == "MetaTrader 5":
         return _cached_mtf_mt5(symbol, count, confirmation, context, modality)
     if source == "GitHub (MT5 de casa)":
@@ -678,8 +682,8 @@ with st.sidebar:
              "direto é tempo real, mas só funciona rodando este app na máquina com o MT5 aberto. "
              "\"GitHub (MT5 de casa)\" funciona de qualquer lugar (inclusive do trabalho) e busca "
              "dado real do MT5, mas só atualiza quando você clicar em \"Atualizar via MT5\". "
-             "\"Homelab (Postgres)\" lê candles persistidos por um coletor MT5 rodando "
-             "continuamente numa VM do homelab — dado real, quase em tempo real.",
+             "\"Homelab (API)\" lê candles pela API do homelab, alimentada por um scraper "
+             "MT5 rodando continuamente numa VM — dado real, quase em tempo real.",
     )
     if source == "MetaTrader 5":
         st.caption(
@@ -687,11 +691,11 @@ with st.sidebar:
             "vendo isso no Streamlit Cloud, vai dar erro de conexão — o servidor da nuvem não "
             "tem o MT5 instalado. Veja o README pra rodar local e acessar remoto."
         )
-    elif source == "Homelab (Postgres)":
+    elif source == "Homelab (API)":
         st.caption(
-            "🏠 Lê candles do Postgres do homelab, alimentado por um coletor MT5 contínuo "
-            "numa VM. Requer HOMELAB_DB_DSN configurado (st.secrets ou variável de ambiente) "
-            "e o coletor rodando — veja `collector/README.md`."
+            "🏠 Lê candles pela API do homelab, alimentada por um scraper MT5 contínuo "
+            "numa VM. Requer ACOES_API_URL configurada (st.secrets ou variável de ambiente) "
+            "e o scraper rodando — veja `scraper/README.md`."
         )
     elif source == "GitHub (MT5 de casa)":
         last_update = fetch_snapshot_timestamp()

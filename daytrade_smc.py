@@ -261,7 +261,7 @@ def _resample_to_h4(df_h1: pd.DataFrame) -> pd.DataFrame:
     return resampled.tz_convert("UTC")
 
 
-DATA_SOURCES = ("Yahoo Finance", "MetaTrader 5", "GitHub (MT5 de casa)", "Homelab (Postgres)")
+DATA_SOURCES = ("Yahoo Finance", "MetaTrader 5", "GitHub (MT5 de casa)", "Homelab (API)")
 
 # Configuração da ponte GitHub — definida pelo app (a partir de
 # st.secrets) antes de qualquer chamada com source="GitHub (MT5 de casa)".
@@ -270,11 +270,20 @@ DATA_SOURCES = ("Yahoo Finance", "MetaTrader 5", "GitHub (MT5 de casa)", "Homela
 GITHUB_BRIDGE_REPO: str | None = None
 GITHUB_BRIDGE_TOKEN: str | None = None
 
-# Configuração do banco do homelab (Postgres/TimescaleDB alimentado pelo
-# coletor MT5 contínuo) — definida pelo app a partir de st.secrets/env
-# antes de qualquer chamada com source="Homelab (Postgres)". Mesmo padrão
-# de globals de módulo usado pela ponte GitHub acima.
-HOMELAB_DB_DSN: str | None = None
+# Configuração da API do homelab (serviço `api`, que lê o TimescaleDB
+# alimentado pelo `acoes-scraper`) — definida pelo app a partir de
+# st.secrets/env antes de qualquer chamada com source="Homelab (API)".
+# Mesmo padrão de globals de módulo usado pela ponte GitHub acima.
+#
+# Até 2026-08 este módulo falava SQL direto com o Postgres. Passar por HTTP
+# tirou a credencial de banco de todo cliente que não seja o backend, e deu
+# um caminho de leitura único pro Streamlit e pra qualquer outro consumidor.
+ACOES_API_URL: str | None = None
+ACOES_API_KEY: str | None = None
+
+# Timeout de todas as chamadas à API. Curto de propósito: o Streamlit chama
+# isso de dentro de um rerun, e travar a UI é pior que dar erro.
+_API_TIMEOUT_SECONDS = 10
 
 _MT5_TIMEFRAME_MAP_NAMES = {"M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4", "D1": "TIMEFRAME_D1", "W1": "TIMEFRAME_W1"}
 
@@ -288,9 +297,10 @@ def fetch_ohlcv(symbol: str, timeframe: str, count: int, source: str = "Yahoo Fi
       - "GitHub (MT5 de casa)": lê o snapshot mais recente publicado no GitHub por
         `mt5_bridge/update_data.py` — dado real do MT5, mas atualizado só quando você
         pedir (botão "Atualizar via MT5" no app), não em tempo real contínuo.
-      - "Homelab (Postgres)": lê candles persistidos no Postgres/TimescaleDB por um
-        coletor MT5 rodando continuamente numa VM do homelab — dado real, quase em
-        tempo real (poucos segundos de atraso), sem depender do GitHub Actions.
+      - "Homelab (API)": lê candles pela API do homelab (`GET /candles`), que serve
+        o que o `acoes-scraper` persistiu no TimescaleDB rodando continuamente numa
+        VM — dado real, quase em tempo real (poucos segundos de atraso), sem
+        depender do GitHub Actions e sem credencial de banco no cliente.
     """
     if timeframe == "H4" and source == "Yahoo Finance":
         # busca H1 com folga (4x) pra ter candles de H1 suficientes antes de agregar
@@ -306,38 +316,53 @@ def fetch_ohlcv(symbol: str, timeframe: str, count: int, source: str = "Yahoo Fi
     if source == "GitHub (MT5 de casa)":
         return _fetch_ohlcv_github(symbol, timeframe, count)
 
-    if source == "Homelab (Postgres)":
-        return _fetch_ohlcv_homelab(symbol, timeframe, count)
+    if source == "Homelab (API)":
+        return _fetch_ohlcv_api(symbol, timeframe, count)
 
     return _fetch_ohlcv_yahoo(symbol, timeframe, count)
 
 
-def _fetch_ohlcv_homelab(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
-    """Lê candles persistidos no Postgres/TimescaleDB pelo coletor MT5 contínuo do homelab."""
-    import psycopg  # import tardio — mesma convenção de _fetch_ohlcv_mt5/_fetch_ohlcv_github
-
-    if not HOMELAB_DB_DSN:
+def _api_base_url() -> str:
+    """URL da API do homelab, ou erro claro em vez de travar."""
+    if not ACOES_API_URL:
         raise RuntimeError(
-            "Banco do homelab não configurado (HOMELAB_DB_DSN). Configure em "
-            "st.secrets['homelab_db_dsn'] ou na variável de ambiente HOMELAB_DB_DSN."
+            "API do homelab não configurada (ACOES_API_URL). Configure em "
+            "st.secrets['acoes_api_url'] ou na variável de ambiente ACOES_API_URL."
         )
+    return ACOES_API_URL.rstrip("/")
 
-    query = """
-        SELECT time, open, high, low, close, volume
-        FROM candles
-        WHERE symbol = %(symbol)s AND timeframe = %(timeframe)s
-        ORDER BY time DESC
-        LIMIT %(count)s
-    """
+
+def _api_headers() -> dict[str, str]:
+    """A chave só é necessária nas rotas de escrita, mas mandar sempre é
+    inofensivo e evita ter dois caminhos de montagem de header."""
+    return {"X-API-Key": ACOES_API_KEY} if ACOES_API_KEY else {}
+
+
+def _fetch_ohlcv_api(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+    """Lê candles pela API do homelab (`GET /candles`), que serve o que o
+    `acoes-scraper` persistiu no TimescaleDB."""
+    import requests  # import tardio — mesma convenção de _fetch_ohlcv_mt5/_fetch_ohlcv_github
+
     try:
-        with psycopg.connect(HOMELAB_DB_DSN, connect_timeout=10) as conn:
-            df = pd.read_sql(query, conn, params={"symbol": symbol, "timeframe": timeframe, "count": count})
+        response = requests.get(
+            f"{_api_base_url()}/candles",
+            params={"symbol": symbol, "timeframe": timeframe, "count": count},
+            headers=_api_headers(),
+            timeout=_API_TIMEOUT_SECONDS,
+        )
+        if response.status_code == 404:
+            raise RuntimeError(f"Sem candles na API do homelab para {symbol} em {timeframe}.")
+        response.raise_for_status()
+        candles = response.json().get("candles", [])
+    except RuntimeError:
+        raise
     except Exception as exc:
-        raise RuntimeError(f"Falha ao consultar o banco do homelab: {exc}") from exc
+        raise RuntimeError(f"Falha ao consultar a API do homelab: {exc}") from exc
 
-    if df.empty:
-        raise RuntimeError(f"Sem candles no banco do homelab para {symbol} em {timeframe}.")
+    if not candles:
+        raise RuntimeError(f"Sem candles na API do homelab para {symbol} em {timeframe}.")
 
+    df = pd.DataFrame(candles)
     df["time"] = pd.to_datetime(df["time"], utc=True)
     df = df.set_index("time").sort_index()
     return df[["open", "high", "low", "close", "volume"]].tail(count)
@@ -1975,57 +2000,55 @@ def _save_symbols_file(symbols: list[str]) -> None:
     )
 
 
-def _load_symbols_db(dsn: str) -> list[str]:
-    import psycopg
+def _load_symbols_api() -> list[str]:
+    import requests
 
-    with psycopg.connect(dsn, connect_timeout=10) as conn, conn.cursor() as cur:
-        cur.execute("SELECT symbol FROM watchlist WHERE active ORDER BY symbol")
-        return [row[0] for row in cur.fetchall()]
+    response = requests.get(
+        f"{_api_base_url()}/watchlist", headers=_api_headers(), timeout=_API_TIMEOUT_SECONDS
+    )
+    response.raise_for_status()
+    return response.json().get("symbols", [])
 
 
-def _save_symbols_db(dsn: str, symbols: list[str]) -> None:
-    import psycopg
+def _save_symbols_api(symbols: list[str]) -> None:
+    import requests
 
-    with psycopg.connect(dsn, connect_timeout=10) as conn, conn.cursor() as cur:
-        # Sincronização completa, na mesma semântica "sobrescreve tudo de
-        # uma vez" do arquivo local: desativa quem não está mais na lista,
-        # (re)ativa quem está.
-        cur.execute("UPDATE watchlist SET active = false")
-        for symbol in symbols:
-            cur.execute(
-                """
-                INSERT INTO watchlist (symbol, active) VALUES (%s, true)
-                ON CONFLICT (symbol) DO UPDATE SET active = true
-                """,
-                (symbol,),
-            )
-        conn.commit()
+    # PUT (não POST) porque a semântica aqui é "sobrescreve tudo de uma
+    # vez", igual à do arquivo local: o servidor desativa quem saiu e
+    # (re)ativa quem está na lista, tudo numa transação só.
+    response = requests.put(
+        f"{_api_base_url()}/watchlist",
+        json={"symbols": symbols},
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
 
 
 def load_symbols() -> list[str]:
-    """Lê a watchlist do Postgres do homelab quando configurado
-    (HOMELAB_DB_DSN), com fallback pro arquivo local `daytrade_symbols.json`
-    — usado pelo Tkinter, pelo CLI, e por qualquer deploy que não use o
-    homelab (ex: Streamlit Cloud com Yahoo Finance)."""
-    if HOMELAB_DB_DSN:
+    """Lê a watchlist da API do homelab quando configurada (ACOES_API_URL),
+    com fallback pro arquivo local `daytrade_symbols.json` — usado pelo
+    Tkinter, pelo CLI, e por qualquer deploy que não use o homelab (ex:
+    Streamlit Cloud com Yahoo Finance)."""
+    if ACOES_API_URL:
         try:
-            symbols = _load_symbols_db(HOMELAB_DB_DSN)
+            symbols = _load_symbols_api()
             if symbols:
                 return symbols
         except Exception:
-            pass  # banco indisponível — cai pro arquivo local
+            pass  # API indisponível — cai pro arquivo local
     return _load_symbols_file()
 
 
 def save_symbols(symbols: list[str]) -> None:
-    """Espelho de `load_symbols`: grava no Postgres do homelab quando
-    configurado, com fallback pro arquivo local."""
-    if HOMELAB_DB_DSN:
+    """Espelho de `load_symbols`: grava pela API do homelab quando
+    configurada, com fallback pro arquivo local."""
+    if ACOES_API_URL:
         try:
-            _save_symbols_db(HOMELAB_DB_DSN, symbols)
+            _save_symbols_api(symbols)
             return
         except Exception:
-            pass  # banco indisponível — cai pro arquivo local
+            pass  # API indisponível — cai pro arquivo local
     _save_symbols_file(symbols)
 
 

@@ -1,12 +1,15 @@
-"""Configuração do coletor, via variáveis de ambiente. Nenhuma delas tem
-acesso a credencial de banco — o coletor só fala com o processor via HTTP."""
+"""Configuração do scraper, via variáveis de ambiente. Nenhuma delas tem
+acesso a credencial de banco — o scraper só fala com o processor via HTTP."""
 
 from __future__ import annotations
 
 import os
 
+# No homelab: https://acoes-processor.dondon.services, resolvido pelo
+# arquivo hosts da VM para 192.168.122.1 (a NIC da VM na rede do libvirt).
+# Ver scraper/README.md e docs/homelab-pipeline.md.
 PROCESSOR_URL = os.environ.get("PROCESSOR_URL", "http://localhost:8000").rstrip("/")
-PROCESSOR_API_KEY = os.environ.get("PROCESSOR_API_KEY") or None
+ACOES_API_KEY = os.environ.get("ACOES_API_KEY") or None
 
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 WATCHLIST_REFRESH_SECONDS = float(os.environ.get("WATCHLIST_REFRESH_SECONDS", "60"))
@@ -15,13 +18,13 @@ WATCHLIST_REFRESH_SECONDS = float(os.environ.get("WATCHLIST_REFRESH_SECONDS", "6
 # custo extra incluir aqui. W1 fica de fora do loop de tempo real por não
 # fazer sentido reenviar a cada poucos segundos; pode ser adicionado se
 # algum dia for necessário.
-COLLECTOR_TIMEFRAMES = tuple(
-    tf.strip() for tf in os.environ.get("COLLECTOR_TIMEFRAMES", "M15,H1,H4,D1").split(",") if tf.strip()
+SCRAPER_TIMEFRAMES = tuple(
+    tf.strip() for tf in os.environ.get("SCRAPER_TIMEFRAMES", "M15,H1,H4,D1").split(",") if tf.strip()
 )
 
 # Quantas velas (mais recentes) reenviar a cada loop, por symbol/timeframe.
 # Cobre reinícios, loops perdidos e a vela em formação (que muda de OHLC a
-# cada tick até fechar) — ver collector.py para o raciocínio completo.
+# cada tick até fechar) — ver scraper.py para o raciocínio completo.
 TRAILING_WINDOW = int(os.environ.get("TRAILING_WINDOW", "10"))
 
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10"))

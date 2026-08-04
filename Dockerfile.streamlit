@@ -1,0 +1,22 @@
+# Imagem `acoes-streamlit`. Build a partir da RAIZ do repo:
+#   docker build -f Dockerfile.streamlit -t acoes-streamlit:<tag> .
+#
+# Só o requirements.txt: nem requirements-local.txt (MetaTrader5 é DLL de
+# Windows e quebraria o build aqui), nem driver de Postgres. O app fala com
+# o banco exclusivamente através do serviço `api` via HTTP — a ausência de
+# psycopg nesta imagem é a prova de que esse acoplamento não voltou.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY daytrade_smc.py streamlit_app.py ./
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "streamlit_app.py", \
+     "--server.address=0.0.0.0", \
+     "--server.port=8501", \
+     "--server.headless=true"]

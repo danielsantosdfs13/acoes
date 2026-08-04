@@ -1,5 +1,5 @@
 """
-collector/collector.py
+scraper/scraper.py
 
 Roda continuamente na VM Windows onde o terminal MetaTrader 5 está aberto
 e logado. A cada `POLL_INTERVAL_SECONDS`, busca as últimas velas de cada
@@ -19,7 +19,7 @@ contra reinícios, loops perdidos e o problema da vela em formação, sem
 nenhum estado local pra persistir ou corromper.
 
 Uso:
-    python collector.py
+    python scraper.py
 
 Ver README.md deste diretório para rodar como serviço Windows via NSSM.
 """
@@ -37,11 +37,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from daytrade_smc import DEFAULT_SYMBOLS, fetch_ohlcv  # noqa: E402
 
 from config import (  # noqa: E402
-    COLLECTOR_TIMEFRAMES,
+    ACOES_API_KEY,
     POLL_INTERVAL_SECONDS,
-    PROCESSOR_API_KEY,
     PROCESSOR_URL,
     REQUEST_TIMEOUT_SECONDS,
+    SCRAPER_TIMEFRAMES,
     TRAILING_WINDOW,
     WATCHLIST_REFRESH_SECONDS,
 )
@@ -50,13 +50,13 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("collector")
+log = logging.getLogger("scraper")
 
 
 def _headers() -> dict[str, str]:
     headers = {}
-    if PROCESSOR_API_KEY:
-        headers["X-API-Key"] = PROCESSOR_API_KEY
+    if ACOES_API_KEY:
+        headers["X-API-Key"] = ACOES_API_KEY
     return headers
 
 
@@ -105,8 +105,8 @@ def _post_candles(symbol: str, timeframe: str) -> None:
 
 def main() -> None:
     log.info(
-        "Iniciando coletor MT5 — processor=%s, intervalo=%ss, timeframes=%s",
-        PROCESSOR_URL, POLL_INTERVAL_SECONDS, COLLECTOR_TIMEFRAMES,
+        "Iniciando scraper MT5 — processor=%s, intervalo=%ss, timeframes=%s",
+        PROCESSOR_URL, POLL_INTERVAL_SECONDS, SCRAPER_TIMEFRAMES,
     )
     watchlist = _refresh_watchlist(fallback=DEFAULT_SYMBOLS.copy())
     last_refresh = time.monotonic()
@@ -117,7 +117,7 @@ def main() -> None:
             last_refresh = time.monotonic()
 
         for symbol in watchlist:
-            for timeframe in COLLECTOR_TIMEFRAMES:
+            for timeframe in SCRAPER_TIMEFRAMES:
                 _post_candles(symbol, timeframe)
 
         time.sleep(POLL_INTERVAL_SECONDS)

@@ -1,9 +1,9 @@
-# Dependências do coletor, além do requirements.txt + requirements-local.txt
+# Dependências do scraper, além do requirements.txt + requirements-local.txt
 # (MetaTrader5) já documentados na raiz do repo pro modo "MetaTrader 5"
 # local. Instale os três nesta VM Windows:
 #
 #   pip install -r requirements.txt
 #   pip install -r requirements-local.txt
-#   pip install -r collector/requirements.txt
+#   pip install -r scraper/requirements.txt
 #
 requests>=2.31

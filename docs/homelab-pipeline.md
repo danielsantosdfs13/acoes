@@ -1,17 +1,17 @@
 # Pipeline de dados MT5 no homelab
 
 Este documento formaliza a arquitetura da 4ª fonte de dados do "Day Trade
-SMC": um coletor MT5 rodando continuamente numa VM Windows do homelab,
-alimentando um banco Postgres/TimescaleDB via um serviço processor, que o
-app de análise (rodando também no homelab) consome diretamente via SQL.
+SMC": um scraper MT5 rodando continuamente numa VM Windows, alimentando o
+TimescaleDB compartilhado do homelab através de um serviço `processor`, e
+uma `api` de leitura que serve o app de análise e qualquer outro consumidor.
 
 Serve como referência de continuidade — o que já foi implementado no
-código, o que ainda depende de infraestrutura real (VM, Docker, rede) pra
-funcionar de ponta a ponta, e as decisões de design por trás de cada peça.
+código, o que ainda depende de execução no seu ambiente, e as decisões de
+design por trás de cada peça.
 
 ## Por que isso existe
 
-As três fontes de dados originais (`daytrade_smc.py:264`, `DATA_SOURCES`)
+As três fontes de dados originais (`daytrade_smc.py`, `DATA_SOURCES`)
 tinham uma lacuna: "Yahoo Finance" funciona em qualquer lugar mas com
 15-20min de atraso; "MetaTrader 5" direto é tempo real mas só rodando na
 mesma máquina do terminal; "GitHub (MT5 de casa)" tentava ser uma ponte
@@ -20,115 +20,234 @@ pra usar dado real do MT5 a partir da nuvem, mas nunca foi terminada
 `.github/workflows/mt5-update.yml` espera, nunca existiram no repo) — e,
 mesmo terminada, seria só sob demanda (botão), não contínua.
 
-Com um homelab disponível, a solução deixa de depender do GitHub Actions
-e passa a ser uma pipeline própria: VM Windows com MT5 aberto → coletor →
-processor (HTTP) → Postgres/TimescaleDB → app (SQL direto).
+Com um homelab disponível, a solução deixa de depender do GitHub Actions e
+passa a ser uma pipeline própria: VM Windows com MT5 aberto → scraper →
+processor (HTTP) → TimescaleDB → api (HTTP) → app.
 
 ## Decisões de arquitetura (já tomadas, não reabrir sem motivo novo)
 
 | Decisão | Escolha | Por quê |
 |---|---|---|
-| Banco | PostgreSQL + TimescaleDB | Hypertable dá partição/retenção de série temporal de graça; SQL direto é trivial de consumir com `pandas.read_sql`. |
-| Transporte coletor → processor | HTTP (sem fila) | Volume de dados é pequeno (poucas linhas por POST, LAN); fila adicionaria um componente de infra sem ganho real aqui. |
-| Onde o app roda | No homelab, acesso remoto via Tailscale | Mesma rede do banco → SQL direto, sem expor banco pra internet. Reaproveita o padrão de Tailscale já documentado no README pro modo MT5 direto. |
-| Cadência do coletor | Loop contínuo (poucos segundos) | Sensação de tempo quase real, no mesmo nível do modo MT5 direto local (que já roda a cada ~3s). |
-| Credencial de banco | Só o processor e o app têm; o coletor nunca tem | O coletor (VM Windows, mais exposta por rodar o MT5) fala só HTTP com o processor — reduz superfície de risco. |
+| Banco | TimescaleDB **compartilhado** do cluster (`default/timescaledb`), database `daytrade` | Já existe, já tem backup e volume. Subir um Postgres próprio seria um segundo banco pra operar sem ganho nenhum. Isolamento é por database + role dedicada, mesmo padrão do fcar. |
+| Transporte scraper → processor | HTTP (sem fila) | Volume pequeno (poucas linhas por POST); fila adicionaria infra sem ganho real. |
+| Leitura | Só via serviço `api` | Nenhum cliente fora do backend tem credencial de banco. Antes o Streamlit falava SQL direto; passar por HTTP tirou o acoplamento e deu um caminho único e reutilizável de leitura. |
+| Separação processor / api | Dois Deployments, **mesma imagem**, `command:` diferente | Escrita e leitura têm exposições diferentes: o processor não precisa (nem tem) DNS público. Compartilham `db.py`/`models.py`, então não há duplicação. Mesmo padrão do fcar (`fcar-backend` roda server, domain-reconciler e migrate). |
+| Onde o app roda | No k3s do homelab, publicado em `acoes.dondon.services` | Mesmo cluster do banco, entregue por ArgoCD junto com o resto. |
+| Cadência do scraper | Loop contínuo (poucos segundos) | Sensação de tempo quase real, no mesmo nível do modo MT5 direto local. |
+| Credencial de banco | Só `processor`, `api` e o Job de migration têm | O scraper (VM Windows, mais exposta) e o Streamlit falam só HTTP — reduz superfície de risco. |
 | Ponte GitHub existente | Mantida, intocada, dormente | Superseded em intenção por este pipeline, mas remoção é decisão separada, não tomada ainda. |
 
 ## Arquitetura
 
 ```
-VM Windows (MT5 aberto)                         Homelab (Docker)
-┌───────────────────────────┐   HTTP POST      ┌──────────────────────────┐
-│ collector/collector.py     │ ──/candles────▶  │ processor/ (FastAPI)     │
-│ (loop contínuo, serviço    │ ◀──/watchlist──  │                          │
-│ via NSSM)                  │   HTTP GET       └───────────┬──────────────┘
-└───────────────────────────┘                               │ SQL (psycopg)
-                                                              ▼
-                                                 ┌──────────────────────────┐
-                                                 │ TimescaleDB (Postgres)   │
-                                                 │ tabelas: candles,        │
-                                                 │ watchlist                │
-                                                 └───────────▲──────────────┘
-                                                              │ SQL direto (DSN)
-                                                 ┌───────────┴──────────────┐
-                                                 │ streamlit_app.py         │
-                                                 │ (daytrade_smc.py)        │
-                                                 └──────────────────────────┘
+VM Windows (fora do cluster)          k3s — ns acoes
+┌────────────────────────┐            ┌──────────────────────────────────┐
+│ MT5 + acoes-scraper    │            │ processor  :8000   (só escrita)  │
+│ NIC1 macvtap → RDP     │  HTTPS     │   POST /candles                  │
+│ NIC2 → 192.168.122.50  │ ─────────▶ │   GET  /watchlist  (p/ o scraper)│
+│ hosts:                 │  :443      └────────────────┬─────────────────┘
+│  192.168.122.1         │                             │ SQL write
+│  acoes-processor.…     │                             ▼
+└────────────────────────┘            ┌──────────────────────────────────┐
+                                      │ ns default — timescaledb         │
+                                      │   database: daytrade             │
+                                      └────────────────┬─────────────────┘
+                                                       │ SQL read
+                                      ┌────────────────▼─────────────────┐
+                                      │ api        :8000   (só leitura)  │
+                                      │   GET /candles  GET /watchlist   │
+                                      │   PUT /watchlist   GET /status   │
+                                      └───▲──────────────────▲───────────┘
+                                          │ ClusterIP        │
+                                   ┌──────┴──────┐   internet│
+                                   │ streamlit   │           │
+                                   │   :8501     │  acoes-api.dondon.services
+                                   └──────▲──────┘
+                                          │ acoes.dondon.services
 ```
 
-O coletor nunca fala direto com o Postgres — só conhece a URL HTTP do
-processor. O app fala direto com o Postgres via SQL. O processor é
-principalmente um gateway de escrita (ingest) mais um endpoint de leitura
-(`/watchlist`) que só o coletor precisa.
+O scraper nunca fala com o Postgres — só conhece o `processor`. O Streamlit
+também não: consome a `api` por HTTP. **Só o backend fala SQL.**
+
+O scraper busca a watchlist no próprio `processor`, não na `api`. Por isso
+`GET /watchlist` existe nos dois serviços: é uma função de rota repetida,
+contra dar dois hostnames e duas entradas de `hosts` pra VM.
+
+## Rede da VM Windows (gotcha do macvtap)
+
+A VM `windows-11` tem **duas** placas de rede, e isso não é acidente:
+
+| NIC | Tipo | Endereço | Para quê |
+|---|---|---|---|
+| NIC1 | macvtap modo bridge sobre `enp2s0` (`type='direct'`) | `192.168.1.x` (DHCP do roteador) | Acesso via área de trabalho remota pela LAN |
+| NIC2 | rede virtual `default` do libvirt (NAT, `virbr0`) | `192.168.122.50/24` estático, **sem gateway** | Alcançar o cluster |
+
+**O motivo:** macvtap em modo bridge dá à VM um IP próprio na LAN — ótimo pro
+RDP — mas isola o guest do *próprio host que o hospeda*. A VM enxerga o
+roteador e todas as outras máquinas da rede, menos o `192.168.1.183`. Os
+pacotes saem pela placa física e o hardware não os devolve pra pilha do host.
+Como todo o cluster é publicado em portas **do host**, o scraper com só a NIC1
+nunca alcançaria o `processor` — o pipeline morreria no primeiro POST, com um
+"connection timed out" que não parece ter nada a ver com virtualização.
+
+A segunda placa contorna isso pelo caminho mais barato: `192.168.122.1` é o
+gateway da rede NAT do libvirt, que também é um IP do host. E as portas do
+`istio-ingressgateway` respondem ali — a regra de DNAT do klipper-lb do k3s é
+por porta de destino, sem casar IP, então vale pra qualquer interface do host.
+Verificado: `curl --resolve <host>:443:192.168.122.1` devolve 200 com o
+certificado validando.
+
+A NIC2 é configurada **sem default gateway e sem DNS** de propósito: com duas
+placas, o DHCP do libvirt entregaria uma segunda rota default e o Windows
+passaria a alternar a saída de internet entre as interfaces. Sem gateway, a
+NIC2 só atende `192.168.122.0/24` e todo o resto continua saindo pela NIC1.
+
+Como consequência, quem resolve `acoes-processor.dondon.services` na VM é o
+arquivo `hosts` (ver `scraper/README.md`), apontando pra `192.168.122.1`.
+
+Para diagnosticar de dentro da VM:
+
+```powershell
+Test-NetConnection 192.168.122.1 -Port 443   # deve dar True
+Test-NetConnection 192.168.1.183  -Port 443   # deve dar False (isolamento macvtap)
+```
+
+Se um dia a NIC2 sumir, esse é o sintoma que volta.
+
+## Exposição — o que é público e o que não é
+
+| Host | Destino | DNS público |
+|---|---|---|
+| `acoes.dondon.services` | streamlit | **sim** |
+| `acoes-api.dondon.services` | api (leitura) | **sim** |
+| `acoes-processor.dondon.services` | processor (escrita) | **não** — só a entrada em `hosts` da VM |
+
+Os três hosts são declarados no `acoes-gateway`, mas `acoes-processor` fica
+fora do `DOMAINS` do `cloudflare-ddns` de propósito: sem registro público, o
+caminho de escrita não é endereçável pela internet.
+
+`ACOES_API_KEY` vazia faz o backend **pular** a checagem. Enquanto o serviço
+só existia dentro da LAN isso era aceitável; com a `api` publicada,
+preenchê-la é o único controle sobre `POST /candles` e `PUT /watchlist` —
+não é mais defesa em profundidade, é o controle principal. `GET /candles`,
+`GET /watchlist` e `GET /status` seguem sem auth por construção.
+
+O Streamlit **não tem autenticação nenhuma** e a watchlist é editável pela
+UI, então `acoes.dondon.services` público significa que qualquer visitante lê
+e edita. Decisão consciente; o ponto de enxerto pra fechar depois é uma
+`AuthorizationPolicy` no `acoes-gateway`, sem mexer em mais nada.
+
+## Entrega (ArgoCD)
+
+Os manifests **não moram neste repo** — moram em
+`homelab/applications/acoes/`, sincronizados pela Application `acoes`
+(`syncPolicy: automated`, com `selfHeal` e `prune`).
+
+| Onde | O quê |
+|---|---|
+| `homelab/applications/acoes/` | namespace, os três Deployments + Services, Gateway, VirtualService, Job de migration |
+| `homelab/bootstrap/applications/acoes.yaml` | a Application, criada pelo app-of-apps |
+| `homelab/secrets/acoes/acoes-db.enc.yaml` | Secret SOPS+age — **fora do sync do Argo**, aplicado à mão por `secrets/scripts/apply-secret.sh` |
+
+Não há registry: o `Makefile` deste repo builda as imagens e importa direto
+no containerd (`docker save | sudo k3s ctr images import -`), com tag
+`<sha>[-dirty.<timestamp>]`, e carimba essa tag nos manifests do `homelab`.
+`make release` faz build → import → manifests → publish; o Argo pega em até
+3 min, ou `make sync` força na hora.
+
+**O Makefile não aplica manifest, e não deve passar a aplicar** — ver o
+cabeçalho dele para o incidente que motivou a regra.
+
+O schema é aplicado por um Job com `argocd.argoproj.io/hook: PreSync`, que
+roda a **cada** sync usando a mesma imagem dos Deployments. Por isso
+`backend/schema.sql` é inteiramente idempotente (`CREATE ... IF NOT EXISTS`,
+`create_hypertable(..., if_not_exists => TRUE)`); antes ele era
+`docker-entrypoint-initdb.d` do Compose, que roda uma vez só num banco vazio.
+
+Role e database são criados fora do GitOps por `scripts/init-tenant-db.sh`
+(`make db-init`), porque exigem superusuário — e o `pg_hba` da instância
+bloqueia `postgres` remoto justamente pra isso não virar rotina.
 
 ## Status da implementação
 
-**Código pronto (Fases 0-4 do plano original, tudo neste repo):**
+**Código pronto, neste repo:**
 
 | Componente | Arquivo(s) | O que faz |
 |---|---|---|
-| Schema do banco | `deploy/init/001_schema.sql` | `candles` (hypertable) + `watchlist`, chave composta `(symbol, timeframe, time)` pra upsert idempotente |
-| Processor | `processor/main.py`, `db.py`, `models.py` | FastAPI: `GET /health`, `POST /candles`, `GET/POST /watchlist`, `DELETE /watchlist/{symbol}`, `GET /status` |
-| Coletor | `collector/collector.py`, `config.py` | Loop contínuo, reaproveita `daytrade_smc.fetch_ohlcv(..., source="MetaTrader 5")`, reenvia as últimas `TRAILING_WINDOW` velas a cada loop (ver "Por que sem watermark" abaixo) |
-| Nova fonte no motor | `daytrade_smc.py:264` (`DATA_SOURCES`), `daytrade_smc.py:315` (`_fetch_ohlcv_homelab`), `daytrade_smc.py:277` (`HOMELAB_DB_DSN`) | Lê candles do Postgres seguindo o mesmo contrato de `fetch_ohlcv` (índice UTC tz-aware, colunas `[open,high,low,close,volume]`, ordem ascendente) |
-| Watchlist DB-aware | `daytrade_smc.py:2005` (`load_symbols`), `daytrade_smc.py:2020` (`save_symbols`), `_load_symbols_db`/`_save_symbols_db` (linhas 1978/1986) | Lê/escreve a tabela `watchlist` quando `HOMELAB_DB_DSN` está configurado; cai pro arquivo local (`_load_symbols_file`/`_save_symbols_file`) senão |
-| Streamlit | `streamlit_app.py:71` (injeção de `HOMELAB_DB_DSN`), `streamlit_app.py:126` (`_cached_mtf_homelab`), `streamlit_app.py:96` (`SOURCE_LABELS`) | Sidebar já mostra "Homelab (Postgres)" como 4ª opção, com legenda própria |
-| Deploy | `deploy/docker-compose.yml`, `deploy/streamlit.Dockerfile`, `processor/Dockerfile` | TimescaleDB + processor + o próprio Streamlit, todos em container |
-| Dependências | `requirements-homelab.txt` (`psycopg[binary,pool]`) | Isolado de `requirements.txt`/`requirements-local.txt`, mesmo padrão de split já existente |
+| Schema | `backend/schema.sql` | `candles` (hypertable) + `watchlist`, chave composta `(symbol, timeframe, time)` pra upsert idempotente |
+| Migration | `backend/migrate.py` | Aplica o schema numa transação; roda como hook PreSync |
+| Processor (escrita) | `backend/processor.py` | `GET /health`, `POST /candles`, `GET /watchlist` |
+| API (leitura) | `backend/api.py` | `GET /health`, `GET /candles`, `GET /watchlist`, `PUT /watchlist`, `GET /status` |
+| Auth | `backend/auth.py` | `X-API-Key` contra `ACOES_API_KEY`, compartilhado pelos dois |
+| Scraper | `scraper/scraper.py`, `config.py` | Loop contínuo, reaproveita `daytrade_smc.fetch_ohlcv(..., source="MetaTrader 5")`, reenvia as últimas `TRAILING_WINDOW` velas a cada loop (ver "Por que sem watermark") |
+| Fonte no motor | `daytrade_smc.py` (`DATA_SOURCES`, `_fetch_ohlcv_api`, `ACOES_API_URL`) | Lê candles pela api seguindo o mesmo contrato de `fetch_ohlcv` (índice UTC tz-aware, colunas `[open,high,low,close,volume]`, ordem ascendente) |
+| Watchlist via API | `daytrade_smc.py` (`load_symbols`/`save_symbols`, `_load_symbols_api`/`_save_symbols_api`) | `GET`/`PUT /watchlist` quando `ACOES_API_URL` está configurada; cai pro arquivo local senão |
+| Streamlit | `streamlit_app.py` (injeção de `ACOES_API_URL`, `_cached_mtf_api`, `SOURCE_LABELS`) | Sidebar mostra "Homelab (API)" como 4ª opção |
+| Imagens | `backend/Dockerfile`, `Dockerfile.streamlit` | `acoes-backend` (3 entrypoints) e `acoes-streamlit` (sem driver de banco) |
+| Release | `Makefile`, `scripts/init-tenant-db.sh` | build → containerd → tag nos manifests → push |
 
-**Ainda depende de infraestrutura real (não é código, é execução no seu homelab):**
+**Ainda depende de execução no seu ambiente:**
 
+- [x] Rede VM Windows ↔ cluster: segunda NIC na rede `default` do libvirt
 - [ ] Provisionar a VM Windows com MT5 instalado, aberto e logado
-- [ ] Subir `docker compose up -d` no host Linux/homelab (TimescaleDB + processor + Streamlit)
-- [ ] Instalar o coletor na VM Windows e rodar manualmente uma vez pra validar
-- [ ] Confirmar upsert idempotente e ausência de duplicatas/buracos no banco
-- [ ] Empacotar o coletor como serviço NSSM (sobrevive a reboot)
-- [ ] Configurar Tailscale (ou equivalente) entre VM Windows ↔ processor, e entre onde você acessa remotamente ↔ app Streamlit
-- [ ] Escolher e configurar `HOMELAB_DB_DSN` (env var ou `secrets.toml`) no container do Streamlit
-- [ ] Testar ponta a ponta: selecionar "Homelab (Postgres)" na sidebar e ver o gráfico atualizando
-
-Essa segunda lista é o que resta pra "continuar a implementação" — é trabalho de operação/infra no seu ambiente, não algo que o Claude Code consiga executar por não ter acesso ao seu homelab.
+- [ ] `make db-init` — criar role e database `daytrade`
+- [ ] Criar e aplicar `secrets/acoes/acoes-db.enc.yaml`
+- [ ] `make release` e commitar `bootstrap/applications/acoes.yaml`
+- [ ] Adicionar os DNS e sincronizar `cloudflare-ddns` (é manual: aquele app não tem `syncPolicy`)
+- [ ] Entrada em `hosts` na VM + `PROCESSOR_URL`/`ACOES_API_KEY`
+- [ ] Instalar o scraper na VM e rodar manualmente uma vez pra validar
+- [ ] Empacotar o scraper como serviço NSSM (sobrevive a reboot)
+- [ ] Testar ponta a ponta: "Homelab (API)" na sidebar e o gráfico atualizando
 
 ## Por que sem "watermark" de última vela enviada
 
 `copy_rates_from_pos(..., 0, count)` sempre inclui a vela ainda em
-formação, cujo OHLC muda a cada tick até fechar. Se o coletor só
-reenviasse linhas mais novas que uma marca lembrada, perderia toda
-atualização intra-vela da barra em formação. Em vez disso, a cada loop
-reenvia as últimas `TRAILING_WINDOW` (padrão 10) velas de cada
-symbol/timeframe, e o `ON CONFLICT DO UPDATE` do processor absorve as
-repetidas como no-op. Pouco tráfego numa LAN, e correto contra reinícios,
-loops perdidos e o problema da vela em formação, sem nenhum estado local
-pra persistir ou corromper.
+formação, cujo OHLC muda a cada tick até fechar. Se o scraper só reenviasse
+linhas mais novas que uma marca lembrada, perderia toda atualização
+intra-vela da barra em formação. Em vez disso, a cada loop reenvia as
+últimas `TRAILING_WINDOW` (padrão 10) velas de cada symbol/timeframe, e o
+`ON CONFLICT DO UPDATE` do processor absorve as repetidas como no-op. Pouco
+tráfego, e correto contra reinícios, loops perdidos e o problema da vela em
+formação, sem nenhum estado local pra persistir ou corromper.
 
-## Endpoints do processor (referência rápida)
+## Endpoints (referência rápida)
+
+**`processor`** — escrita, sem DNS público:
 
 | Método | Rota | Auth | Uso |
 |---|---|---|---|
 | GET | `/health` | não | liveness |
-| POST | `/candles` | `X-API-Key` (opcional) | upsert em lote — usado pelo coletor |
-| GET | `/watchlist` | não | símbolos ativos — usado pelo coletor |
-| POST | `/watchlist` | `X-API-Key` (opcional) | adicionar símbolo (conveniência; o app normalmente escreve direto no Postgres) |
-| DELETE | `/watchlist/{symbol}` | `X-API-Key` (opcional) | soft-delete (`active=false`) |
+| POST | `/candles` | `X-API-Key` | upsert em lote — usado pelo scraper |
+| GET | `/watchlist` | não | símbolos ativos — usado pelo scraper |
+
+**`api`** — leitura, publicada em `acoes-api.dondon.services`:
+
+| Método | Rota | Auth | Uso |
+|---|---|---|---|
+| GET | `/health` | não | liveness |
+| GET | `/candles?symbol=&timeframe=&count=` | não | últimas `count` velas, ordem ascendente; 404 se não houver |
+| GET | `/watchlist` | não | símbolos ativos |
+| PUT | `/watchlist` | `X-API-Key` | substitui a lista **inteira** (ver abaixo) |
 | GET | `/status` | não | `MAX(time)`/`MAX(ingested_at)` por symbol+timeframe |
 
-`PROCESSOR_API_KEY` sem definir = checagem pulada. A proteção real é o
-processor não estar exposto fora da LAN/tailnet do homelab — a API key é
-defesa em profundidade, não o controle principal.
+`PUT` e não `POST` porque `save_symbols` sempre teve semântica de
+sobrescrever tudo de uma vez: o servidor desativa quem saiu e (re)ativa quem
+está na lista, numa transação só. Um `POST` por símbolo somado a um `DELETE`
+por símbolo removido não expressa isso atomicamente.
 
 ## Variáveis de ambiente
 
 | Variável | Onde | Padrão | Uso |
 |---|---|---|---|
-| `HOMELAB_DB_DSN` | app Streamlit | — | DSN do Postgres (`postgresql://user:pass@host:5432/daytrade`); também aceito via `st.secrets["homelab_db_dsn"]` |
-| `DATABASE_URL` | processor | — | mesmo DSN, formato esperado pelo `psycopg_pool` |
-| `PROCESSOR_API_KEY` | processor + coletor | vazio (sem auth) | header `X-API-Key` |
-| `PROCESSOR_URL` | coletor | `http://localhost:8000` | endereço do processor (Tailscale/LAN) |
-| `POLL_INTERVAL_SECONDS` | coletor | `5` | intervalo do loop |
-| `COLLECTOR_TIMEFRAMES` | coletor | `M15,H1,H4,D1` | timeframes coletados (W1 fica fora do tempo real por baixo valor numa cadência de segundos) |
-| `TRAILING_WINDOW` | coletor | `10` | quantas velas reenviar a cada loop |
-| `WATCHLIST_REFRESH_SECONDS` | coletor | `60` | intervalo de releitura da watchlist via `/watchlist` |
+| `DATABASE_URL` | processor, api, migrate | — | DSN do Postgres; montado no manifest a partir do Secret, nunca guardado inteiro nele |
+| `ACOES_API_KEY` | processor, api, streamlit, scraper | vazio (**sem auth — não deixe assim**) | header `X-API-Key` |
+| `ACOES_API_URL` | streamlit | — | URL da api; no cluster é `http://api.acoes.svc.cluster.local:8000`. Também aceito via `st.secrets["acoes_api_url"]` |
+| `PROCESSOR_URL` | scraper | `http://localhost:8000` | no homelab é `https://acoes-processor.dondon.services` |
+| `POLL_INTERVAL_SECONDS` | scraper | `5` | intervalo do loop |
+| `SCRAPER_TIMEFRAMES` | scraper | `M15,H1,H4,D1` | timeframes coletados (W1 fica fora do tempo real por baixo valor numa cadência de segundos) |
+| `TRAILING_WINDOW` | scraper | `10` | quantas velas reenviar a cada loop |
+| `WATCHLIST_REFRESH_SECONDS` | scraper | `60` | intervalo de releitura da watchlist |
+| `REQUEST_TIMEOUT_SECONDS` | scraper | `10` | timeout das chamadas HTTP |
 
 ## O que fica obsoleto (mantido, não removido)
 
@@ -137,10 +256,8 @@ os globais `GITHUB_BRIDGE_REPO`/`GITHUB_BRIDGE_TOKEN` e
 `.github/workflows/mt5-update.yml` continuam no repo, intocados. Remover é
 uma decisão separada, ainda não tomada.
 
-## Próximos passos sugeridos (fora do código)
+## Fase opcional (não bloqueia o pipeline funcionando)
 
-1. Docker/Compose no host do homelab (`cd deploy && cp .env.example .env` → preencher → `docker compose up -d`).
-2. Coletor na VM Windows (ver `collector/README.md` pra setup completo + NSSM).
-3. Rede: Tailscale ligando VM Windows ↔ processor ↔ onde você acessa o app.
-4. Validação ponta a ponta (checklist acima).
-5. Fase 5 opcional (não bloqueia o pipeline funcionando): legenda de "última atualização" na sidebar usando `/status`, logging/rotação de log, estratégia de backup do Postgres.
+Legenda de "última atualização" na sidebar usando `GET /status`; rotação de
+log do scraper; incluir o database `daytrade` na rotina de backup do
+`homelab/backup/`.
