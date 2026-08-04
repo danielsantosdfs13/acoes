@@ -1,0 +1,52 @@
+# Stack do homelab: TimescaleDB + processor + o próprio app Streamlit.
+#
+# O coletor MT5 (VM Windows) NÃO faz parte deste compose — roda à parte,
+# na VM Windows, e só precisa alcançar o serviço "processor" (porta 8000)
+# via LAN/Tailscale. Ver collector/README.md.
+#
+# Uso:
+#   cd deploy
+#   cp .env.example .env   # e preencha POSTGRES_PASSWORD / PROCESSOR_API_KEY
+#   docker compose up -d
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: daytrade
+      POSTGRES_USER: daytrade
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d
+    networks: [daytrade-net]
+
+  processor:
+    build: ../processor
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://daytrade:${POSTGRES_PASSWORD}@timescaledb:5432/daytrade
+      PROCESSOR_API_KEY: ${PROCESSOR_API_KEY}
+    depends_on: [timescaledb]
+    ports:
+      - "8000:8000"  # precisa ser alcançável pela VM Windows do coletor (LAN/Tailscale)
+    networks: [daytrade-net]
+
+  streamlit:
+    build:
+      context: ..
+      dockerfile: deploy/streamlit.Dockerfile
+    restart: unless-stopped
+    environment:
+      HOMELAB_DB_DSN: postgresql://daytrade:${POSTGRES_PASSWORD}@timescaledb:5432/daytrade
+    depends_on: [timescaledb]
+    ports:
+      - "8501:8501"  # precisa ser alcançável de onde você acessa remotamente (ex: trabalho, via Tailscale)
+    networks: [daytrade-net]
+
+volumes:
+  timescale_data:
+
+networks:
+  daytrade-net:
+    driver: bridge

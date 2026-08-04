@@ -1,0 +1,10 @@
+# Dependência extra pra rodar o app/streamlit_app.py no homelab, lendo
+# candles do PostgreSQL/TimescaleDB alimentado pelo coletor MT5.
+#
+# NÃO precisa ser instalada no Streamlit Cloud nem na VM Windows do
+# coletor — só onde a fonte "Homelab (Postgres)" for de fato usada.
+#
+#   pip install -r requirements.txt
+#   pip install -r requirements-homelab.txt
+#
+psycopg[binary,pool]>=3.1
