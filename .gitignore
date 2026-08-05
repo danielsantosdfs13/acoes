@@ -1,1 +1,6 @@
 __pycache__
+
+# Estado local da interface, gravado ao lado do daytrade_smc.py quando
+# ACOES_API_URL não está configurada (ver load_symbols/load_profiles).
+daytrade_symbols.json
+daytrade_profiles.json

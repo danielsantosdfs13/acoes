@@ -13,10 +13,18 @@ count)` sempre inclui a vela ainda em formação, cujo OHLC muda a cada tick
 até fechar. Se só reenviássemos linhas mais novas que uma marca lembrada,
 perderíamos toda atualização intra-vela da barra em formação. Em vez
 disso, a cada loop reenviamos as últimas TRAILING_WINDOW velas de cada
-symbol/timeframe, e deixamos o upsert (ON CONFLICT DO UPDATE) do processor
-absorver as repetidas como no-op — pouco tráfego numa LAN, e correto
+symbol/timeframe e deixamos o upsert do processor deduplicar — correto
 contra reinícios, loops perdidos e o problema da vela em formação, sem
 nenhum estado local pra persistir ou corromper.
+
+O que este comentário afirmava até 2026-08, e estava ERRADO: que o
+ON CONFLICT DO UPDATE absorvia as repetidas "como no-op". Ele é no-op na
+contagem de linhas, não no armazenamento — todo UPDATE em Postgres é uma
+tupla nova mais uma tupla morta, com WAL e autovacuum atrás. Medido no
+homelab: 160,7 escritas/s e 2,1 GB de WAL por dia pra manter 40 KB/dia de
+dados novos. O que tornou a afirmação verdadeira foi a guarda
+`IS DISTINCT FROM` em `_UPSERT_SQL` (backend/processor.py); o barateamento
+deste lado veio de TRAILING_WINDOW menor e do gate de pregão abaixo.
 
 Uso:
     python scraper.py
@@ -29,7 +37,9 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -38,6 +48,10 @@ from daytrade_smc import DEFAULT_SYMBOLS, fetch_ohlcv  # noqa: E402
 
 from config import (  # noqa: E402
     ACOES_API_KEY,
+    MERCADO_ABERTURA_HORA,
+    MERCADO_FECHADO_SLEEP_SECONDS,
+    MERCADO_FECHAMENTO_HORA,
+    MERCADO_TIMEZONE,
     POLL_INTERVAL_SECONDS,
     PROCESSOR_URL,
     REQUEST_TIMEOUT_SECONDS,
@@ -67,6 +81,20 @@ def _deployed_version() -> str:
     except OSError:
         pass
     return "desconhecida (sem DEPLOY-INFO)"
+
+
+_TZ_MERCADO = ZoneInfo(MERCADO_TIMEZONE)
+
+
+def _mercado_aberto(agora: datetime | None = None) -> bool:
+    """True se a B3 pode estar negociando agora (seg–sex, dentro da janela).
+
+    Não trata feriado: num feriado o loop roda à toa, que é bem mais barato do
+    que manter um calendário da B3 correto. Ver config.py para a janela."""
+    agora = agora or datetime.now(_TZ_MERCADO)
+    if agora.weekday() >= 5:  # 5 = sábado, 6 = domingo
+        return False
+    return MERCADO_ABERTURA_HORA <= agora.hour < MERCADO_FECHAMENTO_HORA
 
 
 def _headers() -> dict[str, str]:
@@ -126,11 +154,28 @@ def main() -> None:
     )
     watchlist = _refresh_watchlist(fallback=DEFAULT_SYMBOLS.copy())
     last_refresh = time.monotonic()
+    estava_aberto: bool | None = None
 
     while True:
         if time.monotonic() - last_refresh > WATCHLIST_REFRESH_SECONDS:
             watchlist = _refresh_watchlist(fallback=watchlist)
             last_refresh = time.monotonic()
+
+        # O gate fica DEPOIS do refresh da watchlist, pra que ela continue
+        # sendo atualizada com o mercado fechado — assim o scraper já abre o
+        # pregão com a lista certa.
+        aberto = _mercado_aberto()
+        if aberto != estava_aberto:
+            log.info(
+                "Mercado %s — intervalo de %ss.",
+                "ABERTO" if aberto else "FECHADO",
+                POLL_INTERVAL_SECONDS if aberto else MERCADO_FECHADO_SLEEP_SECONDS,
+            )
+            estava_aberto = aberto
+
+        if not aberto:
+            time.sleep(MERCADO_FECHADO_SLEEP_SECONDS)
+            continue
 
         for symbol in watchlist:
             for timeframe in SCRAPER_TIMEFRAMES:

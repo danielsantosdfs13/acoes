@@ -29,9 +29,12 @@ import streamlit as st
 import daytrade_smc
 from daytrade_smc import (
     ALL_MODALITIES_OPTION,
+    AnalysisParams,
     DATA_SOURCES,
     DAYTRADE_CONFIRMATION_TIMEFRAMES,
     DAYTRADE_CONTEXT_TIMEFRAMES,
+    DEFAULT_PARAMS,
+    DEFAULT_PROFILE_NAME,
     DEFAULT_SYMBOLS,
     Direction,
     MODALITY_CHOICES,
@@ -40,12 +43,15 @@ from daytrade_smc import (
     SWING_CONTEXT_TIMEFRAMES,
     analyze_symbol_mtf,
     check_signal_as_of,
+    delete_profile,
     fetch_snapshot_timestamp,
+    load_profiles,
     load_symbols,
     overall_agreement,
     overall_direction,
     overall_score,
     quality,
+    save_profile,
     save_symbols,
     trigger_github_update,
     yahoo_symbol,
@@ -109,30 +115,30 @@ SOURCE_LABELS = {
 # Dados / cache / análise
 # ========================================================================
 @st.cache_data(ttl=60, show_spinner=False)
-def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
+def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, params_items: tuple):
     counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Yahoo Finance")
+    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Yahoo Finance", params=AnalysisParams.from_items(params_items))
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
+def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, params_items: tuple):
     counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="MetaTrader 5")
+    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="MetaTrader 5", params=AnalysisParams.from_items(params_items))
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
+def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, params_items: tuple):
     counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="GitHub (MT5 de casa)")
+    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="GitHub (MT5 de casa)", params=AnalysisParams.from_items(params_items))
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def _cached_mtf_api(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str):
+def _cached_mtf_api(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, params_items: tuple):
     counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Homelab (API)")
+    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Homelab (API)", params=AnalysisParams.from_items(params_items))
 
 
-def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str):
+def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str, params: AnalysisParams = DEFAULT_PARAMS):
     """
     Cacheia o pacote de timeframes. Yahoo Finance usa 60s de cache (tem
     rate limit); MetaTrader 5 direto e Homelab (API) usam 3s (dado
@@ -141,17 +147,26 @@ def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: 
     tão curto). Funções fixas em vez de decoradas dinamicamente, pelo
     mesmo motivo dos fragmentos de auto-refresh: evita o bug de identidade
     de widget no React já corrigido antes neste projeto.
+
+    Os parâmetros de análise entram na chave de cache como TUPLA DE PARES
+    (`params.to_items()`), nunca como o dataclass e nunca por variável
+    global. O hasher do `st.cache_data` garante tuplas de primitivos; um
+    dataclass ou levanta `UnhashableParamError` na hora, ou — pior — é
+    hasheado por identidade e a falha fica silenciosa: trocar de perfil
+    continuaria servindo os scores do perfil anterior pelo TTL inteiro, e
+    o Scanner ranquearia por eles sem nenhum sinal de que algo está errado.
     """
+    params_items = params.to_items()
     if source == "Homelab (API)":
-        return _cached_mtf_api(symbol, count, confirmation, context, modality)
+        return _cached_mtf_api(symbol, count, confirmation, context, modality, params_items)
     if source == "MetaTrader 5":
-        return _cached_mtf_mt5(symbol, count, confirmation, context, modality)
+        return _cached_mtf_mt5(symbol, count, confirmation, context, modality, params_items)
     if source == "GitHub (MT5 de casa)":
-        return _cached_mtf_github(symbol, count, confirmation, context, modality)
-    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality)
+        return _cached_mtf_github(symbol, count, confirmation, context, modality, params_items)
+    return _cached_mtf_yahoo(symbol, count, confirmation, context, modality, params_items)
 
 
-def find_fvg_zone(df: pd.DataFrame, max_age: int = 20) -> dict | None:
+def find_fvg_zone(df: pd.DataFrame, max_age: int = DEFAULT_PARAMS.fvg_max_idade) -> dict | None:
     """
     Replica a lógica de `detect_fvg_setup` (do seu motor original), mas
     devolve os PREÇOS do gap em vez de só um texto — usado unicamente
@@ -242,7 +257,9 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
             text=[kind] * len(pts), textposition="top center", textfont=dict(size=9, color=color),
         ))
 
-    fvg = find_fvg_zone(df)
+    # O mesmo parâmetro que o motor usou pra DECIDIR o FVG precisa valer aqui
+    # pra DESENHAR — senão o gráfico mostra uma zona que o score não enxerga.
+    fvg = find_fvg_zone(df, context.params.fvg_max_idade)
     if fvg is not None:
         color = "#2ed3a3" if fvg["kind"] == "ALTA" else "#ff5470"
         fig.add_shape(
@@ -281,9 +298,9 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
 # ========================================================================
 # Painéis
 # ========================================================================
-def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None) -> None:
+def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None, timeframe: str = "", context=None, mtf=None, params: AnalysisParams = DEFAULT_PARAMS, perfil: str = DEFAULT_PROFILE_NAME) -> None:
     color = DIRECTION_COLOR[signal.direction]
-    q = quality(signal.score)
+    q = quality(signal.score, params)
 
     if q == "OPORTUNIDADE EXCEPCIONAL" and signal.direction != Direction.NEUTRAL:
         action = "COMPRA" if signal.direction == Direction.BUY else "VENDA"
@@ -340,6 +357,40 @@ def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None) 
         for alert in dict.fromkeys(signal.alerts):
             st.warning(alert)
 
+    if context is not None and daytrade_smc.ACOES_API_URL:
+        # O auto-refresh NÃO dispara este botão: `st.button` só devolve True
+        # no rerun do clique, então o fragmento de 30s renderiza o botão sem
+        # nunca ativá-lo. Não "conserte" isso pra uma chamada incondicional —
+        # viraria uma linha nova a cada 30 segundos.
+        #
+        # A garantia contra clique duplo, essa sim, é o índice único no
+        # banco: (symbol, timeframe, modalidade, candle_time, perfil, origem).
+        if st.button("💾 Salvar sinal", key=f"salvar_{symbol}_{timeframe}_{signal.name}"):
+            # A confirmação gravada é a DESTA leitura, não a da modalidade
+            # selecionada na sidebar: o painel mostra as cinco, e reaproveitar
+            # a confirmação de outra falsearia o recorte de assertividade.
+            confirmado, direcao_mtf = (False, Direction.NEUTRAL)
+            if mtf is not None:
+                confirmado, direcao_mtf = daytrade_smc.mtf_confirmation(
+                    {tf: r.signals for tf, r in mtf.results.items()},
+                    STYLES[st.session_state.style_select]["confirmation"],
+                    signal.name,
+                )
+            try:
+                resultado = daytrade_smc.save_signal(
+                    daytrade_smc.signal_payload(
+                        symbol, timeframe, signal, context, perfil, params, "manual",
+                        confirmado, direcao_mtf,
+                    )
+                )
+            except Exception as exc:
+                st.error(f"Não foi possível salvar: {exc}")
+            else:
+                if resultado.get("duplicado"):
+                    st.info("Este sinal já estava salvo (mesma vela, mesma leitura).")
+                else:
+                    st.success(f"Sinal salvo — {signal.name} de {symbol} em {timeframe}.")
+
 
 TIMEFRAME_LABELS = {
     "M15": "15 minutos",
@@ -350,7 +401,7 @@ TIMEFRAME_LABELS = {
 }
 
 
-def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
+def render_confirmation_badge(mtf, confirmation: tuple[str, str], params: AnalysisParams = DEFAULT_PARAMS) -> None:
     tf_a, tf_b = confirmation
     result_a = mtf.results[tf_a]
     result_b = mtf.results[tf_b]
@@ -379,7 +430,7 @@ def render_confirmation_badge(mtf, confirmation: tuple[str, str]) -> None:
             score_for_badge = overall_score(result_a.signals)
         else:
             score_for_badge = next(s.score for s in result_a.signals if s.name == mtf.modality)
-        star = "🌟 " if quality(score_for_badge) == "OPORTUNIDADE EXCEPCIONAL" else ""
+        star = "🌟 " if quality(score_for_badge, params) == "OPORTUNIDADE EXCEPCIONAL" else ""
         st.markdown(
             f'<div style="border:1px solid {color}; border-radius:8px; padding:12px 16px; '
             f'background:{color}18; margin-bottom:14px;">'
@@ -410,7 +461,7 @@ OUTCOME_LABELS = {
 }
 
 
-def render_retro_check(symbol: str, style: str, modality: str, source: str, count: int) -> None:
+def render_retro_check(symbol: str, style: str, modality: str, source: str, count: int, params: AnalysisParams = DEFAULT_PARAMS) -> None:
     st.caption(
         "Roda a análise usando SÓ os dados que existiam até a data escolhida (sem espiar o "
         "futuro), depois confere o que aconteceu de verdade nos candles seguintes — se bateu "
@@ -428,7 +479,7 @@ def render_retro_check(symbol: str, style: str, modality: str, source: str, coun
     if st.button("🔍 Verificar", type="primary"):
         as_of_ts = pd.Timestamp(as_of_date).tz_localize("America/Sao_Paulo") + pd.Timedelta(hours=23, minutes=59)
         try:
-            check = check_signal_as_of(symbol, check_tf, as_of_ts, count=count, modality=modality, source=source)
+            check = check_signal_as_of(symbol, check_tf, as_of_ts, count=count, modality=modality, source=source, params=params)
         except Exception as exc:
             st.error(f"Não foi possível verificar: {exc}")
             return
@@ -442,7 +493,7 @@ def render_retro_check(symbol: str, style: str, modality: str, source: str, coun
 
         color = DIRECTION_COLOR[check.direction]
         action = "COMPRAR" if check.direction == Direction.BUY else "VENDER"
-        if quality(check.score) == "OPORTUNIDADE EXCEPCIONAL":
+        if quality(check.score, params) == "OPORTUNIDADE EXCEPCIONAL":
             st.markdown("🌟 **OPORTUNIDADE EXCEPCIONAL** nesta data")
         st.markdown(
             f'> **{action} {symbol}** perto de **R$ {check.risk.entry:.2f}**, stop em '
@@ -463,16 +514,169 @@ def render_retro_check(symbol: str, style: str, modality: str, source: str, coun
             st.caption(f"Candles disponíveis após a data escolhida: {check.candles_futuros_disponiveis}")
 
 
-def render_individual_analysis(symbol: str, style: str, modality: str, source: str, count: int, risk_budget: float | None) -> None:
+# ========================================================================
+# Assertividade
+# ========================================================================
+RECORTE_LABELS = {
+    "por_timeframe": "Timeframe",
+    "por_symbol": "Ativo",
+    "por_direcao": "Direção",
+    "por_faixa_score": "Faixa de score",
+    "por_mtf": "Confirmado no multi-timeframe",
+}
+
+
+def _tabela_assertividade(linhas: list[dict], rotulo: str | None) -> pd.DataFrame:
+    """Monta a tabela de um recorte.
+
+    `n` e `resolvidos` ficam SEMPRE visíveis: a taxa e a expectativa
+    ignoram os sinais em aberto (o SQL usa avg(), que pula NULL), então
+    esconder o denominador transformaria "2 de 3" em "66,7% de 28".
+    """
+    registros = []
+    for linha in linhas:
+        registro = {"Leitura": linha["modalidade"]}
+        if rotulo:
+            valor = linha["recorte"]
+            if rotulo == "Confirmado no multi-timeframe":
+                valor = {"true": "Sim", "false": "Não"}.get(valor, valor)
+            registro[rotulo] = valor
+        registro.update({
+            "Sinais": linha["n"],
+            "Resolvidos": linha["resolvidos"],
+            "Em aberto": linha["em_aberto"],
+            "Acertos": linha["acertos"],
+            "Taxa de acerto": None if linha["taxa_acerto"] is None else round(linha["taxa_acerto"] * 100, 1),
+            "Expectativa (R)": None if linha["expectativa_r"] is None else round(linha["expectativa_r"], 2),
+            "Alvo 1": linha["alvo_1"],
+            "Alvo 2": linha["alvo_2"],
+            "Stop": linha["stop"],
+        })
+        registros.append(registro)
+    return pd.DataFrame(registros)
+
+
+def render_assertividade(perfis: list[str]) -> None:
+    st.caption(
+        "Taxa de acerto e expectativa dos sinais efetivamente gravados — os que o worker "
+        "do homelab varreu automaticamente, mais os que você salvou à mão. Só entram na "
+        "conta os que já tiveram desfecho (bateu alvo ou stop); os em aberto aparecem no "
+        "contador, mas não na taxa."
+    )
+
+    if not daytrade_smc.ACOES_API_URL:
+        st.info(
+            "Este modo depende da API do homelab (`ACOES_API_URL`). Sem ela não há onde "
+            "guardar o histórico de sinais — ver `docs/homelab-pipeline.md`."
+        )
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        f_perfil = st.selectbox("Perfil", ["Todos"] + perfis, key="assert_perfil")
+    with col2:
+        f_origem = st.selectbox("Origem", ["Todas", "worker", "manual"], key="assert_origem")
+    with col3:
+        f_symbol = st.selectbox("Ativo", ["Todos"] + st.session_state.watchlist, key="assert_symbol")
+    with col4:
+        f_dias = st.select_slider("Período", options=[7, 30, 90, 180, 365, 1095], value=90,
+                                  format_func=lambda d: f"{d} dias", key="assert_dias")
+
+    filtros = {
+        "perfil": None if f_perfil == "Todos" else f_perfil,
+        "origem": None if f_origem == "Todas" else f_origem,
+        "symbol": None if f_symbol == "Todos" else f_symbol,
+        "dias": f_dias,
+    }
+
+    try:
+        stats = daytrade_smc.fetch_signal_stats(**filtros)
+    except Exception as exc:
+        st.error(f"Não foi possível carregar as estatísticas: {exc}")
+        return
+
+    if not stats["geral"]:
+        st.info(
+            "Nenhum sinal com desfecho neste recorte ainda. O worker grava os sinais assim "
+            "que a vela fecha, mas o desfecho só aparece depois que o preço bate o alvo ou "
+            "o stop — em D1 isso leva dias."
+        )
+        return
+
+    total_n = sum(linha["n"] for linha in stats["geral"])
+    total_res = sum(linha["resolvidos"] for linha in stats["geral"])
+    total_acertos = sum(linha["acertos"] for linha in stats["geral"])
+    total_aberto = sum(linha["em_aberto"] for linha in stats["geral"])
+
+    cols = st.columns(4)
+    cols[0].metric("Sinais no período", total_n)
+    cols[1].metric("Já resolvidos", total_res, f"{total_aberto} em aberto")
+    cols[2].metric(
+        "Taxa de acerto",
+        "—" if not total_res else f"{total_acertos / total_res * 100:.1f}%",
+        help="Acertos ÷ resolvidos. Os sinais em aberto ficam de fora até baterem alvo ou stop.",
+    )
+    expectativas = [(l["expectativa_r"], l["resolvidos"]) for l in stats["geral"] if l["expectativa_r"] is not None]
+    peso_total = sum(peso for _, peso in expectativas)
+    cols[3].metric(
+        "Expectativa (R)",
+        "—" if not peso_total else f"{sum(v * p for v, p in expectativas) / peso_total:+.2f}",
+        help="Retorno médio em múltiplos de risco, usando o R que cada sinal realmente tinha "
+             "(alvo 1 e alvo 2 são parâmetros do perfil, não valores fixos).",
+    )
+
+    st.markdown("### Por tipo de análise")
+    st.dataframe(_tabela_assertividade(stats["geral"], None), hide_index=True, use_container_width=True)
+
+    for chave, rotulo in RECORTE_LABELS.items():
+        linhas = stats.get(chave) or []
+        if not linhas:
+            continue
+        with st.expander(f"Por {rotulo.lower()}"):
+            st.dataframe(_tabela_assertividade(linhas, rotulo), hide_index=True, use_container_width=True)
+
+    st.markdown("### Últimos sinais gravados")
+    try:
+        historico = daytrade_smc.fetch_signals(limite=100, **filtros)
+    except Exception as exc:
+        st.warning(f"Não foi possível carregar o histórico: {exc}")
+        return
+
+    if not historico["signals"]:
+        st.caption("Nenhum sinal gravado neste recorte.")
+        return
+
+    st.caption(f"{historico['total']} sinal(is) no recorte · mostrando os {len(historico['signals'])} mais recentes")
+    st.dataframe(
+        [{
+            "Vela": pd.Timestamp(s["candle_time"]).tz_convert("America/Sao_Paulo").strftime("%d/%m %H:%M"),
+            "Ativo": s["symbol"],
+            "TF": s["timeframe"],
+            "Leitura": s["modalidade"],
+            "Direção": s["direcao"],
+            "Score": round(s["score"], 1),
+            "MTF": "Sim" if s["mtf_confirmado"] else "Não",
+            "Entrada": s["entrada"],
+            "Stop": s["stop"],
+            "Alvo 1": s["alvo_1"],
+            "Desfecho": OUTCOME_LABELS.get(s["resultado"], ("Aguardando", ""))[0] if s["resultado"] else "Aguardando",
+            "Perfil": s["perfil"],
+            "Origem": s["origem"],
+        } for s in historico["signals"]],
+        hide_index=True, use_container_width=True,
+    )
+
+
+def render_individual_analysis(symbol: str, style: str, modality: str, source: str, count: int, risk_budget: float | None, params: AnalysisParams = DEFAULT_PARAMS, perfil: str = DEFAULT_PROFILE_NAME) -> None:
     confirmation = STYLES[style]["confirmation"]
     context_tfs = STYLES[style]["context"]
     all_tfs = list(confirmation) + [tf for tf in context_tfs if tf not in confirmation]
 
     fonte_label = SOURCE_LABELS.get(source, source)
     with st.spinner(f"Buscando {', '.join(TIMEFRAME_LABELS[tf] for tf in all_tfs)} de {symbol} via {fonte_label}..."):
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, params)
 
-    render_confirmation_badge(mtf, confirmation)
+    render_confirmation_badge(mtf, confirmation, params)
 
     tf_tabs = st.tabs([TIMEFRAME_LABELS[tf] + (" (contexto)" if tf not in confirmation else "") for tf in all_tfs])
     for tab, tf in zip(tf_tabs, all_tfs):
@@ -481,10 +685,10 @@ def render_individual_analysis(symbol: str, style: str, modality: str, source: s
             if result.error:
                 st.error(f"Não foi possível analisar {symbol} em {tf}: {result.error}")
                 continue
-            render_timeframe_panel(symbol, tf, result.context, result.signals, risk_budget)
+            render_timeframe_panel(symbol, tf, result.context, result.signals, risk_budget, mtf, params, perfil)
 
 
-def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_budget: float | None) -> None:
+def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_budget: float | None, mtf=None, params: AnalysisParams = DEFAULT_PARAMS, perfil: str = DEFAULT_PROFILE_NAME) -> None:
     by_name = {s.name: s for s in signals}
     last_open = context.df.index[-1].tz_convert("America/Sao_Paulo")
     st.caption(f"{symbol} ({yahoo_symbol(symbol)}) · {timeframe} · último candle: {last_open} · "
@@ -501,7 +705,7 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
     tabs = st.tabs([s.name for s in signals])
     for tab, s in zip(tabs, signals):
         with tab:
-            render_signal_panel(s, symbol, risk_budget)
+            render_signal_panel(s, symbol, risk_budget, timeframe, context, mtf, params, perfil)
 
     st.markdown("### Resumo — as 5 leituras lado a lado")
     st.dataframe(
@@ -526,23 +730,23 @@ def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_b
 # fixo por intervalo, nunca criado dinamicamente.
 # ========================================================================
 @st.fragment(run_every=30)
-def _auto_refresh_30(symbol, style, modality, source, count, risk_budget):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget)
+def _auto_refresh_30(symbol, style, modality, source, count, risk_budget, params, perfil):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
 
 
 @st.fragment(run_every=60)
-def _auto_refresh_60(symbol, style, modality, source, count, risk_budget):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget)
+def _auto_refresh_60(symbol, style, modality, source, count, risk_budget, params, perfil):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
 
 
 @st.fragment(run_every=120)
-def _auto_refresh_120(symbol, style, modality, source, count, risk_budget):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget)
+def _auto_refresh_120(symbol, style, modality, source, count, risk_budget, params, perfil):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
 
 
 @st.fragment(run_every=300)
-def _auto_refresh_300(symbol, style, modality, source, count, risk_budget):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget)
+def _auto_refresh_300(symbol, style, modality, source, count, risk_budget, params, perfil):
+    render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
 
 
 _AUTO_REFRESH_FRAGMENTS = {
@@ -553,7 +757,7 @@ _AUTO_REFRESH_FRAGMENTS = {
 }
 
 
-def run_scanner(symbols: list[str], style: str, modality: str, source: str, count: int, risk_budget: float | None) -> pd.DataFrame:
+def run_scanner(symbols: list[str], style: str, modality: str, source: str, count: int, risk_budget: float | None, params: AnalysisParams = DEFAULT_PARAMS) -> pd.DataFrame:
     rows = []
     progress = st.progress(0.0, text="Iniciando scanner...")
     confirmation = STYLES[style]["confirmation"]
@@ -563,7 +767,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
 
     for i, symbol in enumerate(symbols):
         progress.progress((i + 1) / len(symbols), text=f"Analisando {symbol} ({i+1}/{len(symbols)})...")
-        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source)
+        mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, params)
         result_a = mtf.results[tf_a]
         result_b = mtf.results[tf_b]
 
@@ -604,7 +808,7 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
                 total = round(qty * risk.entry, 2) if qty > 0 else 0.0
 
         score_geral = round((score_a + score_b) / 2, 1)
-        destaque = "🌟 Excepcional" if (mtf.confirmed and quality(score_geral) == "OPORTUNIDADE EXCEPCIONAL") else ""
+        destaque = "🌟 Excepcional" if (mtf.confirmed and quality(score_geral, params) == "OPORTUNIDADE EXCEPCIONAL") else ""
 
         rows.append({
             "Ativo": symbol,
@@ -659,6 +863,150 @@ if st.session_state.get("jump_to_symbol"):
     st.session_state.pop("scanner_pick_select", None)
 
 
+# Perfis de análise. A troca de perfil precisa acontecer AQUI, antes da
+# sidebar, pelo mesmo motivo do `jump_to_symbol` logo acima: os widgets do
+# expander de parâmetros são presos às chaves `param_*`, e o Streamlit não
+# deixa mexer numa chave depois que o widget dela já existe no mesmo run.
+# Campos-tupla ganham um widget por posição (`param_<campo>_<i>`); os
+# escalares têm um widget só (`param_<campo>`). A distinção existe porque
+# não dá pra editar uma tupla num number_input, e reconstruí-la a partir
+# das posições é mais simples que parsear texto.
+PARAM_TUPLAS = {
+    nome: len(valor)
+    for nome, valor in DEFAULT_PARAMS.to_items()
+    if isinstance(valor, tuple)
+}
+PARAM_ESCALARES = [nome for nome, valor in DEFAULT_PARAMS.to_items() if not isinstance(valor, tuple)]
+
+# Como cada parâmetro aparece na sidebar. A ordem dos grupos segue os
+# estágios do motor, na mesma sequência de `analyze()`: primeiro o que
+# monta o contexto, depois as leituras, depois o filtro, depois o risco.
+# (campo, rótulo, mínimo, máximo, passo) — os tipos de mínimo/máximo/passo
+# decidem se o number_input é inteiro ou decimal, então precisam bater com
+# o tipo do campo no AnalysisParams.
+PARAM_UI = {
+    "Contexto": [
+        ("atr_periodo", "Período do ATR", 2, 200, 1),
+        ("swing_esquerda", "Swing — velas à esquerda", 1, 20, 1),
+        ("swing_direita", "Swing — velas à direita", 1, 20, 1),
+        ("vol_baixa_max_pct", "Volatilidade BAIXA abaixo de (ATR %)", 0.0, 5.0, 0.05),
+        ("vol_excessiva_min_pct", "Volatilidade EXCESSIVA acima de (ATR %)", 0.5, 30.0, 0.5),
+    ],
+    "Estrutura (BOS/CHoCH e FVG)": [
+        ("estrutura_volume_min", "Volume mínimo do rompimento (× média)", 0.5, 5.0, 0.1),
+        ("estrutura_range_min", "Amplitude mínima do rompimento (× ATR)", 0.1, 5.0, 0.1),
+        ("evento_max_idade", "Idade máxima do BOS/CHoCH (velas)", 1, 200, 1),
+        ("fvg_max_idade", "Idade máxima do FVG (velas)", 1, 200, 1),
+    ],
+    "Price Action": [
+        ("rompimento_lookback", "Janela do rompimento (velas)", 3, 200, 1),
+        ("rompimento_tolerancia_pct", "Tolerância do reteste (%)", 0.0, 5.0, 0.05),
+    ],
+    "VWAP": [
+        ("vwap_distancia_min_pct", "Distância mínima pra contar (%)", 0.0, 2.0, 0.01),
+        ("vwap_distancia_max_pct", "Distância que bloqueia a entrada (%)", 0.1, 10.0, 0.1),
+    ],
+    "Confluência": [
+        ("peso_smc", "Peso — SMC", 0.0, 100.0, 1.0),
+        ("peso_price_action", "Peso — Price Action", 0.0, 100.0, 1.0),
+        ("peso_medias", "Peso — Médias Móveis", 0.0, 100.0, 1.0),
+        ("peso_vwap", "Peso — VWAP", 0.0, 100.0, 1.0),
+        ("normalizacao_score", "Divisor de normalização", 1.0, 200.0, 1.0),
+        ("confluencia_banda_empate", "Banda de empate (pontos)", 0.0, 50.0, 0.5),
+    ],
+    "Filtro de mercado": [
+        ("filtro_isolada_score_max", "Teto de score — leitura isolada", 0.0, 100.0, 1.0),
+        ("filtro_isolada_confianca_max", "Teto de confiança — leitura isolada", 0.0, 100.0, 1.0),
+        ("filtro_bloqueio_score_max", "Teto de score — entrada bloqueada", 0.0, 100.0, 1.0),
+        ("filtro_bloqueio_confianca_max", "Teto de confiança — entrada bloqueada", 0.0, 100.0, 1.0),
+        ("filtro_excessiva_score_max", "Teto de score — volatilidade excessiva", 0.0, 100.0, 1.0),
+        ("filtro_excessiva_confianca_max", "Teto de confiança — volatilidade excessiva", 0.0, 100.0, 1.0),
+        ("score_minimo_operavel", "Score mínimo operável", 0.0, 100.0, 1.0),
+    ],
+    "Risco": [
+        ("rr_alvo_1", "Risco/retorno do alvo 1", 0.1, 20.0, 0.1),
+        ("rr_alvo_2", "Risco/retorno do alvo 2", 0.1, 20.0, 0.1),
+        ("stop_minimo_atr", "Distância mínima do stop (× ATR)", 0.0, 5.0, 0.05),
+    ],
+}
+
+# campo -> (rótulos por posição, passo, formato)
+PARAM_UI_TUPLAS = {
+    "Confluência": {
+        "multiplicador_concordancia": (["0", "1", "2", "3", "4"], 0.05, "%.2f"),
+    },
+    "Filtro de mercado": {
+        "bandas_qualidade": (["Evitar", "Baixa", "Monitorar", "Boa", "Forte"], 1.0, "%.0f"),
+    },
+}
+
+PARAM_AJUDA = {
+    "vol_baixa_max_pct": "Abaixo disso a entrada é bloqueada — o ativo não anda o bastante pra pagar o risco.",
+    "vol_excessiva_min_pct": "Acima disso o score é capado: o ativo está volátil demais pra o stop fazer sentido.",
+    "evento_max_idade": "Um BOS/CHoCH mais velho que isso deixa de contar como sinal recente.",
+    "normalizacao_score": "Divide o score de cada leitura antes de aplicar o peso. Acoplado ao teto da leitura isolada.",
+    "confluencia_banda_empate": "Diferença mínima entre compra e venda pra a confluência sair de NEUTRO.",
+    "multiplicador_concordancia": "Multiplicador do score da confluência por quantas das 4 leituras concordam (0 a 4)",
+    "bandas_qualidade": "Score a partir do qual cada rótulo de qualidade começa",
+    "score_minimo_operavel": "Abaixo disso a direção vira NEUTRO, qualquer que seja a leitura.",
+    "stop_minimo_atr": "Piso da distância entrada→stop, pra um stop estrutural colado demais não virar risco irreal.",
+    "rompimento_tolerancia_pct": "Quão perto do nível rompido o preço precisa voltar pra contar como reteste.",
+}
+
+if "perfis" not in st.session_state:
+    st.session_state.perfis = load_profiles()
+if "perfil_aplicado" not in st.session_state:
+    st.session_state.perfil_aplicado = None
+
+# Precisa nascer explícito, igual ao `symbol_select` acima. Sem isso o
+# selectbox assume a PRIMEIRA opção da lista ordenada — que é o primeiro
+# perfil em ordem alfabética, não o padrão. E o estrago não é só cosmético:
+# o primeiro run aplicaria os parâmetros do padrão, o widget gravaria outro
+# nome em `perfil_select`, e o run seguinte veria "o perfil mudou" e
+# reaplicaria por cima de qualquer ajuste que o usuário tivesse feito.
+if "perfil_select" not in st.session_state:
+    st.session_state.perfil_select = DEFAULT_PROFILE_NAME
+
+# Salvar/remover perfil precisa mudar qual está selecionado, e o botão que
+# faz isso roda DEPOIS que o selectbox já nasceu — mexer na chave dele ali
+# levanta StreamlitAPIException. Mesma solução do `jump_to_symbol` acima:
+# o botão deixa o pedido aqui e o rerun aplica antes do widget existir.
+if st.session_state.get("perfil_pendente"):
+    _pedido = st.session_state.pop("perfil_pendente")
+    st.session_state.perfis = load_profiles()
+    if _pedido in st.session_state.perfis:
+        st.session_state.perfil_select = _pedido
+    else:
+        st.session_state.perfil_select = DEFAULT_PROFILE_NAME
+    st.session_state.perfil_aplicado = None  # força reaplicar as chaves param_*
+
+_perfil_alvo = st.session_state.get("perfil_select") or DEFAULT_PROFILE_NAME
+if _perfil_alvo not in st.session_state.perfis:
+    _perfil_alvo = DEFAULT_PROFILE_NAME
+if _perfil_alvo != st.session_state.perfil_aplicado:
+    for _campo, _valor in st.session_state.perfis[_perfil_alvo].to_items():
+        if isinstance(_valor, tuple):
+            for _i, _item in enumerate(_valor):
+                st.session_state[f"param_{_campo}_{_i}"] = _item
+        else:
+            st.session_state[f"param_{_campo}"] = _valor
+    st.session_state.perfil_aplicado = _perfil_alvo
+
+
+def _params_da_sessao() -> AnalysisParams:
+    """Monta o AnalysisParams a partir das chaves `param_*` da sessão."""
+    dados = {
+        campo: st.session_state[f"param_{campo}"]
+        for campo in PARAM_ESCALARES
+        if f"param_{campo}" in st.session_state
+    }
+    for campo, tamanho in PARAM_TUPLAS.items():
+        chaves = [f"param_{campo}_{i}" for i in range(tamanho)]
+        if all(chave in st.session_state for chave in chaves):
+            dados[campo] = [st.session_state[chave] for chave in chaves]
+    return AnalysisParams.from_dict(dados)
+
+
 def _persist_watchlist() -> None:
     try:
         save_symbols(st.session_state.watchlist)
@@ -673,7 +1021,11 @@ with st.sidebar:
     st.markdown("## 📊 Day Trade SMC")
     st.caption("SMC · Price Action · Médias Móveis · VWAP")
 
-    mode = st.radio("Modo", ["Análise individual", "Scanner (todos os ativos)", "Verificação retroativa"], key="mode_select")
+    mode = st.radio(
+        "Modo",
+        ["Análise individual", "Scanner (todos os ativos)", "Verificação retroativa", "Assertividade"],
+        key="mode_select",
+    )
 
     st.markdown("### Fonte de dados")
     source = st.radio(
@@ -770,6 +1122,68 @@ with st.sidebar:
         _persist_watchlist()
         st.rerun()
 
+    st.markdown("### Perfil de análise")
+    perfil = st.selectbox(
+        "Calibragem do motor", sorted(st.session_state.perfis), key="perfil_select",
+        help="Um perfil é um conjunto nomeado de parâmetros do motor. Cada sinal salvo "
+             "guarda o perfil que o gerou, então dá pra comparar a assertividade de uma "
+             "calibragem contra a outra no modo Assertividade.",
+    )
+    params = _params_da_sessao()
+    st.caption(f"hash `{params.params_hash()[:8]}`" + ("" if params == st.session_state.perfis.get(perfil) else " · **alterado, não salvo**"))
+
+    if params.normalizacao_score != params.filtro_isolada_score_max:
+        st.warning(
+            "O divisor de normalização e o teto de score da leitura isolada estão "
+            "diferentes. Os dois são acoplados por construção: uma leitura isolada é "
+            "capada pelo teto, e a confluência divide por esse mesmo número pra ela "
+            "normalizar em 1.0. Separados, a escala da confluência sai do lugar."
+        )
+
+    with st.expander("Ajustar parâmetros", expanded=False):
+        for grupo, campos in PARAM_UI.items():
+            st.markdown(f"**{grupo}**")
+            for campo, rotulo, minimo, maximo, passo in campos:
+                st.number_input(
+                    rotulo, min_value=minimo, max_value=maximo, step=passo,
+                    key=f"param_{campo}", help=PARAM_AJUDA.get(campo),
+                )
+            for campo, (rotulos, passo, formato) in PARAM_UI_TUPLAS.get(grupo, {}).items():
+                st.caption(PARAM_AJUDA.get(campo, campo))
+                colunas = st.columns(len(rotulos))
+                for i, (coluna, rotulo) in enumerate(zip(colunas, rotulos)):
+                    with coluna:
+                        st.number_input(rotulo, step=passo, key=f"param_{campo}_{i}", format=formato)
+
+        st.divider()
+        novo_perfil = st.text_input("Salvar como perfil", value=perfil, key="novo_perfil_input")
+        col_salvar, col_remover = st.columns(2)
+        with col_salvar:
+            if st.button("Salvar", use_container_width=True) and novo_perfil.strip():
+                # o try cobre SÓ a gravação: englobar o st.rerun/session_state
+                # transformaria um erro de API do Streamlit em "não foi possível
+                # salvar" logo depois de a gravação ter dado certo
+                try:
+                    save_profile(novo_perfil.strip(), params)
+                except Exception as exc:
+                    st.error(f"Não foi possível salvar: {exc}")
+                else:
+                    st.session_state.perfil_pendente = novo_perfil.strip()
+                    st.rerun()
+        with col_remover:
+            if st.button("Remover perfil", use_container_width=True, disabled=perfil == DEFAULT_PROFILE_NAME):
+                try:
+                    delete_profile(perfil)
+                except Exception as exc:
+                    st.error(f"Não foi possível remover: {exc}")
+                else:
+                    st.session_state.perfil_pendente = DEFAULT_PROFILE_NAME
+                    st.rerun()
+
+        if st.button("Restaurar valores do perfil", use_container_width=True):
+            st.session_state.perfil_aplicado = None
+            st.rerun()
+
     st.markdown("### Parâmetros")
     st.caption(f"A recomendação exige **{TIMEFRAME_LABELS[conf_a]}** e **{TIMEFRAME_LABELS[conf_b]}** concordando "
               f"(ver \"Filtro multi-timeframe\" no rodapé). "
@@ -777,6 +1191,14 @@ with st.sidebar:
     count = st.slider(STYLES[style]["count_label"], min_value=50, max_value=400, value=250, step=10)
     risk_budget = st.number_input("Risco máximo (R$) — opcional", min_value=0.0, value=0.0, step=50.0)
     risk_budget = risk_budget if risk_budget > 0 else None
+
+    # Inicializados INCONDICIONALMENTE, antes da cadeia de modos: eles são
+    # lidos lá embaixo no corpo principal sem guarda nenhuma, e até aqui só
+    # funcionava porque o if/elif do corpo espelhava exatamente o daqui. Com
+    # mais um modo, esse acoplamento vira NameError na primeira divergência.
+    auto_refresh = False
+    refresh_interval = 60
+    run_scanner_clicked = False
 
     if mode == "Análise individual":
         st.markdown("### Atualização")
@@ -806,16 +1228,16 @@ if mode == "Análise individual":
 
     if auto_refresh:
         st.caption(f"🔄 Atualizando automaticamente a cada {refresh_interval}s")
-        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, source, count, risk_budget)
+        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, source, count, risk_budget, params, perfil)
     else:
-        render_individual_analysis(symbol, style, modality, source, count, risk_budget)
+        render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
 
 elif mode == "Scanner (todos os ativos)":
     st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · leitura: {modality} · "
-              f"{count} candles · recomendação exige {conf_a}+{conf_b} concordando")
+              f"perfil: {perfil} · {count} candles · recomendação exige {conf_a}+{conf_b} concordando")
 
     if run_scanner_clicked:
-        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, modality, source, count, risk_budget)
+        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, modality, source, count, risk_budget, params)
         st.session_state.scanner_risk_budget = risk_budget
 
     if "scanner_result" in st.session_state:
@@ -845,6 +1267,9 @@ elif mode == "Scanner (todos os ativos)":
     else:
         st.info("Clique em **Rodar scanner** na barra lateral para analisar todos os ativos da watchlist.")
 
-else:  # Verificação retroativa
+elif mode == "Verificação retroativa":
     symbol = st.session_state.symbol_select
-    render_retro_check(symbol, style, modality, source, count)
+    render_retro_check(symbol, style, modality, source, count, params)
+
+else:  # Assertividade
+    render_assertividade(sorted(st.session_state.perfis))

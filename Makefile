@@ -125,8 +125,11 @@ help:
 	@echo "tags deste build:  $(BACKEND_IMAGE)  $(STREAMLIT_IMAGE)"
 	@echo "scraper:           $(SCRAPER_VERSION) -> $(VM_HOST):$(VM_APP_DIR)"
 
+# Contexto na RAIZ (e não em backend/) porque o analyzer.py roda o motor, e
+# `daytrade_smc.py` mora aqui fora. Mesmo formato do build do streamlit logo
+# abaixo. Ver o cabeçalho do backend/Dockerfile e o .dockerignore.
 build-backend:
-	docker build -t "$(BACKEND_IMAGE)" backend/
+	docker build -f backend/Dockerfile -t "$(BACKEND_IMAGE)" .
 
 build-streamlit:
 	docker build -f Dockerfile.streamlit -t "$(STREAMLIT_IMAGE)" .

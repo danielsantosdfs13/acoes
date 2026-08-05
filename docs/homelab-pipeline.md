@@ -36,6 +36,9 @@ processor (HTTP) → TimescaleDB → api (HTTP) → app.
 | Cadência do scraper | Loop contínuo (poucos segundos) | Sensação de tempo quase real, no mesmo nível do modo MT5 direto local. |
 | Credencial de banco | Só `processor`, `api` e o Job de migration têm | O scraper (VM Windows, mais exposta) e o Streamlit falam só HTTP — reduz superfície de risco. |
 | Ponte GitHub existente | Mantida, intocada, dormente | Superseded em intenção por este pipeline, mas remoção é decisão separada, não tomada ainda. |
+| Geração de sinais | Worker `analyzer` no cluster (4º entrypoint da mesma imagem) **+** botão "salvar sinal" no Streamlit, distinguidos pela coluna `origem` | O worker varre a watchlist inteira toda vela e é o que torna a assertividade uma medição; sem ele só existiriam os sinais que alguém por acaso olhou, e a taxa de acerto sairia enviesada pelo uso da interface. O botão manual continua existindo pra marcar o que interessou na hora. |
+| Parâmetros de análise | Conjunto curado (~30) num `AnalysisParams`, agrupado em **perfis nomeados** na tabela `analysis_profiles` | Calibrar sem editar código, e — porque cada sinal grava o perfil que o gerou — comparar historicamente a assertividade de uma calibragem contra a outra. Fallback pro JSON local, mesmo padrão da watchlist. |
+| Onde o analyzer lê candles | SQL in-process (o analyzer **é** o backend) | HTTP pra própria `api` acrescentaria um round-trip de serialização de ~250 velas × 4 timeframes × 11 símbolos por varredura, e mataria o worker toda vez que o pod da api reiniciasse. |
 
 ## Arquitetura
 
@@ -50,13 +53,16 @@ VM Windows (fora do cluster)          k3s — ns acoes
 │  acoes-processor.…     │                             ▼
 └────────────────────────┘            ┌──────────────────────────────────┐
                                       │ ns default — timescaledb         │
-                                      │   database: daytrade             │
-                                      └────────────────┬─────────────────┘
-                                                       │ SQL read
-                                      ┌────────────────▼─────────────────┐
-                                      │ api        :8000   (só leitura)  │
-                                      │   GET /candles  GET /watchlist   │
+              ┌──────────────────────▶│   database: daytrade             │
+              │ SQL read+write        │   candles · watchlist            │
+              │                       │   signals · analysis_profiles    │
+   ┌──────────┴─────────────┐         └────────────────┬─────────────────┘
+   │ analyzer (sem porta)   │                          │ SQL read
+   │  varre → grava signals │         ┌────────────────▼─────────────────┐
+   │  avalia desfechos      │         │ api        :8000   (só leitura)  │
+   └────────────────────────┘         │   GET /candles  GET /watchlist   │
                                       │   PUT /watchlist   GET /status   │
+                                      │   …/profiles   …/signals   (auth)│
                                       └───▲──────────────────▲───────────┘
                                           │ ClusterIP        │
                                    ┌──────┴──────┐   internet│
@@ -67,7 +73,11 @@ VM Windows (fora do cluster)          k3s — ns acoes
 ```
 
 O scraper nunca fala com o Postgres — só conhece o `processor`. O Streamlit
-também não: consome a `api` por HTTP. **Só o backend fala SQL.**
+também não: consome a `api` por HTTP. **Só o backend fala SQL** — e o
+`analyzer` é backend, por isso lê e escreve direto, sem passar pela `api`.
+
+O `analyzer` não tem Service, nem porta, nem probe: não serve nada e não
+deve ser endereçável de fora.
 
 O scraper busca a watchlist no próprio `processor`, não na `api`. Por isso
 `GET /watchlist` existe nos dois serviços: é uma função de rota repetida,
@@ -131,6 +141,19 @@ só existia dentro da LAN isso era aceitável; com a `api` publicada,
 preenchê-la é o único controle sobre `POST /candles` e `PUT /watchlist` —
 não é mais defesa em profundidade, é o controle principal. `GET /candles`,
 `GET /watchlist` e `GET /status` seguem sem auth por construção.
+
+**As rotas de perfis e sinais são a exceção: autenticadas INCLUSIVE nos
+GETs.** A regra antiga ("GET aberto, escrita com chave") vale pra OHLCV,
+que é dado público de mercado. Perfil de calibragem e histórico de sinais
+não são: são a pesquisa do usuário, e a taxa de acerto de cada leitura é
+justamente o que ninguém mais deveria ler. Não custa nada ao cliente —
+`daytrade_smc._api_headers()` já manda a chave em toda chamada.
+
+Como a chave vazia desliga a checagem inteira em silêncio, e agora isso
+exporia também perfis e sinais, a `api` passou a **logar um aviso alto no
+start** quando `ACOES_API_KEY` estiver vazia. Avisa em vez de recusar
+subir de propósito: um CrashLoopBackOff ali tiraria do ar também a leitura
+de candles, que é pública de qualquer jeito.
 
 O Streamlit **não tem autenticação nenhuma** e a watchlist é editável pela
 UI, então `acoes.dondon.services` público significa que qualquer visitante lê
@@ -219,16 +242,21 @@ Bootstrap da VM (OpenSSH Server, chave pública, NSSM) está em
 
 | Componente | Arquivo(s) | O que faz |
 |---|---|---|
-| Schema | `backend/schema.sql` | `candles` (hypertable) + `watchlist`, chave composta `(symbol, timeframe, time)` pra upsert idempotente |
+| Schema | `backend/schema.sql` | `candles` (hypertable) + `watchlist` + `analysis_profiles` + `signals`, todas idempotentes |
 | Migration | `backend/migrate.py` | Aplica o schema numa transação; roda como hook PreSync |
 | Processor (escrita) | `backend/processor.py` | `GET /health`, `POST /candles`, `GET /watchlist` |
-| API (leitura) | `backend/api.py` | `GET /health`, `GET /candles`, `GET /watchlist`, `PUT /watchlist`, `GET /status` |
-| Auth | `backend/auth.py` | `X-API-Key` contra `ACOES_API_KEY`, compartilhado pelos dois |
+| API (leitura) | `backend/api.py` | `GET /health`, `/candles`, `/watchlist`, `/status`, mais `/profiles` e `/signals` (estas com auth também no GET) |
+| Analyzer (worker) | `backend/analyzer.py` | Loop com gate de pregão: varre watchlist × timeframe × perfil gravando `signals`, e avalia os desfechos pendentes reusando `evaluate_signal_outcome` |
+| Auth | `backend/auth.py` | `X-API-Key` contra `ACOES_API_KEY`, compartilhado pelos entrypoints |
+| Parâmetros de análise | `daytrade_smc.py` (`AnalysisParams`, `DEFAULT_PARAMS`) | ~30 parâmetros curados; um campo `params` no `MarketContext` os leva a toda função de score/risco sem mudar assinatura |
+| Perfis via API | `daytrade_smc.py` (`load_profiles`/`save_profile`/`delete_profile`) | `GET`/`PUT`/`DELETE /profiles` quando `ACOES_API_URL` está configurada; cai pro `daytrade_profiles.json` senão |
+| Sinais via API | `daytrade_smc.py` (`signal_payload`, `save_signal`, `fetch_signals`, `fetch_signal_stats`) | `signal_payload` é o construtor ÚNICO, usado pelo worker e pelo botão manual, pra as duas origens gravarem linhas idênticas. Aqui **não há fallback local** — de propósito |
 | Scraper | `scraper/scraper.py`, `config.py` | Loop contínuo, reaproveita `daytrade_smc.fetch_ohlcv(..., source="MetaTrader 5")`, reenvia as últimas `TRAILING_WINDOW` velas a cada loop (ver "Por que sem watermark") |
 | Fonte no motor | `daytrade_smc.py` (`DATA_SOURCES`, `_fetch_ohlcv_api`, `ACOES_API_URL`) | Lê candles pela api seguindo o mesmo contrato de `fetch_ohlcv` (índice UTC tz-aware, colunas `[open,high,low,close,volume]`, ordem ascendente) |
 | Watchlist via API | `daytrade_smc.py` (`load_symbols`/`save_symbols`, `_load_symbols_api`/`_save_symbols_api`) | `GET`/`PUT /watchlist` quando `ACOES_API_URL` está configurada; cai pro arquivo local senão |
 | Streamlit | `streamlit_app.py` (injeção de `ACOES_API_URL`, `_cached_mtf_api`, `SOURCE_LABELS`) | Sidebar mostra "Homelab (API)" como 4ª opção |
-| Imagens | `backend/Dockerfile`, `Dockerfile.streamlit` | `acoes-backend` (3 entrypoints) e `acoes-streamlit` (sem driver de banco) |
+| Perfis e assertividade na UI | `streamlit_app.py` (seletor de perfil, expander de parâmetros, modo "Assertividade", botão "salvar sinal") | Os parâmetros atravessam o `st.cache_data` como **tupla de pares** (`params.to_items()`); ver o docstring de `cached_mtf` sobre por que um dataclass ali falharia em silêncio |
+| Imagens | `backend/Dockerfile`, `Dockerfile.streamlit` | `acoes-backend` (4 entrypoints) e `acoes-streamlit` (sem driver de banco). O backend passou a buildar **a partir da raiz** (`-f backend/Dockerfile .`) porque o analyzer precisa do `daytrade_smc.py`; ver `.dockerignore` |
 | Release k3s | `Makefile`, `scripts/init-tenant-db.sh` | build → containerd → tag nos manifests → push |
 | Release scraper | `Makefile` (alvos `scraper-*`) | scp pra `C:\acoes` + restart do serviço, com `DEPLOY-INFO` de versão |
 
@@ -280,10 +308,70 @@ Enquanto o serviço não existe, o scraper só roda à mão
 formação, cujo OHLC muda a cada tick até fechar. Se o scraper só reenviasse
 linhas mais novas que uma marca lembrada, perderia toda atualização
 intra-vela da barra em formação. Em vez disso, a cada loop reenvia as
-últimas `TRAILING_WINDOW` (padrão 10) velas de cada symbol/timeframe, e o
-`ON CONFLICT DO UPDATE` do processor absorve as repetidas como no-op. Pouco
-tráfego, e correto contra reinícios, loops perdidos e o problema da vela em
-formação, sem nenhum estado local pra persistir ou corromper.
+últimas `TRAILING_WINDOW` (padrão 3) velas de cada symbol/timeframe, e o
+`ON CONFLICT DO UPDATE` do processor deduplica. Correto contra reinícios,
+loops perdidos e o problema da vela em formação, sem nenhum estado local
+pra persistir ou corromper.
+
+> **Correção de 2026-08-04.** Este parágrafo dizia que o upsert absorvia as
+> repetidas *"como no-op"*, com `TRAILING_WINDOW` em 10. A afirmação era
+> falsa na camada de armazenamento: como `ingested_at = now()` sempre muda,
+> cada reenvio era um UPDATE MVCC real — tupla nova, tupla morta, WAL e
+> autovacuum. O custo medido no cluster estava em **160,7 escritas/s e
+> 2,1 GB de WAL por dia** para manter **~370 linhas novas por pregão**
+> (~40 KB/dia), ou seja ~99,997% de escrita desperdiçada. Três mudanças
+> corrigiram isso, e o "no-op" só passou a ser verdade com a primeira:
+>
+> 1. guarda `IS DISTINCT FROM` no `DO UPDATE` (`backend/processor.py`) — o
+>    UPDATE só acontece se algum campo do OHLCV mudou de fato;
+> 2. `TRAILING_WINDOW` de 10 → 3, já que só a vela em formação muda entre
+>    um loop e outro;
+> 3. gate de horário de pregão no scraper — antes, ~70% das escritas
+>    aconteciam de madrugada e no fim de semana, quando nada pode mudar.
+>
+> Note que `last_ingested_at` no `GET /status` mudou de significado por
+> causa do item 1: agora é "última vez que o dado mudou", não "última vez
+> que o scraper falou", e congela com o mercado fechado.
+
+## Por que o analyzer não guarda estado
+
+Mesma resposta do scraper, por um motivo parecido: a deduplicação mora no
+banco, não no worker. Cada linha de `signals` é chaveada por
+`(symbol, timeframe, modalidade, candle_time, perfil, origem)` num índice
+ÚNICO, e a varredura usa `ON CONFLICT DO NOTHING`. Reiniciar o pod no meio
+de uma varredura, perder um ciclo, ou varrer duas vezes seguidas não produz
+linha repetida — e não há watermark, cursor nem arquivo pra corromper.
+
+**`DO NOTHING`, nunca `DO UPDATE`.** Um sinal não muda depois que a vela
+fechou, então um UPDATE incondicional só geraria tupla morta, WAL e
+autovacuum a cada varredura — exatamente o incidente de 2026-08-04
+registrado logo acima. Aqui o erro foi evitado antes de acontecer.
+
+**Só velas fechadas.** Esta é a armadilha número um do worker, e é
+específica dele: o scraper grava a vela ABERTA a cada ciclo, por design
+(ver "por que sem watermark"), enquanto `_fetch_ohlcv_yahoo` descarta a
+vela corrente antes de devolver. O caminho do banco não tem esse filtro de
+graça, então `analyzer._ler_candles` corta explicitamente
+(`index + duration <= now()`). Sem o corte, o worker analisaria a vela pela
+metade, o `DO NOTHING` congelaria essa leitura como se fosse o sinal
+definitivo daquela vela, e **todo o dataset de assertividade ficaria errado
+de um jeito que parece certo**.
+
+**Por que 900s e não 300s de intervalo.** 900s casa com a vela mais curta
+varrida (M15), e um sinal não muda depois do fechamento — varrer mais rápido
+só produz tentativas de INSERT que o `ON CONFLICT` descarta. A 300s num
+pregão de 10h seriam ~26.400 INSERTs tentados por dia contra ~2.090 linhas
+reais (11 símbolos × 4 timeframes × 5 modalidades, uma linha por VELA e não
+por varredura): ~92% de conflito. Conflito é barato, mas não é grátis — e
+cada tentativa **queima um valor da sequence**, porque `GENERATED AS
+IDENTITY` não faz rollback. Inofensivo num `BIGINT`, mas deixaria `max(id)`
+dez vezes maior que a contagem real de sinais, e alguém leria isso como
+"geramos 26 mil sinais". É a lição do `TRAILING_WINDOW` 10→3 aplicada antes
+de repetir o erro.
+
+Volume esperado: ~2.090 linhas por pregão, ~110 MB por ano — irrelevante
+perto da `candles`. Por isso `signals` **não** é hypertable; a justificativa
+completa está no comentário da tabela em `backend/schema.sql`.
 
 ## Endpoints (referência rápida)
 
@@ -304,6 +392,15 @@ formação, sem nenhum estado local pra persistir ou corromper.
 | GET | `/watchlist` | não | símbolos ativos |
 | PUT | `/watchlist` | `X-API-Key` | substitui a lista **inteira** (ver abaixo) |
 | GET | `/status` | não | `MAX(time)`/`MAX(ingested_at)` por symbol+timeframe |
+| GET | `/profiles` | `X-API-Key` | perfis de análise ativos |
+| GET | `/profiles/{nome}` | `X-API-Key` | um perfil; 404 se não existir |
+| PUT | `/profiles/{nome}` | `X-API-Key` | cria ou substitui o perfil **inteiro**; reativa um desativado |
+| DELETE | `/profiles/{nome}` | `X-API-Key` | soft-delete (`ativo=false`); 400 no perfil `padrão` |
+| POST | `/signals` | `X-API-Key` | grava um sinal; devolve `duplicado=true` se a vela já tinha aquele registro |
+| GET | `/signals` | `X-API-Key` | histórico com filtros (symbol, timeframe, modalidade, perfil, origem, resultado, dias, limite) |
+| GET | `/signals/stats` | `X-API-Key` | assertividade por modalidade, com recortes por timeframe, ativo, direção, faixa de score e confirmação MTF |
+
+**`analyzer`** — worker, sem porta e sem Service: não expõe rota nenhuma.
 
 `PUT` e não `POST` porque `save_symbols` sempre teve semântica de
 sobrescrever tudo de uma vez: o servidor desativa quem saiu e (re)ativa quem
@@ -314,15 +411,27 @@ por símbolo removido não expressa isso atomicamente.
 
 | Variável | Onde | Padrão | Uso |
 |---|---|---|---|
-| `DATABASE_URL` | processor, api, migrate | — | DSN do Postgres; montado no manifest a partir do Secret, nunca guardado inteiro nele |
+| `DATABASE_URL` | processor, api, analyzer, migrate | — | DSN do Postgres; montado no manifest a partir do Secret, nunca guardado inteiro nele |
 | `ACOES_API_KEY` | processor, api, streamlit, scraper | vazio (**sem auth — não deixe assim**) | header `X-API-Key` |
+| `ANALYZER_INTERVAL_SECONDS` | analyzer | `900` | intervalo da varredura com o pregão aberto — ver "por que 900 e não 300" abaixo |
+| `ANALYZER_FECHADO_SLEEP_SECONDS` | analyzer | `900` | intervalo fora do pregão |
+| `ANALYZER_TIMEFRAMES` | analyzer | `M15,H1,H4,D1` | timeframes varridos; espelha `SCRAPER_TIMEFRAMES` |
+| `ANALYZER_COUNTS` | analyzer | `M15=250,H1=250,H4=150,D1=250` | velas lidas por timeframe |
+| `ANALYZER_PERFIS` | analyzer | `padrão` | perfis varridos (um conjunto de linhas por perfil) |
+| `ANALYZER_CONFIRMACAO` | analyzer | `M15,H1` | par que define "confirmado no MTF"; o de Swing (`D1,W1`) exigiria W1, que o scraper não coleta |
+| `ANALYZER_JANELA_DESFECHO_DIAS` | analyzer | `30` | recorte dos sinais pendentes no passe de desfecho |
+| `MERCADO_*` | analyzer | iguais ao scraper | gate de pregão, mesma regra |
 | `ACOES_API_URL` | streamlit | — | URL da api; no cluster é `http://api.acoes.svc.cluster.local:8000`. Também aceito via `st.secrets["acoes_api_url"]` |
 | `PROCESSOR_URL` | scraper | `http://localhost:8000` | no homelab é `https://acoes-processor.dondon.services` |
-| `POLL_INTERVAL_SECONDS` | scraper | `5` | intervalo do loop |
+| `POLL_INTERVAL_SECONDS` | scraper | `5` | intervalo do loop com o mercado aberto |
 | `SCRAPER_TIMEFRAMES` | scraper | `M15,H1,H4,D1` | timeframes coletados (W1 fica fora do tempo real por baixo valor numa cadência de segundos) |
-| `TRAILING_WINDOW` | scraper | `10` | quantas velas reenviar a cada loop |
+| `TRAILING_WINDOW` | scraper | `3` | quantas velas reenviar a cada loop |
 | `WATCHLIST_REFRESH_SECONDS` | scraper | `60` | intervalo de releitura da watchlist |
 | `REQUEST_TIMEOUT_SECONDS` | scraper | `10` | timeout das chamadas HTTP |
+| `MERCADO_TIMEZONE` | scraper | `America/Sao_Paulo` | fuso do gate de pregão (exige o pacote `tzdata` no Windows) |
+| `MERCADO_ABERTURA_HORA` | scraper | `9` | início da janela de coleta, hora local |
+| `MERCADO_FECHAMENTO_HORA` | scraper | `19` | fim da janela (exclusivo); folga proposital pra cobrir after-market e fechamento do D1 |
+| `MERCADO_FECHADO_SLEEP_SECONDS` | scraper | `300` | intervalo do loop fora do pregão |
 
 ## O que fica obsoleto (mantido, não removido)
 
@@ -330,6 +439,33 @@ por símbolo removido não expressa isso atomicamente.
 os globais `GITHUB_BRIDGE_REPO`/`GITHUB_BRIDGE_TOKEN` e
 `.github/workflows/mt5-update.yml` continuam no repo, intocados. Remover é
 uma decisão separada, ainda não tomada.
+
+## O que falta pro analyzer entrar em produção
+
+O código e a imagem estão prontos; o que falta mora no **repo `homelab`**,
+que este repo não pode tocar. Em `applications/acoes/`, um
+`deployment-analyzer.yaml` novo, partindo de uma cópia do `deployment-api.yaml`:
+
+- `metadata.name: analyzer`, `command: ["python", "analyzer.py"]`
+- **remover** `ports`, `readinessProbe` e `livenessProbe` — não sobe servidor HTTP
+- **manter na ordem** o trio `DATABASE_USER` → `DATABASE_PASSWORD` → `DATABASE_URL`
+  (a expansão de `$(VAR)` do Kubernetes depende dela)
+- acrescentar as `ANALYZER_*` e `MERCADO_*` da tabela de variáveis acima
+- `replicas: 1` + `strategy: {type: Recreate}` — dois analyzers não corrompem
+  nada (o índice único protege), só dobram trabalho à toa
+- `resources: requests {cpu: 200m, memory: 384Mi}, limits {memory: 1Gi}` —
+  pandas precisa de mais folga que os 384Mi da api
+- **nada** em `service-*.yaml`, `gateway.yaml` ou `virtualservice.yaml`
+
+O `sed` do alvo `manifests:` do Makefile já reescreve `image: acoes-backend:`
+em todo `*.yaml` da pasta, então o arquivo novo é carimbado sozinho — não há
+alvo novo pra criar.
+
+**Custo da imagem, medido em 2026-08-04**: `acoes-backend` foi pra **536 MB**,
+dos quais 279 MB são a camada do `pip install`; `pandas` (68 MB), `numpy`
+(40 MB) e `yfinance` (1 MB) somam ~110 MB diretos, mais as transitivas. É
+pago uma vez por release, num nó só, e compartilhado pelos quatro workloads —
+que é justamente por que eles continuam numa imagem só, e não em duas.
 
 ## Fase opcional (não bloqueia o pipeline funcionando)
 

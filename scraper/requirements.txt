@@ -7,3 +7,8 @@
 #   pip install -r scraper/requirements.txt
 #
 requests>=2.31
+
+# O gate de pregão usa zoneinfo.ZoneInfo("America/Sao_Paulo"). No Linux o
+# zoneinfo lê a base de fusos do sistema, mas o Windows não tem uma — sem este
+# pacote o scraper morre no start com ZoneInfoNotFoundError.
+tzdata>=2024.1

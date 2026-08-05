@@ -1,0 +1,25 @@
+# Os dois Dockerfiles buildam a partir da RAIZ do repo (`-f <arquivo> .`),
+# então o contexto é o repo inteiro. Sem este arquivo, cada build enviaria
+# o .git e o histórico de candles junto pro daemon.
+#
+# Nada aqui é copiado por nenhum Dockerfile — os COPY são todos explícitos,
+# arquivo por arquivo. Isto existe pelo custo do contexto, não por segurança.
+.git
+.github
+__pycache__
+*.pyc
+.venv
+venv
+
+docs/
+scraper/
+scripts/
+mt5_bridge/
+data/
+
+Makefile
+README.md
+CLAUDE.md
+requirements-local.txt
+daytrade_symbols.json
+daytrade_profiles.json

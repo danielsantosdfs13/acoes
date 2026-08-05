@@ -24,9 +24,32 @@ CREATE TABLE IF NOT EXISTS candles (
 
 SELECT create_hypertable('candles', 'time', chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE);
 
--- O padrão de leitura é sempre "últimas N linhas de um symbol+timeframe,
--- time DESC" — este índice faz isso ser um index scan puro.
-CREATE INDEX IF NOT EXISTS candles_symbol_tf_time_desc_idx ON candles (symbol, timeframe, time DESC);
+-- A janela de 7 dias do create_hypertable acima só vale pra quem cria a
+-- tabela do zero; este set_chunk_time_interval é o que reajusta um banco já
+-- existente, e vale pra chunks NOVOS (os antigos ficam como estão).
+--
+-- 7 dias era pequeno demais: o backfill de D1 vai até 2022, o que gerou 213
+-- chunks pra 40 mil linhas — ~190 linhas por chunk, quando o Timescale é
+-- dimensionado pra chunks de milhões. O preço aparece no planejamento de
+-- query, não no disco: em 2026-08-04 o GET /status gastava 150 ms de planning
+-- (contra 29 ms de execução) só pra montar um plano de 1.270 linhas sobre
+-- todos os chunks.
+SELECT set_chunk_time_interval('candles', INTERVAL '90 days');
+
+-- NÃO recrie um índice (symbol, timeframe, time DESC) aqui.
+--
+-- Ele existiu até 2026-08 com a justificativa de servir o padrão de leitura
+-- "últimas N velas de um symbol+timeframe, time DESC". Só que a PRIMARY KEY
+-- (symbol, timeframe, time) já resolve isso: um btree é varrido pra trás sem
+-- custo extra. Confirmado por EXPLAIN no chunk quente, onde o próprio planner
+-- escolheu a PK e ignorou o índice dedicado:
+--
+--   ->  Index Scan Backward using "1_candles_pkey" on _hyper_1_1_chunk
+--         Index Cond: ((symbol = 'VALE3') AND (timeframe = 'M15'))
+--
+-- O que ele custava: os índices ocupavam 13 MB contra 7,2 MB de heap, e cada
+-- update não-HOT pagava a escrita nos dois.
+DROP INDEX IF EXISTS candles_symbol_tf_time_desc_idx;
 
 -- Watchlist: fonte única de verdade, substitui o daytrade_symbols.json
 -- local quando ACOES_API_URL está configurado. `active` permite que
@@ -41,6 +64,132 @@ INSERT INTO watchlist (symbol) VALUES
     ('VALE3'), ('PETR4'), ('PRIO3'), ('ITUB4'), ('BBAS3'),
     ('BBDC4'), ('B3SA3'), ('WEGE3'), ('ABEV3'), ('MGLU3'), ('BRA50')
 ON CONFLICT (symbol) DO NOTHING;
+
+-- Perfis de análise: conjunto NOMEADO de parâmetros do motor
+-- (`daytrade_smc.AnalysisParams`). Espelha o papel da `watchlist` acima —
+-- fonte única de verdade quando ACOES_API_URL está configurada, com
+-- fallback pro `daytrade_profiles.json` local senão.
+--
+-- `params` guarda SÓ os campos diferentes do default. Por isso o perfil
+-- semeado abaixo é `{}`, e não o dicionário completo: quando um parâmetro
+-- novo é acrescentado ao motor, o perfil 'padrão' continua significando
+-- "todos os defaults de hoje", sem precisar de migration de dados.
+--
+-- `ativo` em vez de DELETE pelo mesmo motivo da watchlist, mas com um
+-- agravante: um perfil que já gerou sinais NÃO pode sumir, senão a
+-- comparação histórica entre calibragens (que é o ponto de existir
+-- perfil) quebra. A FK lá embaixo em `signals.perfil` é RESTRICT.
+--
+-- ATENÇÃO: `params_hash` aqui é CONSULTIVO — é só o que o cliente que
+-- gravou disse. Quem manda numa comparação é o `params_hash` copiado em
+-- cada linha de `signals` no momento em que o sinal foi gerado.
+CREATE TABLE IF NOT EXISTS analysis_profiles (
+    nome        TEXT PRIMARY KEY,
+    params      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    params_hash TEXT        NOT NULL DEFAULT '',
+    descricao   TEXT        NOT NULL DEFAULT '',
+    ativo       BOOLEAN     NOT NULL DEFAULT true,
+    criado_em   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    alterado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO analysis_profiles (nome, params, params_hash, descricao) VALUES
+    ('padrão', '{}'::jsonb, 'defaults',
+     'Comportamento histórico do motor — nenhum parâmetro alterado.')
+ON CONFLICT (nome) DO NOTHING;
+
+-- Sinais gerados, uma linha por (ativo, timeframe, modalidade, vela).
+-- Quem escreve: o worker `analyzer.py` varrendo a watchlist, e o botão
+-- "salvar sinal" do Streamlit — distinguidos por `origem`.
+--
+-- O DESFECHO mora aqui, em coluna, e não numa tabela separada: um sinal
+-- tem exatamente um desfecho, nunca um histórico deles. Uma tabela 1:1
+-- custaria um join em TODA consulta de assertividade (o caminho quente
+-- do painel) pra ganhar só o fato de esta tabela ser append-only. Nesse
+-- volume, não paga.
+--
+-- `r_alvo_1`/`r_alvo_2` não são decoração. Como `rr_alvo_1`/`rr_alvo_2`
+-- viraram parâmetros ajustáveis por perfil, um `CASE resultado WHEN
+-- 'ALVO_2' THEN 3.0` cravado no SQL de agregação mentiria pra qualquer
+-- perfil que os tivesse mudado. O R realizado fica gravado por linha.
+--
+-- NÃO é hypertable, de propósito. O volume é de ~2 mil linhas por pregão
+-- (11 símbolos × 4 timeframes × 5 modalidades, uma linha por VELA e não
+-- por varredura), ~110 MB por ano. Chunk do Timescale é dimensionado pra
+-- milhões de linhas — a lição de 2026-08 na `candles` logo acima foi
+-- exatamente essa: 213 chunks pra 40 mil linhas custaram 150 ms de
+-- planning. Além disso o caminho de escrita depende de ON CONFLICT sobre
+-- índice único e o de desfecho depende de UPDATE, os dois mais simples
+-- numa tabela comum. Se um dia virar dezenas de milhões de linhas,
+-- `create_hypertable(..., migrate_data => TRUE)` continua disponível.
+--
+-- Sem CHECK nas colunas tipo-enum (`direcao`, `origem`, `modalidade`,
+-- `resultado`): omissão consciente, no mesmo estilo do resto do schema.
+-- Os valores vêm de `Direction`, `MODALITIES` e `evaluate_signal_outcome`
+-- no cliente, e um CHECK aqui viraria uma segunda fonte de verdade pra
+-- manter em sincronia a cada valor novo.
+CREATE TABLE IF NOT EXISTS signals (
+    id                BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    symbol            TEXT        NOT NULL,
+    timeframe         TEXT        NOT NULL,
+    modalidade        TEXT        NOT NULL,   -- Confluência | SMC | Price Action | Médias Móveis | VWAP
+    candle_time       TIMESTAMPTZ NOT NULL,   -- UTC, abertura da vela FECHADA que gerou o sinal
+    perfil            TEXT        NOT NULL REFERENCES analysis_profiles(nome),
+    params_hash       TEXT        NOT NULL,
+    origem            TEXT        NOT NULL,   -- 'worker' | 'manual'
+    direcao           TEXT        NOT NULL,   -- COMPRA | VENDA | NEUTRO
+    score             DOUBLE PRECISION NOT NULL,
+    confianca         DOUBLE PRECISION NOT NULL,
+    setup             TEXT        NOT NULL,
+    mtf_confirmado    BOOLEAN     NOT NULL DEFAULT false,
+    mtf_direcao       TEXT        NOT NULL DEFAULT 'NEUTRO',
+    entrada           DOUBLE PRECISION,
+    stop              DOUBLE PRECISION,
+    alvo_1            DOUBLE PRECISION,
+    alvo_2            DOUBLE PRECISION,
+    r_alvo_1          DOUBLE PRECISION,       -- R realizado se o alvo 1 bater
+    r_alvo_2          DOUBLE PRECISION,       -- idem, alvo 2
+    stop_basis        TEXT        NOT NULL DEFAULT '',
+    detalhes          JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- motivos, alertas, alvos alternativos
+    criado_em         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Desfecho, preenchido pelo segundo passe do analyzer.
+    resultado             TEXT,               -- ALVO_1 | ALVO_2 | STOP | EM_ABERTO | SEM_SINAL
+    resultado_detalhe     TEXT,
+    candles_ate_resultado INT,
+    avaliado_em           TIMESTAMPTZ,
+    avaliado_ate          TIMESTAMPTZ         -- até que vela o desfecho foi conferido
+);
+
+-- ÚNICO índice obrigatório: é a chave de deduplicação E o alvo do
+-- ON CONFLICT do worker. Sem ele, (a) o worker recriaria a mesma linha a
+-- cada varredura e a cada reinício de pod, e (b) dois cliques no botão
+-- "salvar sinal" do Streamlit virariam dois registros — nos dois casos
+-- inflando em silêncio toda taxa de acerto calculada depois.
+--
+-- `origem` entra na chave de propósito: um sinal salvo à mão NÃO deve
+-- colidir com o do worker pra mesma vela (distinguir os dois é
+-- requisito), mas dois cliques na mesma leitura continuam deduplicando.
+CREATE UNIQUE INDEX IF NOT EXISTS signals_dedup_idx
+    ON signals (symbol, timeframe, modalidade, candle_time, perfil, origem);
+
+-- Índice PARCIAL pro segundo passe (avaliação de desfecho), cuja consulta
+-- é "todo sinal ainda sem desfecho final". Esse conjunto é uma fração
+-- mínima da tabela e ENCOLHE com o tempo — a linha sai do índice assim
+-- que o desfecho é gravado. Sem ele, o passe vira um seq scan que cresce
+-- pra sempre.
+CREATE INDEX IF NOT EXISTS signals_pendentes_idx
+    ON signals (candle_time)
+    WHERE resultado IS NULL OR resultado = 'EM_ABERTO';
+
+-- NÃO acrescente índice pras consultas de assertividade sem medir antes.
+--
+-- Elas agregam a tabela inteira com um recorte de data e quebram por
+-- modalidade, timeframe, símbolo, direção, faixa de score e confirmação
+-- MTF. Em 10⁴–10⁵ linhas isso é seq scan + hash aggregate na casa dos
+-- milissegundos; um índice por recorte seriam SEIS índices pagos em toda
+-- escrita pra economizar nada mensurável. Foi exatamente um índice não
+-- medido que custou 13 MB e uma escrita extra por update na `candles`
+-- (ver o comentário lá em cima).
 
 -- Acesso de leitura e escrita pra role `fcar`, que vive no mesmo TimescaleDB
 -- compartilhado e consome estes dados. Fica aqui, e não só aplicado à mão no

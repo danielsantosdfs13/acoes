@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import math
@@ -32,9 +33,11 @@ import re
 import statistics
 import threading
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -134,6 +137,137 @@ class Direction(str, Enum):
     NEUTRAL = "NEUTRO"
 
 
+@dataclass(frozen=True)
+class AnalysisParams:
+    """
+    Conjunto CURADO de parâmetros do motor. Todo default aqui é exatamente
+    o literal que estava cravado no código antes — um `AnalysisParams()`
+    sem argumentos reproduz o comportamento histórico, campo por campo.
+
+    Mora neste arquivo, e não num módulo novo, porque `daytrade_smc.py`
+    não importa nenhum módulo de primeira parte: é o fechamento que o
+    `make release-scraper` entrega pra VM Windows (ver Makefile). Um
+    `params.py` separado quebraria o scraper em silêncio.
+
+    É `frozen` por dois motivos: ganha `__hash__` de graça (o
+    `st.cache_data` do Streamlit precisa hashear isso — ver `to_items`) e
+    torna seguro compartilhar a instância única `DEFAULT_PARAMS` como
+    default de campo do `MarketContext`.
+
+    O que ficou DE FORA, de propósito, pra não procurar em vão:
+      - períodos das EMAs (9/21/50/200): os nomes de coluna `ema_9`... são
+        lidos por nome em meia dúzia de lugares;
+      - as bases 70/55 e o teto 90 do `smc_signal`;
+      - os pesos 50/45/20 do `price_action_signal`;
+      - `min_gap_pct`/`min_slope_pct` do `moving_average_signal`;
+      - os limiares de `_confirmed_breakout` e `candle_patterns`;
+      - os buffers de ATR do `stop_for_signal`/`structural_stop`.
+
+    ATENÇÃO ao par `normalizacao_score` / `filtro_isolada_score_max`: os
+    dois valem 79.0 e são ACOPLADOS por construção — uma leitura isolada
+    é capada em 79 pelo filtro de mercado, e a confluência divide por 79
+    justamente pra essa leitura capada normalizar em exatamente 1.0.
+    Mexer num sem o outro desregula a escala da confluência.
+    """
+
+    # --- Contexto -------------------------------------------------------
+    atr_periodo: int = 14                       # compute_atr
+    swing_esquerda: int = 3                     # detect_swings
+    swing_direita: int = 3                      # detect_swings
+    vol_baixa_max_pct: float = 0.30             # build_context: abaixo disso, volatilidade BAIXA
+    vol_excessiva_min_pct: float = 6.0          # build_context: acima disso, EXCESSIVA
+
+    # --- Estrutura (BOS/CHoCH) e Price Action ---------------------------
+    estrutura_volume_min: float = 1.2           # detect_structure: volume/média mínimo pra validar
+    estrutura_range_min: float = 0.8            # detect_structure: amplitude/ATR mínima
+    evento_max_idade: int = 20                  # last_recent_event: candles desde o BOS/CHoCH
+    rompimento_lookback: int = 20               # breakout_and_retest
+    rompimento_tolerancia_pct: float = 0.3      # breakout_and_retest
+    fvg_max_idade: int = 20                     # detect_fvg_setup
+
+    # --- VWAP -----------------------------------------------------------
+    vwap_distancia_min_pct: float = 0.10        # abaixo disso o preço está "em cima" da VWAP
+    vwap_distancia_max_pct: float = 1.5         # acima disso bloqueia entrada e alerta
+
+    # --- Confluência ----------------------------------------------------
+    peso_smc: float = 30.0
+    peso_price_action: float = 20.0
+    peso_medias: float = 20.0
+    peso_vwap: float = 20.0
+    normalizacao_score: float = 79.0            # divisor que normaliza a força de cada leitura
+    confluencia_banda_empate: float = 3.0       # diferença compra/venda abaixo da qual dá NEUTRO
+    multiplicador_concordancia: tuple[float, ...] = (0.60, 0.60, 0.95, 1.0, 1.10)  # indexado por 0..4 leituras concordando
+
+    # --- Filtro de mercado ----------------------------------------------
+    filtro_isolada_score_max: float = 79.0
+    filtro_isolada_confianca_max: float = 70.0
+    filtro_bloqueio_score_max: float = 39.0
+    filtro_bloqueio_confianca_max: float = 35.0
+    filtro_excessiva_score_max: float = 59.0
+    filtro_excessiva_confianca_max: float = 50.0
+    score_minimo_operavel: float = 40.0
+    bandas_qualidade: tuple[float, ...] = (40.0, 60.0, 70.0, 80.0, 90.0)
+
+    # --- Risco ----------------------------------------------------------
+    rr_alvo_1: float = 1.5
+    rr_alvo_2: float = 3.0
+    stop_minimo_atr: float = 0.75
+
+    def to_items(self) -> tuple[tuple[str, object], ...]:
+        """Forma canônica e hasheável, ordenada por nome do campo.
+
+        É ESTA a forma que atravessa o `@st.cache_data` do Streamlit. O
+        hasher dele garante tuplas de primitivos; um dataclass ou levanta
+        `UnhashableParamError` ou é hasheado por identidade — e a falha
+        por identidade é silenciosa (trocar de perfil continuaria
+        servindo os scores do perfil anterior pelo TTL inteiro)."""
+        return tuple(
+            (campo.name, getattr(self, campo.name))
+            for campo in sorted(fields(self), key=lambda f: f.name)
+        )
+
+    @classmethod
+    def from_items(cls, items: tuple[tuple[str, object], ...]) -> AnalysisParams:
+        return cls.from_dict(dict(items))
+
+    def to_dict(self) -> dict:
+        """Pronto pra JSON: tuplas viram listas."""
+        pronto = {}
+        for campo in fields(self):
+            valor = getattr(self, campo.name)
+            pronto[campo.name] = list(valor) if isinstance(valor, tuple) else valor
+        return pronto
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> AnalysisParams:
+        """Tolerante de propósito: chave desconhecida é ignorada, chave
+        ausente cai no default, lista vira tupla.
+
+        É isso que faz um perfil salvo por um build antigo continuar
+        carregando depois de um parâmetro novo entrar no motor, e que faz
+        `{}` significar "todos os defaults de hoje" — por isso o perfil
+        'padrão' é gravado no banco como um objeto vazio, e não como o
+        dicionário completo."""
+        if not data:
+            return cls()
+        conhecidos = {campo.name for campo in fields(cls)}
+        kwargs = {}
+        for nome, valor in data.items():
+            if nome not in conhecidos:
+                continue
+            kwargs[nome] = tuple(valor) if isinstance(valor, list) else valor
+        return cls(**kwargs)
+
+    def params_hash(self) -> str:
+        """Identidade estável do conjunto, gravada junto de cada sinal pra
+        depois dar pra saber com que calibragem ele foi gerado."""
+        bruto = json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(bruto.encode("utf-8")).hexdigest()[:16]
+
+
+DEFAULT_PARAMS = AnalysisParams()
+
+
 @dataclass
 class Swing:
     index: int
@@ -173,6 +307,10 @@ class MarketContext:
     bullish_retest: bool
     bearish_retest: bool
     fvg_setup: str | None
+    # Único campo com default, e trailing de propósito: é o que torna os
+    # parâmetros alcançáveis por TODA função de score/risco (que recebem
+    # só o contexto) sem mexer em nenhuma assinatura.
+    params: AnalysisParams = DEFAULT_PARAMS
 
 
 @dataclass
@@ -578,7 +716,7 @@ def _fetch_ohlcv_yahoo(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
     return df.tail(count)
 
 
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+def compute_atr(df: pd.DataFrame, period: int = DEFAULT_PARAMS.atr_periodo) -> pd.Series:
     previous_close = df["close"].shift(1)
     true_range = pd.concat(
         [
@@ -623,8 +761,8 @@ def slope_pct(series: pd.Series, lookback: int = 5) -> float:
 
 def detect_swings(
     df: pd.DataFrame,
-    left: int = 3,
-    right: int = 3,
+    left: int = DEFAULT_PARAMS.swing_esquerda,
+    right: int = DEFAULT_PARAMS.swing_direita,
 ) -> list[Swing]:
     highs = df["high"].to_numpy()
     lows = df["low"].to_numpy()
@@ -650,6 +788,7 @@ def detect_structure(
     df: pd.DataFrame,
     swings: list[Swing],
     atr_series: pd.Series,
+    params: AnalysisParams = DEFAULT_PARAMS,
 ) -> list[StructureEvent]:
     volume_average = df["volume"].rolling(20, min_periods=5).mean()
     by_confirmation: dict[int, list[Swing]] = {}
@@ -676,7 +815,14 @@ def detect_structure(
 
         volume_ratio = float(candle["volume"]) / volume_ma
         range_ratio = float(candle["high"] - candle["low"]) / atr
-        valid = volume_ratio >= 1.2 and range_ratio >= 0.8
+        valid = (
+            volume_ratio >= params.estrutura_volume_min
+            and range_ratio >= params.estrutura_range_min
+        )
+        # Os divisores 2.4 e 1.6 continuam literais de propósito: são a
+        # escala da confiança (0.5-1.0 quando válido), não o critério de
+        # validade. Amarrá-los aos mínimos acima mudaria o significado do
+        # número de confiança toda vez que alguém ajustasse o filtro.
         confidence = min(
             1.0,
             0.5 * min(1.0, volume_ratio / 2.4)
@@ -790,8 +936,8 @@ def _confirmed_breakout(candle: pd.Series, level: float, direction: str, atr: fl
 def breakout_and_retest(
     df: pd.DataFrame,
     atr: float,
-    lookback: int = 20,
-    tolerance_pct: float = 0.3,
+    lookback: int = DEFAULT_PARAMS.rompimento_lookback,
+    tolerance_pct: float = DEFAULT_PARAMS.rompimento_tolerancia_pct,
 ) -> tuple[bool, bool, bool, bool]:
     current = df.iloc[-1]
     reference = df.iloc[-(lookback + 1) : -1]
@@ -831,7 +977,7 @@ def breakout_and_retest(
     return broke_high, broke_low, bullish_retest, bearish_retest
 
 
-def detect_fvg_setup(df: pd.DataFrame, max_age: int = 20) -> str | None:
+def detect_fvg_setup(df: pd.DataFrame, max_age: int = DEFAULT_PARAMS.fvg_max_idade) -> str | None:
     current_price = float(df["close"].iloc[-1])
     tolerance = current_price * 0.0015
     first = max(1, len(df) - max_age)
@@ -861,20 +1007,20 @@ def detect_fvg_setup(df: pd.DataFrame, max_age: int = 20) -> str | None:
     return None
 
 
-def build_context(df: pd.DataFrame) -> MarketContext:
+def build_context(df: pd.DataFrame, params: AnalysisParams = DEFAULT_PARAMS) -> MarketContext:
     if len(df) < 30:
         raise ValueError("São necessários pelo menos 30 candles fechados.")
 
-    atr_series = compute_atr(df)
+    atr_series = compute_atr(df, params.atr_periodo)
     atr = float(atr_series.iloc[-1])
     price = float(df["close"].iloc[-1])
     atr_pct = atr / price * 100 if price else 0.0
     rvol_series = df["volume"] / df["volume"].rolling(20, min_periods=5).mean()
     rvol = float(rvol_series.iloc[-1]) if pd.notna(rvol_series.iloc[-1]) else 0.0
 
-    if atr_pct < 0.30:
+    if atr_pct < params.vol_baixa_max_pct:
         volatility = "BAIXA"
-    elif atr_pct > 6.0:
+    elif atr_pct > params.vol_excessiva_min_pct:
         volatility = "EXCESSIVA"
     else:
         volatility = "ADEQUADA"
@@ -891,9 +1037,14 @@ def build_context(df: pd.DataFrame) -> MarketContext:
     rejection = touched_vwap and abs(vwap_distance) >= 0.15
 
     volume_ma_current = float(df["volume"].rolling(20, min_periods=5).mean().iloc[-1])
-    swings = detect_swings(df)
-    events = detect_structure(df, swings, atr_series)
-    broke_high, broke_low, bullish_retest, bearish_retest = breakout_and_retest(df, atr)
+    swings = detect_swings(df, params.swing_esquerda, params.swing_direita)
+    events = detect_structure(df, swings, atr_series, params)
+    broke_high, broke_low, bullish_retest, bearish_retest = breakout_and_retest(
+        df,
+        atr,
+        params.rompimento_lookback,
+        params.rompimento_tolerancia_pct,
+    )
 
     return MarketContext(
         df=df,
@@ -915,22 +1066,26 @@ def build_context(df: pd.DataFrame) -> MarketContext:
         broke_low=broke_low,
         bullish_retest=bullish_retest,
         bearish_retest=bearish_retest,
-        fvg_setup=detect_fvg_setup(df),
+        fvg_setup=detect_fvg_setup(df, params.fvg_max_idade),
+        params=params,
     )
 
 
-def quality(score: float) -> str:
-    if score < 40:
-        return "EVITAR"
-    if score < 60:
-        return "BAIXA QUALIDADE"
-    if score < 70:
-        return "MONITORAR"
-    if score < 80:
-        return "BOA OPORTUNIDADE"
-    if score < 90:
-        return "FORTE OPORTUNIDADE"
-    return "OPORTUNIDADE EXCEPCIONAL"
+QUALITY_LABELS = (
+    "EVITAR",
+    "BAIXA QUALIDADE",
+    "MONITORAR",
+    "BOA OPORTUNIDADE",
+    "FORTE OPORTUNIDADE",
+    "OPORTUNIDADE EXCEPCIONAL",
+)
+
+
+def quality(score: float, params: AnalysisParams = DEFAULT_PARAMS) -> str:
+    for banda, rotulo in zip(params.bandas_qualidade, QUALITY_LABELS):
+        if score < banda:
+            return rotulo
+    return QUALITY_LABELS[-1]
 
 
 def market_alerts(context: MarketContext) -> list[str]:
@@ -939,7 +1094,7 @@ def market_alerts(context: MarketContext) -> list[str]:
         alerts.append("VOLATILIDADE INSUFICIENTE — entrada bloqueada")
     if context.volatility == "EXCESSIVA":
         alerts.append("VOLATILIDADE EXCESSIVA — risco elevado")
-    if abs(context.vwap_distance_pct) > 1.5:
+    if abs(context.vwap_distance_pct) > context.params.vwap_distancia_max_pct:
         alerts.append("PREÇO MUITO DISTANTE DA VWAP — risco de entrada tardia")
     if not context.ema_reliable:
         alerts.append("EMA200 EM AQUECIMENTO — use 200 ou mais candles")
@@ -954,24 +1109,35 @@ def apply_market_filter(
     isolated: bool = False,
     block_entry: bool = False,
 ) -> tuple[Direction, float, float]:
+    params = context.params
     if isolated:
-        score = min(score, 79.0)
-        confidence = min(confidence, 70.0)
+        score = min(score, params.filtro_isolada_score_max)
+        confidence = min(confidence, params.filtro_isolada_confianca_max)
     if context.volatility == "BAIXA" or block_entry:
-        return Direction.NEUTRAL, min(score, 39.0), min(confidence, 35.0)
+        return (
+            Direction.NEUTRAL,
+            min(score, params.filtro_bloqueio_score_max),
+            min(confidence, params.filtro_bloqueio_confianca_max),
+        )
     if context.volatility == "EXCESSIVA":
-        return direction, min(score, 59.0), min(confidence, 50.0)
-    if score < 40:
-        return Direction.NEUTRAL, score, min(confidence, 35.0)
+        return (
+            direction,
+            min(score, params.filtro_excessiva_score_max),
+            min(confidence, params.filtro_excessiva_confianca_max),
+        )
+    if score < params.score_minimo_operavel:
+        return Direction.NEUTRAL, score, min(confidence, params.filtro_bloqueio_confianca_max)
     return direction, score, confidence
 
 
 def last_recent_event(
     context: MarketContext,
-    max_age: int = 20,
+    max_age: int | None = None,
 ) -> StructureEvent | None:
     if not context.events:
         return None
+    if max_age is None:
+        max_age = context.params.evento_max_idade
     event = context.events[-1]
     return event if len(context.df) - 1 - event.index <= max_age else None
 
@@ -1056,10 +1222,10 @@ def price_action_signal(context: MarketContext) -> Signal:
         # deveria nascer abaixo do corte de neutralização só por faltar
         # também um padrão de candle no mesmo candle.
         bull_points += 45
-        reasons.append("Rompimento da máxima dos últimos 20 candles")
+        reasons.append(f"Rompimento da máxima dos últimos {context.params.rompimento_lookback} candles")
     if context.broke_low:
         bear_points += 45
-        reasons.append("Rompimento da mínima dos últimos 20 candles")
+        reasons.append(f"Rompimento da mínima dos últimos {context.params.rompimento_lookback} candles")
     if context.bullish_retest:
         bull_points += 20
         reasons.append("Reteste de alta sustentado")
@@ -1185,7 +1351,7 @@ def vwap_signal(context: MarketContext) -> Signal:
     # precisam superar um mínimo pra contar como "acima/abaixo" ou
     # "subindo/descendo" de verdade — um preço a 0,007% da VWAP está,
     # na prática, EM CIMA dela, não acima nem abaixo.
-    min_distance_pct = 0.10
+    min_distance_pct = context.params.vwap_distancia_min_pct
     min_slope_pct = 0.02
     meaningful_distance = abs(context.vwap_distance_pct) >= min_distance_pct
     above = context.vwap_distance_pct > 0
@@ -1213,7 +1379,7 @@ def vwap_signal(context: MarketContext) -> Signal:
         setup = "Abaixo da VWAP sem inclinação"
         reasons.append("Preço abaixo da VWAP, mas sem inclinação favorável")
 
-    too_far = abs(context.vwap_distance_pct) > 1.5
+    too_far = abs(context.vwap_distance_pct) > context.params.vwap_distancia_max_pct
     direction, score, confidence = apply_market_filter(
         direction,
         score,
@@ -1237,11 +1403,12 @@ def confluence_signal(
     context: MarketContext,
     isolated: list[Signal],
 ) -> Signal:
+    params = context.params
     weights = {
-        "SMC": 30.0,
-        "Price Action": 20.0,
-        "Médias Móveis": 20.0,
-        "VWAP": 20.0,
+        "SMC": params.peso_smc,
+        "Price Action": params.peso_price_action,
+        "Médias Móveis": params.peso_medias,
+        "VWAP": params.peso_vwap,
     }
     buy = 0.0
     sell = 0.0
@@ -1249,7 +1416,7 @@ def confluence_signal(
     reasons: list[str] = []
 
     for signal in isolated:
-        normalized_strength = min(signal.score / 79.0, 1.0)
+        normalized_strength = min(signal.score / params.normalizacao_score, 1.0)
         points = weights[signal.name] * normalized_strength
         if signal.direction == Direction.BUY:
             buy += points
@@ -1262,7 +1429,7 @@ def confluence_signal(
         sell += 10
         reasons.append("Volatilidade adequada para o ativo/timeframe")
 
-    if abs(buy - sell) < 3:
+    if abs(buy - sell) < params.confluencia_banda_empate:
         direction = Direction.NEUTRAL
         score = max(buy, sell) * 0.5
     elif buy > sell:
@@ -1278,7 +1445,7 @@ def confluence_signal(
     # categorias conseguia passar, mesmo com concordância forte. 0.95 dá
     # margem real sem abrir mão do critério (ainda exige concordância
     # genuína e pontuação consistente das 2 categorias).
-    multiplier = {0: 0.60, 1: 0.60, 2: 0.95, 3: 1.0, 4: 1.10}[agreeing]
+    multiplier = params.multiplicador_concordancia[agreeing]
     score = min(100.0, score * multiplier)
     confidence = agreeing / 4 * 100
 
@@ -1391,17 +1558,23 @@ def alternative_targets(
     project = lambda distance: (
         entry + distance if direction == Direction.BUY else entry - distance
     )
+    params = context.params
+    # O corte de viabilidade dos alvos alternativos é o próprio R/R do
+    # alvo 1: um alvo alternativo só é "viável" se render pelo menos
+    # tanto quanto o alvo padrão. Antes era um 1.5 literal, idêntico por
+    # coincidência — amarrado, continua coerente se o R/R for ajustado.
+    minimo_viavel = params.rr_alvo_1
     targets = [
         {
-            "method": "Risco/Retorno 1:1.5",
-            "price": project(risk * 1.5),
-            "rr": 1.5,
+            "method": f"Risco/Retorno 1:{params.rr_alvo_1:.1f}",
+            "price": project(risk * params.rr_alvo_1),
+            "rr": params.rr_alvo_1,
             "viable": True,
         },
         {
-            "method": "Risco/Retorno 1:3.0",
-            "price": project(risk * 3.0),
-            "rr": 3.0,
+            "method": f"Risco/Retorno 1:{params.rr_alvo_2:.1f}",
+            "price": project(risk * params.rr_alvo_2),
+            "rr": params.rr_alvo_2,
             "viable": True,
         },
     ]
@@ -1416,7 +1589,7 @@ def alternative_targets(
                     "method": f"Fibonacci {ratio:.3f}",
                     "price": price,
                     "rr": rr,
-                    "viable": rr >= 1.5,
+                    "viable": rr >= minimo_viavel,
                 }
             )
 
@@ -1442,7 +1615,7 @@ def alternative_targets(
                 "method": "Próxima estrutura (SMC)",
                 "price": structure,
                 "rr": rr,
-                "viable": rr >= 1.5,
+                "viable": rr >= minimo_viavel,
             }
         )
 
@@ -1460,7 +1633,7 @@ def alternative_targets(
                 "method": "Expectativa estatística",
                 "price": price,
                 "rr": rr,
-                "viable": rr >= 1.5,
+                "viable": rr >= minimo_viavel,
             }
         )
 
@@ -1471,32 +1644,34 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
     if signal.direction == Direction.NEUTRAL:
         return
 
+    params = context.params
     entry = round_tick(float(context.df["close"].iloc[-1]), "nearest")
     stop, basis = stop_for_signal(signal, context)
-    minimum_distance = context.atr * 0.75
+    minimum_distance = context.atr * params.stop_minimo_atr
+    minimo_label = f"+mínimo_{params.stop_minimo_atr:g}ATR"
 
     if signal.direction == Direction.BUY:
         if entry - stop < minimum_distance:
             stop = entry - minimum_distance
-            basis += "+mínimo_0.75ATR"
+            basis += minimo_label
         stop = round_tick(stop, "floor")
         risk = entry - stop
         if risk <= 0:
             signal.direction = Direction.NEUTRAL
             return
-        target_1 = round_tick(entry + risk * 1.5, "ceil")
-        target_2 = round_tick(entry + risk * 3.0, "ceil")
+        target_1 = round_tick(entry + risk * params.rr_alvo_1, "ceil")
+        target_2 = round_tick(entry + risk * params.rr_alvo_2, "ceil")
     else:
         if stop - entry < minimum_distance:
             stop = entry + minimum_distance
-            basis += "+mínimo_0.75ATR"
+            basis += minimo_label
         stop = round_tick(stop, "ceil")
         risk = stop - entry
         if risk <= 0:
             signal.direction = Direction.NEUTRAL
             return
-        target_1 = round_tick(entry - risk * 1.5, "floor")
-        target_2 = round_tick(entry - risk * 3.0, "floor")
+        target_1 = round_tick(entry - risk * params.rr_alvo_1, "floor")
+        target_2 = round_tick(entry - risk * params.rr_alvo_2, "floor")
 
     alternatives = alternative_targets(
         context,
@@ -1529,8 +1704,11 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
         )
 
 
-def analyze(df: pd.DataFrame) -> tuple[MarketContext, list[Signal]]:
-    context = build_context(df)
+def analyze(
+    df: pd.DataFrame,
+    params: AnalysisParams = DEFAULT_PARAMS,
+) -> tuple[MarketContext, list[Signal]]:
+    context = build_context(df, params)
     isolated = [
         smc_signal(context),
         price_action_signal(context),
@@ -1566,6 +1744,30 @@ class MultiTimeframeResult:
 MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP")
 ALL_MODALITIES_OPTION = "Todas as modalidades"
 MODALITY_CHOICES = (ALL_MODALITIES_OPTION, *MODALITIES)
+
+
+def mtf_confirmation(
+    signals_por_tf: dict[str, list[Signal] | None],
+    confirmation: tuple[str, str],
+    modality: str,
+) -> tuple[bool, Direction]:
+    """Confirmação multi-timeframe DE UMA modalidade específica.
+
+    A confirmação é uma propriedade do par (timeframes de confirmação,
+    modalidade) — não do símbolo. Carimbar a confirmação da Confluência
+    numa linha de SMC diria que o SMC foi confirmado quando quem
+    concordou foi outra leitura, e o recorte "confirmado no MTF" da
+    assertividade passaria a medir a coisa errada.
+
+    Existe separado de `analyze_symbol_mtf` porque tanto a interface
+    quanto o worker precisam calcular isso pras CINCO modalidades a
+    partir de um mesmo conjunto de resultados, sem reanalisar nada.
+    """
+    tf_a, tf_b = confirmation
+    dir_a = _signal_direction(signals_por_tf.get(tf_a), modality)
+    dir_b = _signal_direction(signals_por_tf.get(tf_b), modality)
+    confirmado = bool(dir_a and dir_b and dir_a == dir_b and dir_a != Direction.NEUTRAL)
+    return confirmado, dir_a if confirmado and dir_a is not None else Direction.NEUTRAL
 
 
 def overall_score(signals: list[Signal]) -> float:
@@ -1680,6 +1882,7 @@ def check_signal_as_of(
     count: int = 250,
     modality: str = "Confluência",
     source: str = "Yahoo Finance",
+    params: AnalysisParams = DEFAULT_PARAMS,
 ) -> RetroSignalCheck:
     """
     Busca os dados normalmente (que vêm até "agora"), separa em duas
@@ -1703,7 +1906,7 @@ def check_signal_as_of(
             f"({len(historical)} candles, precisa de 30+). Tente uma data mais recente ou outro timeframe."
         )
 
-    context, signals = analyze(historical)
+    context, signals = analyze(historical, params)
 
     if modality == ALL_MODALITIES_OPTION:
         direction = overall_direction(signals)
@@ -1745,6 +1948,8 @@ def analyze_symbol_mtf(
     counts: dict[str, int] | None = None,
     modality: str = "Confluência",
     source: str = "Yahoo Finance",
+    params: AnalysisParams = DEFAULT_PARAMS,
+    fetcher: Callable[[str, str, int], pd.DataFrame] | None = None,
 ) -> MultiTimeframeResult:
     """
     Roda a análise nos timeframes de CONFIRMAÇÃO (obrigatórios — a
@@ -1762,8 +1967,18 @@ def analyze_symbol_mtf(
     partir do H1 já baixado — se H1 não estiver entre os timeframes
     pedidos, ele é buscado só como dependência interna, sem aparecer
     no resultado final.
+
+    `fetcher` troca a origem das velas sem trocar mais nada: recebe
+    (symbol, timeframe, count) e devolve o mesmo DataFrame que
+    `fetch_ohlcv` devolveria. Existe pro worker do backend, que lê o
+    TimescaleDB in-process — sem isso, a alternativa seria devolver um
+    DSN de banco pra dentro deste módulo, que é justamente o que foi
+    removido daqui quando a API entrou no lugar. Com `None` (o padrão),
+    `source` decide como sempre.
     """
     counts = counts or {}
+    if fetcher is None:
+        fetcher = lambda sym, tf, n: fetch_ohlcv(sym, tf, n, source=source)
     requested = list(dict.fromkeys([*confirmation, *context]))  # únicos, preserva ordem
 
     needs_h1_only_for_h4 = "H4" in requested and "H1" not in requested
@@ -1777,8 +1992,8 @@ def analyze_symbol_mtf(
     for tf in fetch_list:
         count = counts.get(tf, DEFAULT_TF_COUNTS.get(tf, 200))
         try:
-            df = fetch_ohlcv(symbol, tf, count, source=source)
-            ctx, signals = analyze(df)
+            df = fetcher(symbol, tf, count)
+            ctx, signals = analyze(df, params)
             results[tf] = TimeframeResult(tf, ctx, signals, None)
             if tf == "H1":
                 h1_df = ctx.df
@@ -1790,7 +2005,7 @@ def analyze_symbol_mtf(
             try:
                 h4_df = _resample_to_h4(h1_df)
                 if len(h4_df) >= 30:
-                    ctx4, sig4 = analyze(h4_df)
+                    ctx4, sig4 = analyze(h4_df, params)
                     results["H4"] = TimeframeResult("H4", ctx4, sig4, None)
                 else:
                     results["H4"] = TimeframeResult(
@@ -1822,14 +2037,19 @@ def percentage(entry: float, price: float) -> float:
     return (price - entry) / entry * 100 if entry else 0.0
 
 
-def print_signal(signal: Signal, symbol: str, risk_budget: float | None) -> None:
+def print_signal(
+    signal: Signal,
+    symbol: str,
+    risk_budget: float | None,
+    params: AnalysisParams = DEFAULT_PARAMS,
+) -> None:
     line = "-" * 72
     print(line)
     print(f" {signal.name.upper()}")
     print(line)
     print(
         f"\n>>> DIREÇÃO: {signal.direction.value}"
-        f"  |  SCORE: {signal.score:.1f}/100 ({quality(signal.score)})"
+        f"  |  SCORE: {signal.score:.1f}/100 ({quality(signal.score, params)})"
     )
     print(f">>> SETUP: {signal.setup}")
     print(f">>> CONFIANÇA: {signal.confidence:.0f}%\n")
@@ -1918,6 +2138,7 @@ def build_report(
     timeframe: str = "M15",
     count: int = 250,
     risk_budget: float | None = None,
+    params: AnalysisParams = DEFAULT_PARAMS,
 ) -> str:
     """Executa a análise e devolve o relatório completo como texto."""
     symbol = symbol.strip().upper()
@@ -1939,7 +2160,7 @@ def build_report(
         )
 
         df = fetch_ohlcv(symbol, timeframe, count)
-        context, signals = analyze(df)
+        context, signals = analyze(df, params)
 
         duration = TIMEFRAMES[timeframe]["duration"]
         last_open = df.index[-1].tz_convert(LOCAL_TZ)
@@ -1965,7 +2186,7 @@ def build_report(
             )
 
         for signal in signals:
-            print_signal(signal, symbol, risk_budget)
+            print_signal(signal, symbol, risk_budget, params)
         print_summary(signals)
 
     return output.getvalue()
@@ -2050,6 +2271,277 @@ def save_symbols(symbols: list[str]) -> None:
         except Exception:
             pass  # API indisponível — cai pro arquivo local
     _save_symbols_file(symbols)
+
+
+# ---------------------------------------------------------------------------
+# Perfis de análise
+#
+# Mesmo desenho da watchlist acima: API do homelab quando ACOES_API_URL
+# está configurada, arquivo local senão. Um perfil pode ter sido salvo por
+# um build mais antigo do motor, e `AnalysisParams.from_dict` é tolerante
+# de propósito pra isso — parâmetro que não existe mais é ignorado,
+# parâmetro que ainda não existia cai no default.
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROFILE_NAME = "padrão"
+
+
+def profiles_file() -> Path:
+    """Espelho de `symbols_file()` para os perfis."""
+    return Path(__file__).resolve().with_name("daytrade_profiles.json")
+
+
+def _load_profiles_file() -> dict[str, AnalysisParams]:
+    path = profiles_file()
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        perfis = {
+            str(nome): AnalysisParams.from_dict(dados)
+            for nome, dados in saved.items()
+            if str(nome).strip()
+        }
+        if perfis:
+            perfis.setdefault(DEFAULT_PROFILE_NAME, AnalysisParams())
+            return perfis
+    except (OSError, AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return {DEFAULT_PROFILE_NAME: AnalysisParams()}
+
+
+def _save_profiles_file(perfis: dict[str, AnalysisParams]) -> None:
+    path = profiles_file()
+    path.write_text(
+        json.dumps(
+            {nome: params.to_dict() for nome, params in perfis.items()},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _load_profiles_api() -> dict[str, AnalysisParams]:
+    import requests
+
+    response = requests.get(
+        f"{_api_base_url()}/profiles", headers=_api_headers(), timeout=_API_TIMEOUT_SECONDS
+    )
+    response.raise_for_status()
+    return {
+        perfil["nome"]: AnalysisParams.from_dict(perfil.get("params"))
+        for perfil in response.json().get("profiles", [])
+    }
+
+
+def _save_profile_api(nome: str, params: AnalysisParams, descricao: str) -> None:
+    import requests
+
+    response = requests.put(
+        f"{_api_base_url()}/profiles/{quote(nome, safe='')}",
+        json={
+            "params": params.to_dict(),
+            "params_hash": params.params_hash(),
+            "descricao": descricao,
+        },
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+
+def _delete_profile_api(nome: str) -> None:
+    import requests
+
+    response = requests.delete(
+        f"{_api_base_url()}/profiles/{quote(nome, safe='')}",
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+
+def load_profiles() -> dict[str, AnalysisParams]:
+    """Lê os perfis da API do homelab quando configurada, com fallback
+    pro arquivo local. O perfil padrão sempre existe, mesmo sem nenhuma
+    das duas fontes disponível."""
+    if ACOES_API_URL:
+        try:
+            perfis = _load_profiles_api()
+            if perfis:
+                perfis.setdefault(DEFAULT_PROFILE_NAME, AnalysisParams())
+                return perfis
+        except Exception:
+            pass  # API indisponível — cai pro arquivo local
+    return _load_profiles_file()
+
+
+def save_profile(nome: str, params: AnalysisParams, descricao: str = "") -> None:
+    """Espelho de `load_profiles`: grava pela API quando configurada,
+    com fallback pro arquivo local."""
+    nome = nome.strip()
+    if not nome:
+        raise ValueError("Informe um nome para o perfil.")
+
+    if ACOES_API_URL:
+        try:
+            _save_profile_api(nome, params, descricao)
+            return
+        except Exception:
+            pass  # API indisponível — cai pro arquivo local
+    perfis = _load_profiles_file()
+    perfis[nome] = params
+    _save_profiles_file(perfis)
+
+
+def delete_profile(nome: str) -> None:
+    """Desativa um perfil. O padrão nunca some — é o fallback de todo o resto."""
+    nome = nome.strip()
+    if nome == DEFAULT_PROFILE_NAME:
+        raise ValueError(f"O perfil '{DEFAULT_PROFILE_NAME}' não pode ser removido.")
+
+    if ACOES_API_URL:
+        try:
+            _delete_profile_api(nome)
+            return
+        except Exception:
+            pass  # API indisponível — cai pro arquivo local
+    perfis = _load_profiles_file()
+    perfis.pop(nome, None)
+    _save_profiles_file(perfis)
+
+
+# ---------------------------------------------------------------------------
+# Sinais gravados
+#
+# Diferente da watchlist e dos perfis, aqui NÃO existe fallback pro arquivo
+# local, de propósito: um histórico de sinais dividido entre o banco e o
+# filesystem efêmero de um container é pior que histórico nenhum, porque a
+# taxa de acerto sairia calculada sobre a metade que o processo por acaso
+# enxergou. Watchlist e perfil são preferência e toleram sumir; taxa de
+# acerto é medição, e uma medição incompleta em silêncio engana.
+# ---------------------------------------------------------------------------
+
+
+def signal_payload(
+    symbol: str,
+    timeframe: str,
+    signal: Signal,
+    context: MarketContext,
+    perfil: str,
+    params: AnalysisParams,
+    origem: str,
+    mtf_confirmado: bool = False,
+    mtf_direcao: Direction = Direction.NEUTRAL,
+    modalidade: str | None = None,
+) -> dict:
+    """Monta o corpo do POST /signals a partir de um sinal analisado.
+
+    Mora AQUI, e não no worker nem no Streamlit, porque os dois produtores
+    precisam gravar linhas idênticas — dois construtores de payload
+    divergiriam na primeira mudança do motor, e a comparação entre sinais
+    de origens diferentes deixaria de valer.
+
+    `candle_time` é a abertura da última vela do DataFrame, em UTC, que é o
+    contrato do índice em todo o motor. Montar essa chave a partir do
+    horário EXIBIDO (Brasília) criaria em silêncio uma segunda linha
+    deslocada 3 horas, escapando do índice de deduplicação.
+
+    `mtf_confirmado`/`mtf_direcao` vêm de `mtf_confirmation` calculado PRA
+    ESTA modalidade — ver o docstring de lá sobre por que reaproveitar a
+    confirmação de outra leitura falsearia o recorte de assertividade.
+    """
+    risk = signal.risk
+    risco_por_acao = (
+        abs(risk.entry - risk.stop)
+        if risk.entry is not None and risk.stop is not None
+        else None
+    )
+
+    def r_de(alvo: float | None) -> float | None:
+        if alvo is None or risk.entry is None or not risco_por_acao:
+            return None
+        return abs(alvo - risk.entry) / risco_por_acao
+
+    return {
+        "symbol": symbol.strip().upper(),
+        "timeframe": timeframe.strip().upper(),
+        "modalidade": modalidade or signal.name,
+        "candle_time": context.df.index[-1].isoformat(),
+        "perfil": perfil,
+        "params_hash": params.params_hash(),
+        "origem": origem,
+        "direcao": signal.direction.value,
+        "score": float(signal.score),
+        "confianca": float(signal.confidence),
+        "setup": signal.setup,
+        "mtf_confirmado": bool(mtf_confirmado),
+        "mtf_direcao": mtf_direcao.value if isinstance(mtf_direcao, Direction) else str(mtf_direcao),
+        "entrada": risk.entry,
+        "stop": risk.stop,
+        "alvo_1": risk.target_1,
+        "alvo_2": risk.target_2,
+        "r_alvo_1": r_de(risk.target_1),
+        "r_alvo_2": r_de(risk.target_2),
+        "stop_basis": risk.stop_basis,
+        "detalhes": {
+            "reasons": list(signal.reasons),
+            "alerts": list(dict.fromkeys(signal.alerts)),
+            "alternatives": list(risk.alternatives),
+            "volatilidade": context.volatility,
+            "atr": float(context.atr),
+            "atr_pct": float(context.atr_pct),
+            "rvol": float(context.rvol),
+        },
+    }
+
+
+def save_signal(payload: dict) -> dict:
+    """Grava um sinal pela API. LEVANTA erro se a API não estiver
+    configurada ou não responder — ver o comentário do bloco acima sobre
+    por que aqui não existe fallback local.
+
+    A resposta traz `duplicado=True` quando aquela vela já tinha sido
+    gravada com a mesma modalidade/perfil/origem."""
+    import requests
+
+    response = requests.post(
+        f"{_api_base_url()}/signals",
+        json=payload,
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_signals(**filtros) -> dict:
+    """Histórico de sinais. Filtros aceitos: symbol, timeframe, modalidade,
+    perfil, origem, resultado, dias, limite."""
+    import requests
+
+    response = requests.get(
+        f"{_api_base_url()}/signals",
+        params={k: v for k, v in filtros.items() if v is not None},
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_signal_stats(**filtros) -> dict:
+    """Assertividade agregada. Filtros aceitos: perfil, origem, symbol,
+    timeframe, dias."""
+    import requests
+
+    response = requests.get(
+        f"{_api_base_url()}/signals/stats",
+        params={k: v for k, v in filtros.items() if v is not None},
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def launch_gui() -> None:

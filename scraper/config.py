@@ -25,6 +25,24 @@ SCRAPER_TIMEFRAMES = tuple(
 # Quantas velas (mais recentes) reenviar a cada loop, por symbol/timeframe.
 # Cobre reinícios, loops perdidos e a vela em formação (que muda de OHLC a
 # cada tick até fechar) — ver scraper.py para o raciocínio completo.
-TRAILING_WINDOW = int(os.environ.get("TRAILING_WINDOW", "10"))
+#
+# Era 10 até 2026-08. Como só a vela em formação muda entre um loop e outro,
+# as outras 9 eram reenvio puro; 3 já cobre reinício e loop perdido com folga.
+# Backfill de histórico é trabalho de script one-shot, não do loop permanente.
+TRAILING_WINDOW = int(os.environ.get("TRAILING_WINDOW", "3"))
 
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10"))
+
+# Gate de pregão: fora do horário da B3 nenhuma vela pode mudar, então o loop
+# dorme MERCADO_FECHADO_SLEEP_SECONDS em vez de POLL_INTERVAL_SECONDS. Sem
+# isso, ~70% das buscas no MT5 e dos POSTs aconteciam de madrugada e no fim de
+# semana, sem nada pra coletar.
+#
+# A janela é folgada de propósito (pregão regular é 10h–17h): pega leilão de
+# abertura, after-market e o fechamento do D1 sem depender de horário exato.
+# Feriados da B3 não são tratados — nesses dias o gate não economiza, o que é
+# aceitável perto da complexidade de manter um calendário.
+MERCADO_TIMEZONE = os.environ.get("MERCADO_TIMEZONE", "America/Sao_Paulo")
+MERCADO_ABERTURA_HORA = int(os.environ.get("MERCADO_ABERTURA_HORA", "9"))
+MERCADO_FECHAMENTO_HORA = int(os.environ.get("MERCADO_FECHAMENTO_HORA", "19"))
+MERCADO_FECHADO_SLEEP_SECONDS = float(os.environ.get("MERCADO_FECHADO_SLEEP_SECONDS", "300"))

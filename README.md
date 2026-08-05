@@ -179,6 +179,55 @@ Isso é diferente do backtest de "rodar em centenas de ativos" — é uma checag
 
 **Limitação real:** como este ambiente de desenvolvimento não tem acesso à internet, essa funcionalidade só pode ser testada de verdade rodando o app publicado (que tem acesso real ao Yahoo Finance). O histórico intraday do Yahoo (M15/H1/H4) cobre só ~60 dias — pra checar datas mais antigas, use Diário ou Semanal.
 
+## Perfis de análise e assertividade
+
+Duas coisas que andam juntas: poder **mexer nos parâmetros** do motor, e
+depois **saber se mexer valeu a pena**.
+
+### Perfis (barra lateral → "Perfil de análise")
+
+Cerca de 30 parâmetros do motor que antes eram números cravados no código
+viraram campos ajustáveis: período do ATR, largura do swing, bandas de
+volatilidade, pesos da confluência (SMC 30 / Price Action 20 / Médias 20 /
+VWAP 20), faixas de qualidade, risco/retorno dos alvos, distância mínima do
+stop, e por aí. Um **perfil** é um conjunto nomeado desses valores.
+
+O perfil `padrão` reproduz exatamente o comportamento histórico do motor —
+não é "quase igual", é idêntico campo a campo, conferido por um script que
+roda os dois motores sobre as mesmas séries (`scripts/conferir-refactor-params.py`).
+Crie perfis novos ao lado dele; o padrão não pode ser removido.
+
+Com a API do homelab configurada os perfis ficam no banco; sem ela, num
+`daytrade_profiles.json` local — mesmo esquema da watchlist.
+
+### Assertividade (quarto modo na barra lateral)
+
+Cada sinal gerado é gravado com o perfil que o gerou, e depois tem o
+desfecho conferido contra os candles que vieram de verdade: bateu o Alvo 1,
+o Alvo 2, ou o Stop. Daí sai a taxa de acerto **por tipo de análise**
+(Confluência, SMC, Price Action, Médias Móveis, VWAP), recortada ainda por
+timeframe, ativo, direção, faixa de score e se o sinal estava confirmado no
+multi-timeframe. Além do acerto, a **expectativa em R** — porque uma leitura
+pode acertar pouco e ainda ser lucrativa, ou o contrário.
+
+De onde vêm os sinais:
+
+- **Automaticamente**, do worker `analyzer` que roda no homelab e varre a
+  watchlist inteira a cada vela. É ele que torna isso uma medição: sem o
+  worker, só existiriam os sinais que você por acaso olhou, e a taxa sairia
+  enviesada pelo seu uso da tela.
+- **Manualmente**, pelo botão "💾 Salvar sinal" em qualquer painel de
+  leitura. Ficam marcados com origem `manual`, separados dos do worker, e
+  clicar duas vezes não cria duas linhas.
+
+**Cuidado ao ler os números:** a taxa de acerto e a expectativa só contam os
+sinais **já resolvidos**. Os em aberto aparecem no contador mas ficam de
+fora da conta até baterem alvo ou stop — por isso a tabela sempre mostra
+"sinais" e "resolvidos" em colunas separadas.
+
+Este modo depende da API do homelab (`ACOES_API_URL`): é onde o histórico
+mora. Sem ela, o modo explica isso em vez de mostrar número errado.
+
 ## Estilo de operação: Day Trade ou Swing Trade
 
 A barra lateral agora tem um seletor **Estilo de operação**, logo abaixo do modo:
@@ -204,7 +253,7 @@ O motor por trás é o mesmo — SMC, Price Action, Médias, VWAP e Confluência
 1. **Persistência de verdade entre deploys** — trocar o arquivo local por um banco externo gratuito (Google Sheets via API, ou Supabase), pra lista sobreviver a redeploys.
 2. **Alertas por e-mail/Telegram** — disparar uma notificação quando o Scanner encontrar um score acima de um limiar (ex: 80+) em algum ativo da watchlist.
 3. ~~Múltiplos timeframes na mesma tela~~ — feito: M15/H1/H4/Diário agora, com confirmação M15+H1 obrigatória (ver seção "Filtro multi-timeframe" abaixo).
-4. **Histórico de sinais** — guardar os sinais gerados ao longo do tempo pra depois conferir se o setup teria funcionado (uma espécie de backtest simplificado direto na interface).
+4. ~~Histórico de sinais~~ — feito: os sinais são gravados e têm o desfecho conferido automaticamente, com taxa de acerto por tipo de análise (ver "Perfis de análise e assertividade" abaixo).
 5. **Times & Trades aproximado** — indicador de pressão compradora/vendedora estimada a partir do candle (ver seção dedicada abaixo) — ainda não implementado, aguardando sua confirmação.
 
 Me avisa qual desses (ou outra ideia) você quer que eu implemente a seguir.

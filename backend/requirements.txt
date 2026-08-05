@@ -2,3 +2,13 @@ fastapi>=0.115
 uvicorn[standard]>=0.32
 psycopg[binary,pool]>=3.1
 pydantic>=2.9
+
+# Do `analyzer.py`, que roda o motor (`daytrade_smc.py`) dentro do cluster.
+# O yfinance entra junto porque o motor o importa no topo, com SystemExit se
+# faltar — o analyzer nunca busca nada do Yahoo (lê os candles do banco), mas
+# sem a lib o import do módulo falha. As três valem pra imagem inteira: os
+# quatro entrypoints (processor, api, analyzer, migrate) compartilham uma
+# imagem só, que é importada uma vez no containerd do nó.
+pandas>=2.2
+numpy>=1.26
+yfinance>=0.2.40
