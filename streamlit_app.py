@@ -558,10 +558,12 @@ def _tabela_assertividade(linhas: list[dict], rotulo: str | None) -> pd.DataFram
 
 def render_assertividade(perfis: list[str]) -> None:
     st.caption(
-        "Taxa de acerto e expectativa dos sinais efetivamente gravados — os que o worker "
-        "do homelab varreu automaticamente, mais os que você salvou à mão. Só entram na "
-        "conta os que já tiveram desfecho (bateu alvo ou stop); os em aberto aparecem no "
-        "contador, mas não na taxa."
+        "Taxa de acerto e expectativa dos sinais efetivamente gravados: os que o worker "
+        "do homelab varreu automaticamente (`worker`), os que você salvou à mão "
+        "(`manual`) e os reconstruídos a partir das velas já guardadas no banco "
+        "(`backfill`). Só entram na conta os que já tiveram desfecho (bateu alvo ou "
+        "stop); os em aberto aparecem no contador, mas não na taxa. O período é contado "
+        "pela data da **vela**, não pela data em que o sinal foi gravado."
     )
 
     if not daytrade_smc.ACOES_API_URL:
@@ -575,7 +577,11 @@ def render_assertividade(perfis: list[str]) -> None:
     with col1:
         f_perfil = st.selectbox("Perfil", ["Todos"] + perfis, key="assert_perfil")
     with col2:
-        f_origem = st.selectbox("Origem", ["Todas", "worker", "manual"], key="assert_origem")
+        # 'backfill' é o passe único que reconstrói os sinais das velas já
+        # guardadas (`analyzer.py --backfill`). Sem ele aqui, a maior parte
+        # do histórico ficaria invisível no filtro.
+        f_origem = st.selectbox("Origem", ["Todas", "worker", "manual", "backfill"],
+                                key="assert_origem")
     with col3:
         f_symbol = st.selectbox("Ativo", ["Todos"] + st.session_state.watchlist, key="assert_symbol")
     with col4:
@@ -599,7 +605,9 @@ def render_assertividade(perfis: list[str]) -> None:
         st.info(
             "Nenhum sinal com desfecho neste recorte ainda. O worker grava os sinais assim "
             "que a vela fecha, mas o desfecho só aparece depois que o preço bate o alvo ou "
-            "o stop — em D1 isso leva dias."
+            "o stop — em D1 isso leva dias. Pra não esperar, rode o backfill "
+            "(`analyzer.py --backfill`), que reconstrói os sinais das velas já guardadas "
+            "e já com o desfecho resolvido."
         )
         return
 

@@ -113,7 +113,7 @@ class SignalIn(BaseModel):
     candle_time: datetime      # UTC, abertura da vela FECHADA analisada
     perfil: str
     params_hash: str
-    origem: str                # 'worker' | 'manual'
+    origem: str                # 'worker' | 'manual' | 'backfill'
     direcao: str
     score: float
     confianca: float

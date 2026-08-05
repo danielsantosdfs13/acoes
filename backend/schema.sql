@@ -99,8 +99,14 @@ INSERT INTO analysis_profiles (nome, params, params_hash, descricao) VALUES
 ON CONFLICT (nome) DO NOTHING;
 
 -- Sinais gerados, uma linha por (ativo, timeframe, modalidade, vela).
--- Quem escreve: o worker `analyzer.py` varrendo a watchlist, e o botão
--- "salvar sinal" do Streamlit — distinguidos por `origem`.
+-- Três produtores, distinguidos por `origem`: o worker `analyzer.py`
+-- varrendo a watchlist a cada vela ('worker'), o botão "salvar sinal" do
+-- Streamlit ('manual') e o passe único que reconstrói o histórico já
+-- guardado, `analyzer.py --backfill` ('backfill').
+--
+-- `origem` entra no índice de dedup mais abaixo justamente pra que os três
+-- possam descrever a MESMA vela sem colidir — e pra que a assertividade
+-- medida em tempo real continue separável da reconstruída.
 --
 -- O DESFECHO mora aqui, em coluna, e não numa tabela separada: um sinal
 -- tem exatamente um desfecho, nunca um histórico deles. Uma tabela 1:1
@@ -136,7 +142,7 @@ CREATE TABLE IF NOT EXISTS signals (
     candle_time       TIMESTAMPTZ NOT NULL,   -- UTC, abertura da vela FECHADA que gerou o sinal
     perfil            TEXT        NOT NULL REFERENCES analysis_profiles(nome),
     params_hash       TEXT        NOT NULL,
-    origem            TEXT        NOT NULL,   -- 'worker' | 'manual'
+    origem            TEXT        NOT NULL,   -- 'worker' | 'manual' | 'backfill'
     direcao           TEXT        NOT NULL,   -- COMPRA | VENDA | NEUTRO
     score             DOUBLE PRECISION NOT NULL,
     confianca         DOUBLE PRECISION NOT NULL,

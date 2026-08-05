@@ -17,6 +17,11 @@ faz duas coisas, em passes separados a cada iteração:
 worker, só existiriam os sinais que alguém por acaso olhou e salvou à mão,
 e a taxa de acerto sairia enviesada pelo uso da interface.
 
+Existe ainda um terceiro modo, de execução ÚNICA e fora do loop: o
+BACKFILL (`--backfill`), que reconstrói os sinais das velas já guardadas
+no banco em vez de esperar as próximas. Sem ele a assertividade começa
+vazia e leva semanas pra ter número — em D1, um desfecho leva dias.
+
 Por que Deployment em loop, e não CronJob: o gate de pregão já existe (e
 duplicá-lo num cron ainda erraria feriado), o pool de conexão fica quente,
 o passe de desfecho aproveita as mesmas leituras de vela da varredura, e
@@ -27,6 +32,7 @@ Uso:
     python analyzer.py                    # loop contínuo (é o do manifest)
     python analyzer.py --varrer-uma-vez   # uma varredura e sai
     python analyzer.py --avaliar-uma-vez  # um passe de desfecho e sai
+    python analyzer.py --backfill         # reprocessa o histórico e sai
 
 Deploy: `command: ["python", "analyzer.py"]`, mesma imagem do processor,
 da api e do migrate.
@@ -35,11 +41,12 @@ da api e do migrate.
 from __future__ import annotations
 
 import argparse
+import bisect
 import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -111,6 +118,13 @@ COUNTS = _env_counts("ANALYZER_COUNTS", "M15=250,H1=250,H4=150,D1=250")
 PERFIS = _env_lista("ANALYZER_PERFIS", DEFAULT_PROFILE_NAME)
 JANELA_DESFECHO_DIAS = _env_int("ANALYZER_JANELA_DESFECHO_DIAS", 30)
 
+# Backfill (modo de execução única, ver `backfill()`). O warm-up existe
+# porque o motor calcula EMA200: numa fatia mais curta que isso a leitura
+# nasce degenerada, e gravá-la envenenaria a assertividade com sinais que
+# a interface nunca produziria.
+BACKFILL_WARMUP = _env_int("ANALYZER_BACKFILL_WARMUP", 250)
+BACKFILL_VELAS = _env_int("ANALYZER_BACKFILL_VELAS", 750)
+
 # Par de timeframes que define "confirmado no multi-timeframe". O padrão é
 # o de Day Trade (M15+H1); o de Swing (D1+W1) exigiria W1, que o scraper
 # não coleta — ver SCRAPER_TIMEFRAMES.
@@ -123,6 +137,15 @@ MERCADO_FECHAMENTO_HORA = _env_int("MERCADO_FECHAMENTO_HORA", 19)
 _TZ_MERCADO = ZoneInfo(MERCADO_TIMEZONE)
 
 ORIGEM = "worker"
+
+# Terceiro valor de `origem`, ao lado de 'worker' e 'manual'. Vale um valor
+# próprio, e não reaproveitar 'worker', por três razões: `origem` faz parte
+# do índice de dedup, então backfill e varredura nunca colidem nem se o
+# backfill for reexecutado com janela maior; a aba Assertividade filtra por
+# origem, então dá pra separar o que foi medido em tempo real do que foi
+# reconstruído; e uma palavra só passaria a significar dois regimes de
+# coleta diferentes.
+ORIGEM_BACKFILL = "backfill"
 
 
 def _mercado_aberto(agora: datetime | None = None) -> bool:
@@ -237,30 +260,56 @@ INSERT INTO signals (
     symbol, timeframe, modalidade, candle_time, perfil, params_hash, origem,
     direcao, score, confianca, setup, mtf_confirmado, mtf_direcao,
     entrada, stop, alvo_1, alvo_2, r_alvo_1, r_alvo_2, stop_basis, detalhes,
-    resultado, resultado_detalhe
+    resultado, resultado_detalhe, candles_ate_resultado, avaliado_em, avaliado_ate
 ) VALUES (
     %(symbol)s, %(timeframe)s, %(modalidade)s, %(candle_time)s, %(perfil)s,
     %(params_hash)s, %(origem)s, %(direcao)s, %(score)s, %(confianca)s, %(setup)s,
     %(mtf_confirmado)s, %(mtf_direcao)s, %(entrada)s, %(stop)s, %(alvo_1)s,
     %(alvo_2)s, %(r_alvo_1)s, %(r_alvo_2)s, %(stop_basis)s, %(detalhes)s,
-    %(resultado)s, %(resultado_detalhe)s
+    %(resultado)s, %(resultado_detalhe)s, %(candles_ate_resultado)s,
+    %(avaliado_em)s, %(avaliado_ate)s
 )
 ON CONFLICT (symbol, timeframe, modalidade, candle_time, perfil, origem) DO NOTHING
 """
 
 
-def _preparar(payload: dict) -> dict:
+def _preparar(
+    payload: dict,
+    desfecho: tuple[str, str, int | None] | None = None,
+    avaliado_ate: datetime | None = None,
+) -> dict:
     """Ajusta o payload do motor pro driver, e resolve o SEM_SINAL.
 
     Sinal sem entrada operável já nasce com desfecho: ele nunca vai ter um,
     e deixar `resultado` nulo o deixaria pra sempre na fila do passe 2. Mas
     é gravado assim mesmo — sem essas linhas não dá pra responder "com que
-    frequência este perfil sequer produz sinal"."""
+    frequência este perfil sequer produz sinal".
+
+    `desfecho` só vem do BACKFILL, que já tem as velas seguintes na mão e
+    por isso grava o resultado no mesmo INSERT. A varredura normal deixa
+    tudo nulo e entrega o trabalho ao passe 2 — que é o certo pra ela, já
+    que ali o futuro ainda não aconteceu.
+    """
     dados = dict(payload)
     dados["detalhes"] = Jsonb(payload.get("detalhes") or {})
-    sem_sinal = payload["direcao"] == Direction.NEUTRAL.value or payload["entrada"] is None
-    dados["resultado"] = "SEM_SINAL" if sem_sinal else None
-    dados["resultado_detalhe"] = "Não havia sinal operável nesta vela." if sem_sinal else None
+
+    if payload["direcao"] == Direction.NEUTRAL.value or payload["entrada"] is None:
+        dados["resultado"] = "SEM_SINAL"
+        dados["resultado_detalhe"] = "Não havia sinal operável nesta vela."
+        dados["candles_ate_resultado"] = None
+        dados["avaliado_em"] = None
+        dados["avaliado_ate"] = None
+    elif desfecho is not None:
+        dados["resultado"], dados["resultado_detalhe"], dados["candles_ate_resultado"] = desfecho
+        dados["avaliado_em"] = datetime.now(UTC)
+        dados["avaliado_ate"] = avaliado_ate
+    else:
+        dados["resultado"] = None
+        dados["resultado_detalhe"] = None
+        dados["candles_ate_resultado"] = None
+        dados["avaliado_em"] = None
+        dados["avaliado_ate"] = None
+
     return dados
 
 
@@ -401,6 +450,134 @@ def avaliar(conn) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Backfill — execução única, fora do loop
+# ---------------------------------------------------------------------------
+
+def _carimbar_mtf(linhas: list[dict], momentos: list[tuple], por_tf: dict[str, list]) -> None:
+    """Preenche mtf_confirmado/mtf_direcao com o estado AS-OF de cada vela.
+
+    O `varrer()` calcula uma confirmação por modalidade a partir do M15/H1
+    mais recentes e a carimba nas linhas de TODOS os timeframes. Aqui a
+    mesma regra é reproduzida no passado — inclusive chamando o
+    `mtf_confirmation` do motor, e não uma cópia da regra, pra não haver
+    como as duas divergirem.
+
+    ⚠️ A busca as-of é por horário de FECHAMENTO, não de abertura. Um sinal
+    de M15 na vela das 10:00 fecha às 10:15; a vela de H1 das 10:00 só
+    fecha às 11:00, então usá-la seria espiar 45 minutos de futuro. O
+    `varrer()` não tem esse problema porque `_ler_candles` só devolve vela
+    fechada — aqui o filtro tem que ser refeito à mão.
+
+    Deixar tudo em `false` seria bem mais barato e deixaria o recorte
+    "confirmado no multi-timeframe" da assertividade errado de um jeito
+    que parece certo — a mesma armadilha do corte de vela em formação.
+    """
+    fechamentos = {
+        tf: [t + TIMEFRAMES[tf]["duration"] for t, _ in serie] for tf, serie in por_tf.items()
+    }
+
+    for linha, (fechamento, modalidade) in zip(linhas, momentos):
+        sinais_as_of: dict[str, list | None] = {}
+        for tf, serie in por_tf.items():
+            pos = bisect.bisect_right(fechamentos[tf], fechamento) - 1
+            sinais_as_of[tf] = serie[pos][1] if pos >= 0 else None
+        confirmado, direcao = mtf_confirmation(sinais_as_of, CONFIRMACAO, modalidade)
+        linha["mtf_confirmado"] = confirmado
+        linha["mtf_direcao"] = direcao.value
+
+
+def _backfill_symbol(conn, symbol: str, nome_perfil: str, params: AnalysisParams,
+                     velas: int, warmup: int) -> tuple[int, int]:
+    """Reconstrói os sinais de um símbolo × perfil. Devolve (gravados, tentados)."""
+    linhas: list[dict] = []
+    momentos: list[tuple] = []
+    # sinais das velas dos timeframes de confirmação, pro carimbo as-of
+    por_tf: dict[str, list] = {tf: [] for tf in CONFIRMACAO}
+
+    for timeframe in TIMEFRAMES_VARRIDOS:
+        try:
+            df = _ler_candles(conn, symbol, timeframe, warmup + velas)
+        except Exception as exc:  # noqa: BLE001 — um par ruim não derruba o backfill
+            log.warning("backfill %s %s (%s): %s", symbol, timeframe, nome_perfil, exc)
+            continue
+
+        if len(df) <= warmup:
+            log.warning(
+                "backfill %s %s (%s): só %d velas, warm-up é %d — pulando",
+                symbol, timeframe, nome_perfil, len(df), warmup,
+            )
+            continue
+
+        duracao = TIMEFRAMES[timeframe]["duration"]
+        for i in range(warmup, len(df)):
+            # A fatia do sinal e a do desfecho NUNCA se tocam: é a mesma
+            # garantia de não espiar o futuro que o `check_signal_as_of`
+            # (o modo "Verificação retroativa" da interface) já dá.
+            historico = df.iloc[: i + 1]
+            futuro = df.iloc[i + 1 :]
+            contexto, sinais = analyze(historico, params)
+
+            if timeframe in por_tf:
+                por_tf[timeframe].append((df.index[i], sinais))
+
+            fechamento = df.index[i] + duracao
+            avaliado_ate = futuro.index[-1] if len(futuro) else None
+            for sinal in sinais:
+                if sinal.name not in MODALITIES:
+                    continue
+                payload = signal_payload(
+                    symbol, timeframe, sinal, contexto, nome_perfil, params, ORIGEM_BACKFILL,
+                )
+                # O desfecho vai no MESMO insert, e não no passe 2: aquele
+                # recorta os pendentes em ANALYZER_JANELA_DESFECHO_DIAS, e
+                # um sinal de D1 de 2022 nunca sairia de "aguardando".
+                desfecho = evaluate_signal_outcome(sinal.risk, sinal.direction, futuro)
+                linhas.append(_preparar(payload, desfecho, avaliado_ate))
+                momentos.append((fechamento, sinal.name))
+
+    if not linhas:
+        return 0, 0
+
+    _carimbar_mtf(linhas, momentos, por_tf)
+
+    with conn.cursor() as cur:
+        cur.executemany(_INSERT_SQL, linhas)
+        gravados = cur.rowcount
+    conn.commit()
+    return gravados, len(linhas)
+
+
+def backfill(conn, velas: int, warmup: int) -> tuple[int, int]:
+    """Reprocessa as velas JÁ guardadas, gerando sinais com desfecho.
+
+    Roda uma vez, à mão, com o mercado fechado — não faz parte do loop. O
+    `varrer()` só analisa a última vela fechada, então sozinho ele constrói
+    o dataset pra frente e a assertividade fica sem número por semanas.
+
+    Idempotente pelo mesmo motivo do `varrer()`: `ON CONFLICT DO NOTHING`
+    sobre o índice único. Rerodar com uma janela maior só acrescenta as
+    velas que ainda não estavam lá.
+    """
+    symbols = _watchlist(conn)
+    perfis = _perfis(conn)
+    gravados = 0
+    tentados = 0
+
+    for nome_perfil, params in perfis.items():
+        for symbol in symbols:
+            inicio = time.monotonic()
+            gr, te = _backfill_symbol(conn, symbol, nome_perfil, params, velas, warmup)
+            gravados += gr
+            tentados += te
+            log.info(
+                "backfill %s (%s): %d gravado(s) de %d · %.1fs",
+                symbol, nome_perfil, gr, te, time.monotonic() - inicio,
+            )
+
+    return gravados, tentados
+
+
+# ---------------------------------------------------------------------------
 # Loop
 # ---------------------------------------------------------------------------
 
@@ -419,14 +596,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Worker de sinais do pipeline de ações.")
     parser.add_argument("--varrer-uma-vez", action="store_true", help="uma varredura e sai")
     parser.add_argument("--avaliar-uma-vez", action="store_true", help="um passe de desfecho e sai")
+    parser.add_argument("--backfill", action="store_true",
+                        help="reprocessa as velas já guardadas, com desfecho, e sai")
+    parser.add_argument("--backfill-velas", type=int, default=BACKFILL_VELAS,
+                        help=f"velas reconstruídas por par symbol/timeframe (padrão {BACKFILL_VELAS})")
+    parser.add_argument("--backfill-warmup", type=int, default=BACKFILL_WARMUP,
+                        help=f"velas de aquecimento antes do primeiro sinal (padrão {BACKFILL_WARMUP})")
     args = parser.parse_args()
 
-    if args.varrer_uma_vez or args.avaliar_uma_vez:
+    if args.varrer_uma_vez or args.avaliar_uma_vez or args.backfill:
         try:
             with pool.connection() as conn:
                 if args.varrer_uma_vez:
                     gravados, tentados = varrer(conn)
                     log.info("varredura única: %d gravado(s) de %d tentado(s)", gravados, tentados)
+                if args.backfill:
+                    log.info(
+                        "backfill · %d vela(s) por par, warm-up %d · timeframes=%s · perfis=%s",
+                        args.backfill_velas, args.backfill_warmup,
+                        ",".join(TIMEFRAMES_VARRIDOS), ",".join(PERFIS),
+                    )
+                    gravados, tentados = backfill(conn, args.backfill_velas, args.backfill_warmup)
+                    log.info("backfill: %d gravado(s) de %d tentado(s)", gravados, tentados)
                 if args.avaliar_uma_vez:
                     log.info("desfecho único: %d resolvido(s)", avaliar(conn))
         finally:

@@ -396,8 +396,13 @@ def get_signals(
     # Os ::text não são decoração: num `$1 IS NULL OR col = $1`, o Postgres
     # olha o IS NULL primeiro e desiste de inferir o tipo do parâmetro
     # ("could not determine data type of parameter"). O cast resolve.
+    # A janela é por `candle_time`, NÃO por `criado_em`: "últimos 90 dias"
+    # significa os sinais das velas desse período, não as linhas inseridas
+    # nesse período. Enquanto só o worker escrevia, em tempo real, os dois
+    # davam no mesmo; com o backfill (`analyzer.py --backfill`) deixam de
+    # dar — um sinal de D1 de 2022 gravado hoje cairia no recorte de 7 dias.
     where = """
-        WHERE criado_em > now() - make_interval(days => %(dias)s)
+        WHERE candle_time > now() - make_interval(days => %(dias)s)
           AND (%(symbol)s::text     IS NULL OR symbol     = %(symbol)s)
           AND (%(timeframe)s::text  IS NULL OR timeframe  = %(timeframe)s)
           AND (%(modalidade)s::text IS NULL OR modalidade = %(modalidade)s)
@@ -443,7 +448,9 @@ WITH base AS (
     FROM signals
     WHERE resultado IS NOT NULL
       AND resultado <> 'SEM_SINAL'
-      AND criado_em > now() - make_interval(days => %(dias)s)
+      -- por `candle_time`, e não `criado_em` — mesma razão do comentário em
+      -- get_signals: o backfill grava sinais antigos com criado_em de hoje
+      AND candle_time > now() - make_interval(days => %(dias)s)
       AND (%(perfil)s::text    IS NULL OR perfil    = %(perfil)s)
       AND (%(origem)s::text    IS NULL OR origem    = %(origem)s)
       AND (%(symbol)s::text    IS NULL OR symbol    = %(symbol)s)

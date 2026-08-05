@@ -246,7 +246,7 @@ Bootstrap da VM (OpenSSH Server, chave pública, NSSM) está em
 | Migration | `backend/migrate.py` | Aplica o schema numa transação; roda como hook PreSync |
 | Processor (escrita) | `backend/processor.py` | `GET /health`, `POST /candles`, `GET /watchlist` |
 | API (leitura) | `backend/api.py` | `GET /health`, `/candles`, `/watchlist`, `/status`, mais `/profiles` e `/signals` (estas com auth também no GET) |
-| Analyzer (worker) | `backend/analyzer.py` | Loop com gate de pregão: varre watchlist × timeframe × perfil gravando `signals`, e avalia os desfechos pendentes reusando `evaluate_signal_outcome` |
+| Analyzer (worker) | `backend/analyzer.py` | Loop com gate de pregão: varre watchlist × timeframe × perfil gravando `signals`, e avalia os desfechos pendentes reusando `evaluate_signal_outcome`. Tem também o modo único `--backfill` — ver "Backfill" abaixo |
 | Auth | `backend/auth.py` | `X-API-Key` contra `ACOES_API_KEY`, compartilhado pelos entrypoints |
 | Parâmetros de análise | `daytrade_smc.py` (`AnalysisParams`, `DEFAULT_PARAMS`) | ~30 parâmetros curados; um campo `params` no `MarketContext` os leva a toda função de score/risco sem mudar assinatura |
 | Perfis via API | `daytrade_smc.py` (`load_profiles`/`save_profile`/`delete_profile`) | `GET`/`PUT`/`DELETE /profiles` quando `ACOES_API_URL` está configurada; cai pro `daytrade_profiles.json` senão |
@@ -373,6 +373,46 @@ Volume esperado: ~2.090 linhas por pregão, ~110 MB por ano — irrelevante
 perto da `candles`. Por isso `signals` **não** é hypertable; a justificativa
 completa está no comentário da tabela em `backend/schema.sql`.
 
+## Backfill — por que o worker sozinho não basta
+
+`varrer()` analisa só a **última** vela fechada, então ele constrói o
+dataset pra frente: no dia em que sobe, a aba Assertividade está vazia, e
+em D1 um desfecho leva dias pra aparecer. Mas a `candles` já guarda
+história de verdade — 1000 velas por par, D1 desde 2022 —, e reprocessá-la
+enche a aba com milhares de sinais **já resolvidos**.
+
+Daí o `analyzer.py --backfill`: execução única, à mão, com o mercado
+fechado. Pra cada vela `i`, o sinal sai de `df.iloc[:i+1]` e o desfecho de
+`df.iloc[i+1:]` — as duas fatias nunca se tocam, que é a mesma garantia de
+não espiar o futuro que o `check_signal_as_of` (o modo "Verificação
+retroativa" da interface) já dava.
+
+Quatro decisões, todas com armadilha do outro lado:
+
+1. **`origem = 'backfill'`**, um terceiro valor ao lado de `worker` e
+   `manual`. Como `origem` faz parte do índice de dedup, backfill e
+   varredura nunca colidem — nem se o backfill for reexecutado com janela
+   maior. E a aba filtra por origem, então dá pra ver a assertividade
+   medida em tempo real separada da reconstruída.
+2. **O desfecho vai no mesmo INSERT**, não no passe 2. O passe 2 recorta os
+   pendentes em `ANALYZER_JANELA_DESFECHO_DIAS` (30), então um sinal de D1
+   de 2022 nunca sairia de "aguardando". E o backfill já tem as velas
+   seguintes na mão: avaliar ali é ao mesmo tempo correto e mais barato.
+3. **A confirmação multi-timeframe é as-of, por horário de FECHAMENTO.** Um
+   sinal de M15 na vela das 10:00 fecha às 10:15; a vela de H1 das 10:00 só
+   fecha às 11:00, então carimbar a leitura dela seria espiar 45 minutos de
+   futuro. O `varrer()` não tem esse problema porque `_ler_candles` só
+   devolve vela fechada — no passado o filtro tem que ser refeito à mão.
+   Gravar `mtf_confirmado=false` e pronto seria mais barato e deixaria o
+   recorte "confirmado no MTF" errado de um jeito que parece certo.
+4. **Warm-up de 250 velas.** O motor calcula EMA200; numa fatia mais curta
+   a leitura nasce degenerada e não seria produzida pela interface nunca.
+
+Consequência disso tudo numa consulta: `GET /signals` e `GET /signals/stats`
+passaram a janelar por **`candle_time`**, não por `criado_em`. Enquanto só
+o worker escrevia, em tempo real, os dois davam no mesmo; com o backfill um
+sinal de D1 de 2022 gravado hoje cairia no recorte de "últimos 7 dias".
+
 ## Endpoints (referência rápida)
 
 **`processor`** — escrita, sem DNS público:
@@ -420,6 +460,8 @@ por símbolo removido não expressa isso atomicamente.
 | `ANALYZER_PERFIS` | analyzer | `padrão` | perfis varridos (um conjunto de linhas por perfil) |
 | `ANALYZER_CONFIRMACAO` | analyzer | `M15,H1` | par que define "confirmado no MTF"; o de Swing (`D1,W1`) exigiria W1, que o scraper não coleta |
 | `ANALYZER_JANELA_DESFECHO_DIAS` | analyzer | `30` | recorte dos sinais pendentes no passe de desfecho |
+| `ANALYZER_BACKFILL_VELAS` | analyzer | `750` | velas reconstruídas por par no `--backfill` (também aceita `--backfill-velas`) |
+| `ANALYZER_BACKFILL_WARMUP` | analyzer | `250` | aquecimento antes do primeiro sinal do backfill — o motor calcula EMA200 (`--backfill-warmup`) |
 | `MERCADO_*` | analyzer | iguais ao scraper | gate de pregão, mesma regra |
 | `ACOES_API_URL` | streamlit | — | URL da api; no cluster é `http://api.acoes.svc.cluster.local:8000`. Também aceito via `st.secrets["acoes_api_url"]` |
 | `PROCESSOR_URL` | scraper | `http://localhost:8000` | no homelab é `https://acoes-processor.dondon.services` |
