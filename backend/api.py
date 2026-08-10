@@ -145,10 +145,10 @@ if not auth.API_KEY:
 
 @app.get(
     "/health",
-    operation_id="acoes_health",
+    operation_id="health",
     summary="Liveness da API de ações",
     description="Responde `{'status':'ok'}` se o serviço está de pé. Não diz nada sobre o "
-                "frescor dos dados — pra isso use `acoes_status_dados`.",
+                "frescor dos dados — pra isso use `status_dados`.",
 )
 def health() -> dict:
     return {"status": "ok"}
@@ -250,7 +250,7 @@ def replace_watchlist(body: WatchlistReplace, conn: Connection = Depends(get_con
 @app.get(
     "/status",
     response_model=list[SymbolStatus],
-    operation_id="acoes_status_dados",
+    operation_id="status_dados",
     summary="Frescor dos dados por ação e timeframe",
     description=(
         "Para cada par ação/timeframe, a última vela existente e a última vez que o dado "
