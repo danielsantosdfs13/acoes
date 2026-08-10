@@ -67,11 +67,17 @@ from daytrade_smc import (  # noqa: E402
     Direction,
     RiskPlan,
     analyze,
+    SignalOutcome,
     evaluate_signal_outcome,
     mtf_confirmation,
     signal_payload,
 )
 
+# `candles.py` faz o mesmo `sys.path.insert` acima — as duas leituras de vela
+# saíram daqui em 2026-08-10, quando `api.py` (POST /analisar) passou a
+# precisar da mesma coisa. Ver o docstring de lá.
+from candles import ler_candles as _ler_candles  # noqa: E402
+from candles import ler_candles_depois as _ler_candles_depois  # noqa: E402
 from db import pool  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -162,74 +168,6 @@ def _mercado_aberto(agora: datetime | None = None) -> bool:
 # Leitura de candles
 # ---------------------------------------------------------------------------
 
-def _ler_candles(conn, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
-    """Últimas `count` velas FECHADAS, direto do banco.
-
-    Espelha `api.get_candles`: ORDER BY time DESC + LIMIT, e devolve ASC,
-    que é o contrato do índice em todo o motor.
-
-    ⚠️ O corte da vela em formação é obrigatório e é a armadilha número um
-    deste worker. O scraper grava a vela ABERTA a cada ciclo, por design —
-    diferente do `_fetch_ohlcv_yahoo`, que descarta a vela corrente antes
-    de devolver. Se o analyzer analisasse a vela pela metade, o ON CONFLICT
-    DO NOTHING congelaria essa primeira leitura como se fosse o sinal
-    definitivo daquela vela, e TODO o dataset de assertividade ficaria
-    errado de um jeito que parece certo.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT time, open, high, low, close, volume
-            FROM candles
-            WHERE symbol = %(symbol)s AND timeframe = %(timeframe)s
-            ORDER BY time DESC
-            LIMIT %(count)s
-            """,
-            # o clamp é daqui: o `Query(le=5000)` da api não vale in-process
-            {"symbol": symbol, "timeframe": timeframe, "count": max(1, min(count, 5000))},
-        )
-        rows = cur.fetchall()
-
-    if not rows:
-        raise RuntimeError(f"Sem candles para {symbol} em {timeframe}.")
-
-    df = pd.DataFrame(
-        list(reversed(rows)), columns=["time", "open", "high", "low", "close", "volume"]
-    )
-    df["time"] = pd.to_datetime(df["time"], utc=True)
-    df = df.set_index("time")
-
-    duracao = TIMEFRAMES[timeframe]["duration"]
-    fechadas = df[df.index + duracao <= pd.Timestamp.now(tz="UTC")]
-    if fechadas.empty:
-        raise RuntimeError(f"Só há vela em formação para {symbol} em {timeframe}.")
-    return fechadas
-
-
-def _ler_candles_depois(conn, symbol: str, timeframe: str, desde: datetime) -> pd.DataFrame:
-    """Velas fechadas posteriores a `desde` — o material do passe de desfecho."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT time, open, high, low, close, volume
-            FROM candles
-            WHERE symbol = %s AND timeframe = %s AND time > %s
-            ORDER BY time ASC
-            """,
-            (symbol, timeframe, desde),
-        )
-        rows = cur.fetchall()
-
-    if not rows:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-
-    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
-    df["time"] = pd.to_datetime(df["time"], utc=True)
-    df = df.set_index("time")
-    duracao = TIMEFRAMES[timeframe]["duration"]
-    return df[df.index + duracao <= pd.Timestamp.now(tz="UTC")]
-
-
 # ---------------------------------------------------------------------------
 # Estado lido do banco
 # ---------------------------------------------------------------------------
@@ -260,14 +198,15 @@ INSERT INTO signals (
     symbol, timeframe, modalidade, candle_time, perfil, params_hash, origem,
     direcao, score, confianca, setup, mtf_confirmado, mtf_direcao,
     entrada, stop, alvo_1, alvo_2, r_alvo_1, r_alvo_2, stop_basis, detalhes,
-    resultado, resultado_detalhe, candles_ate_resultado, avaliado_em, avaliado_ate
+    resultado, resultado_detalhe, candles_ate_resultado, preco_fill, r_realizado,
+    avaliado_em, avaliado_ate
 ) VALUES (
     %(symbol)s, %(timeframe)s, %(modalidade)s, %(candle_time)s, %(perfil)s,
     %(params_hash)s, %(origem)s, %(direcao)s, %(score)s, %(confianca)s, %(setup)s,
     %(mtf_confirmado)s, %(mtf_direcao)s, %(entrada)s, %(stop)s, %(alvo_1)s,
     %(alvo_2)s, %(r_alvo_1)s, %(r_alvo_2)s, %(stop_basis)s, %(detalhes)s,
     %(resultado)s, %(resultado_detalhe)s, %(candles_ate_resultado)s,
-    %(avaliado_em)s, %(avaliado_ate)s
+    %(preco_fill)s, %(r_realizado)s, %(avaliado_em)s, %(avaliado_ate)s
 )
 ON CONFLICT (symbol, timeframe, modalidade, candle_time, perfil, origem) DO NOTHING
 """
@@ -275,7 +214,7 @@ ON CONFLICT (symbol, timeframe, modalidade, candle_time, perfil, origem) DO NOTH
 
 def _preparar(
     payload: dict,
-    desfecho: tuple[str, str, int | None] | None = None,
+    desfecho: SignalOutcome | None = None,
     avaliado_ate: datetime | None = None,
 ) -> dict:
     """Ajusta o payload do motor pro driver, e resolve o SEM_SINAL.
@@ -292,6 +231,8 @@ def _preparar(
     """
     dados = dict(payload)
     dados["detalhes"] = Jsonb(payload.get("detalhes") or {})
+    dados["preco_fill"] = None
+    dados["r_realizado"] = None
 
     if payload["direcao"] == Direction.NEUTRAL.value or payload["entrada"] is None:
         dados["resultado"] = "SEM_SINAL"
@@ -300,7 +241,11 @@ def _preparar(
         dados["avaliado_em"] = None
         dados["avaliado_ate"] = None
     elif desfecho is not None:
-        dados["resultado"], dados["resultado_detalhe"], dados["candles_ate_resultado"] = desfecho
+        dados["resultado"] = desfecho.resultado
+        dados["resultado_detalhe"] = desfecho.detalhe
+        dados["candles_ate_resultado"] = desfecho.candles_ate_resultado
+        dados["preco_fill"] = desfecho.preco_fill
+        dados["r_realizado"] = desfecho.r_realizado
         dados["avaliado_em"] = datetime.now(UTC)
         dados["avaliado_ate"] = avaliado_ate
     else:
@@ -320,11 +265,20 @@ def varrer(conn) -> tuple[int, int]:
     índice único em `signals`, e reiniciar o pod no meio de uma varredura
     não produz linha repetida. Mesmo raciocínio do "por que sem watermark"
     do scraper.
+
+    NÃO grava leitura sem sinal (NEUTRO ou sem entrada) — decisão de
+    2026-08-06, depois de medir que essas linhas eram mais da metade do que
+    o worker gravava (1.307 de 2.300 no primeiro lote ao vivo) sem entrar em
+    nenhuma estatística de assertividade (o SQL de /signals/stats já as
+    exclui). "Com que frequência este perfil produz sinal" continua
+    respondível pelo LOG (`sem_sinal` abaixo), sem precisar de uma linha de
+    banco por não-evento. Ver docs/homelab-pipeline.md.
     """
     symbols = _watchlist(conn)
     perfis = _perfis(conn)
     gravados = 0
     tentados = 0
+    sem_sinal = 0
 
     for nome_perfil, params in perfis.items():
         for symbol in symbols:
@@ -353,6 +307,9 @@ def varrer(conn) -> tuple[int, int]:
                 for sinal in sinais:
                     if sinal.name not in MODALITIES:
                         continue
+                    if sinal.direction == Direction.NEUTRAL or sinal.risk.entry is None:
+                        sem_sinal += 1
+                        continue
                     confirmado, direcao_mtf = confirmacao[sinal.name]
                     payload = signal_payload(
                         symbol, timeframe, sinal, contexto, nome_perfil, params, ORIGEM,
@@ -364,6 +321,7 @@ def varrer(conn) -> tuple[int, int]:
                         gravados += cur.rowcount
             conn.commit()
 
+    log.info("varredura: %d leitura(s) sem sinal, não gravada(s)", sem_sinal)
     return gravados, tentados
 
 
@@ -371,24 +329,45 @@ def varrer(conn) -> tuple[int, int]:
 # Passe 2 — desfecho
 # ---------------------------------------------------------------------------
 
-def avaliar(conn) -> int:
+def avaliar(conn, reavaliar_tudo: bool = False) -> int:
     """Preenche o desfecho dos sinais pendentes. Devolve quantos resolveu.
 
     O recorte de 30 dias é o mesmo, pela mesma razão, do `GET /status`:
     sem ele a consulta cresce pra sempre. Também dispensa inventar um
     desfecho "EXPIRADO" que o `OUTCOME_LABELS` do Streamlit não conhece.
+
+    `reavaliar_tudo` existe por causa da mudança do modelo de execução em
+    2026-08-06 (fill na abertura seguinte, R líquido de custo — ver
+    `evaluate_signal_outcome`). As linhas antigas foram resolvidas pelo
+    modelo anterior, e o backfill NÃO as corrige: ele insere com
+    `ON CONFLICT DO NOTHING`, então rerodá-lo não encosta em quem já existe.
+    Com esta flag o passe recalcula desfecho de linhas JÁ resolvidas, sem
+    apagar nada e sem depender da janela de 30 dias — é o caminho pra
+    história inteira passar a falar do mesmo modelo, em vez de misturar dois
+    e produzir uma taxa que não descreve nenhum.
     """
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT id, symbol, timeframe, candle_time, direcao, entrada, stop, alvo_1, alvo_2
-            FROM signals
-            WHERE (resultado IS NULL OR resultado = 'EM_ABERTO')
-              AND candle_time > now() - make_interval(days => %s)
-            ORDER BY symbol, timeframe, candle_time
-            """,
-            (JANELA_DESFECHO_DIAS,),
-        )
+        if reavaliar_tudo:
+            cur.execute(
+                """
+                SELECT id, symbol, timeframe, candle_time, direcao, entrada, stop, alvo_1, alvo_2
+                FROM signals
+                WHERE entrada IS NOT NULL
+                  AND direcao <> 'NEUTRO'
+                ORDER BY symbol, timeframe, candle_time
+                """
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, symbol, timeframe, candle_time, direcao, entrada, stop, alvo_1, alvo_2
+                FROM signals
+                WHERE (resultado IS NULL OR resultado = 'EM_ABERTO')
+                  AND candle_time > now() - make_interval(days => %s)
+                ORDER BY symbol, timeframe, candle_time
+                """,
+                (JANELA_DESFECHO_DIAS,),
+            )
         pendentes = cur.fetchall()
 
     if not pendentes:
@@ -426,8 +405,9 @@ def avaliar(conn) -> int:
         # desempate conservador de vela (stop ganha quando os dois são
         # tocados na mesma). É o que garante que o worker e a "Verificação
         # retroativa" da interface concordem sobre o mesmo sinal.
-        resultado, detalhe, candles = evaluate_signal_outcome(risco, Direction(direcao), depois)
-        atualizacoes.append((resultado, detalhe, candles, depois.index[-1], sinal_id))
+        d = evaluate_signal_outcome(risco, Direction(direcao), depois)
+        atualizacoes.append((d.resultado, d.detalhe, d.candles_ate_resultado,
+                             d.preco_fill, d.r_realizado, depois.index[-1], sinal_id))
 
     if not atualizacoes:
         return 0
@@ -437,6 +417,7 @@ def avaliar(conn) -> int:
             """
             UPDATE signals
             SET resultado = %s, resultado_detalhe = %s, candles_ate_resultado = %s,
+                preco_fill = %s, r_realizado = %s,
                 avaliado_em = now(), avaliado_ate = %s
             WHERE id = %s
             """,
@@ -447,6 +428,40 @@ def avaliar(conn) -> int:
     resolvidos = sum(1 for linha in atualizacoes if linha[0] != "EM_ABERTO")
     log.info("desfecho: %d avaliados, %d com resultado final", len(atualizacoes), resolvidos)
     return resolvidos
+
+
+# ---------------------------------------------------------------------------
+# Purga — execução única, fora do loop
+# ---------------------------------------------------------------------------
+
+def purgar_automaticos(conn) -> int:
+    """DELETE FROM signals WHERE origem IN ('worker', 'backfill'). Devolve
+    quantas linhas apagou. NÃO toca em origem='manual'.
+
+    Decisão de 2026-08-06: a geração em massa (varredura automática +
+    reconstrução histórica) foi abandonada em favor de curadoria manual —
+    o operador decide o que vira sinal rastreado, clicando "salvar sinal" na
+    interface. Ver docs/homelab-pipeline.md pro motivo (a confirmação
+    multi-timeframe media PIOR que a ausência dela, e mais da metade do que
+    o worker gravava nunca entrava em estatística nenhuma).
+
+    Destrutivo e IRREVERSÍVEL de propósito — é a limpeza da abordagem
+    anterior, não uma rotina. Por isso não faz parte de `main()`'s fluxo
+    normal nem do loop: só roda quando alguém chama
+    `--purgar-automaticos` explicitamente. Loga a contagem ANTES de apagar,
+    pra nunca rodar às cegas contra o tamanho real.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM signals WHERE origem IN ('worker', 'backfill')")
+        (a_apagar,) = cur.fetchone()
+        log.info("purga: %d linha(s) de origem worker/backfill serão apagadas", a_apagar)
+
+        cur.execute("DELETE FROM signals WHERE origem IN ('worker', 'backfill')")
+        apagadas = cur.rowcount
+    conn.commit()
+
+    log.info("purga: %d linha(s) apagada(s)", apagadas)
+    return apagadas
 
 
 # ---------------------------------------------------------------------------
@@ -487,11 +502,15 @@ def _carimbar_mtf(linhas: list[dict], momentos: list[tuple], por_tf: dict[str, l
 
 
 def _backfill_symbol(conn, symbol: str, nome_perfil: str, params: AnalysisParams,
-                     velas: int, warmup: int) -> tuple[int, int]:
-    """Reconstrói os sinais de um símbolo × perfil. Devolve (gravados, tentados)."""
+                     velas: int, warmup: int) -> tuple[int, int, int]:
+    """Reconstrói os sinais de um símbolo × perfil. Devolve (gravados, tentados, sem_sinal)."""
     linhas: list[dict] = []
     momentos: list[tuple] = []
-    # sinais das velas dos timeframes de confirmação, pro carimbo as-of
+    sem_sinal = 0
+    # sinais das velas dos timeframes de confirmação, pro carimbo as-of —
+    # inclui TODO sinal, inclusive NEUTRO: o carimbo as-of de outros
+    # timeframes precisa saber o que este dizia em cada momento passado,
+    # não só os momentos em que era operável.
     por_tf: dict[str, list] = {tf: [] for tf in CONFIRMACAO}
 
     for timeframe in TIMEFRAMES_VARRIDOS:
@@ -525,6 +544,14 @@ def _backfill_symbol(conn, symbol: str, nome_perfil: str, params: AnalysisParams
             for sinal in sinais:
                 if sinal.name not in MODALITIES:
                     continue
+                # Mesma regra do varrer(): leitura sem sinal (NEUTRO/sem
+                # entrada) não vira linha de banco — só entrava porque o
+                # backfill reconstrói TODO candle histórico, e foi essa
+                # exaustão que produziu 71 mil das 150 mil linhas originais
+                # sem servir a nenhuma estatística de assertividade.
+                if sinal.direction == Direction.NEUTRAL or sinal.risk.entry is None:
+                    sem_sinal += 1
+                    continue
                 payload = signal_payload(
                     symbol, timeframe, sinal, contexto, nome_perfil, params, ORIGEM_BACKFILL,
                 )
@@ -536,7 +563,7 @@ def _backfill_symbol(conn, symbol: str, nome_perfil: str, params: AnalysisParams
                 momentos.append((fechamento, sinal.name))
 
     if not linhas:
-        return 0, 0
+        return 0, 0, sem_sinal
 
     _carimbar_mtf(linhas, momentos, por_tf)
 
@@ -544,7 +571,7 @@ def _backfill_symbol(conn, symbol: str, nome_perfil: str, params: AnalysisParams
         cur.executemany(_INSERT_SQL, linhas)
         gravados = cur.rowcount
     conn.commit()
-    return gravados, len(linhas)
+    return gravados, len(linhas), sem_sinal
 
 
 def backfill(conn, velas: int, warmup: int) -> tuple[int, int]:
@@ -562,16 +589,18 @@ def backfill(conn, velas: int, warmup: int) -> tuple[int, int]:
     perfis = _perfis(conn)
     gravados = 0
     tentados = 0
+    sem_sinal_total = 0
 
     for nome_perfil, params in perfis.items():
         for symbol in symbols:
             inicio = time.monotonic()
-            gr, te = _backfill_symbol(conn, symbol, nome_perfil, params, velas, warmup)
+            gr, te, ss = _backfill_symbol(conn, symbol, nome_perfil, params, velas, warmup)
             gravados += gr
             tentados += te
+            sem_sinal_total += ss
             log.info(
-                "backfill %s (%s): %d gravado(s) de %d · %.1fs",
-                symbol, nome_perfil, gr, te, time.monotonic() - inicio,
+                "backfill %s (%s): %d gravado(s) de %d · %d sem sinal (não gravado) · %.1fs",
+                symbol, nome_perfil, gr, te, ss, time.monotonic() - inicio,
             )
 
     return gravados, tentados
@@ -596,6 +625,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Worker de sinais do pipeline de ações.")
     parser.add_argument("--varrer-uma-vez", action="store_true", help="uma varredura e sai")
     parser.add_argument("--avaliar-uma-vez", action="store_true", help="um passe de desfecho e sai")
+    parser.add_argument("--reavaliar-tudo", action="store_true",
+                        help="recalcula o desfecho de TODOS os sinais com o modelo de execução "
+                             "atual (fill na abertura seguinte, R líquido de custo) e sai. "
+                             "Só faz UPDATE — não apaga nem insere linha nenhuma.")
+    parser.add_argument("--purgar-automaticos", action="store_true",
+                        help="APAGA (irreversível) todo sinal de origem worker/backfill — "
+                             "não toca em origem=manual — e sai. Ver docstring de "
+                             "purgar_automaticos().")
     parser.add_argument("--backfill", action="store_true",
                         help="reprocessa as velas já guardadas, com desfecho, e sai")
     parser.add_argument("--backfill-velas", type=int, default=BACKFILL_VELAS,
@@ -604,9 +641,20 @@ def main() -> int:
                         help=f"velas de aquecimento antes do primeiro sinal (padrão {BACKFILL_WARMUP})")
     args = parser.parse_args()
 
-    if args.varrer_uma_vez or args.avaliar_uma_vez or args.backfill:
+    if (args.varrer_uma_vez or args.avaliar_uma_vez or args.backfill
+            or args.reavaliar_tudo or args.purgar_automaticos):
         try:
             with pool.connection() as conn:
+                if args.purgar_automaticos:
+                    # sozinho: não faz sentido reavaliar/varrer/backfillar
+                    # linhas que vão embora na mesma chamada
+                    log.warning("purga de sinais automáticos (worker/backfill) — irreversível")
+                    apagadas = purgar_automaticos(conn)
+                    log.info("purga concluída: %d linha(s) apagada(s)", apagadas)
+                    return 0
+                if args.reavaliar_tudo:
+                    log.info("reavaliação total · modelo de execução atual (fill na abertura seguinte)")
+                    log.info("reavaliação: %d sinal(is) recalculado(s)", avaliar(conn, reavaliar_tudo=True))
                 if args.varrer_uma_vez:
                     gravados, tentados = varrer(conn)
                     log.info("varredura única: %d gravado(s) de %d tentado(s)", gravados, tentados)

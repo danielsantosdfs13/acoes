@@ -173,6 +173,50 @@ class StatsRow(BaseModel):
     alvo_1: int = 0
     alvo_2: int = 0
     stop: int = 0
+    # Quantos dos `resolvidos` já foram medidos pelo modelo de execução atual
+    # (fill na abertura seguinte, R líquido de custo). Abaixo de `resolvidos`,
+    # a expectativa está misturando dois modelos e o número infla nos gaps —
+    # o conserto é `analyzer.py --reavaliar-tudo`.
+    modelo_atual: int = 0
+
+
+class AnaliseIn(BaseModel):
+    """Corpo do POST /analisar — rodar o motor AGORA, sob demanda.
+
+    Todos os campos além de `symbol` são opcionais e caem nos mesmos
+    defaults do worker, pra que uma consulta avulsa e a varredura periódica
+    descrevam a mesma coisa quando ninguém pede nada diferente."""
+
+    symbol: str
+    timeframes: list[str] | None = None   # default: os quatro varridos pelo worker
+    perfil: str | None = None             # default: 'padrão'
+    modalidade: str | None = None         # default: todas as cinco
+
+
+class AnaliseResponse(BaseModel):
+    """Resultado de uma análise sob demanda.
+
+    `leituras` reusa `SignalIn` de propósito: é exatamente o mesmo shape que
+    o worker grava, montado pela mesma `daytrade_smc.signal_payload`. Assim
+    "o que o motor está vendo agora" e "o que o motor viu naquela vela" são
+    comparáveis campo a campo, sem tradução no meio.
+
+    Ao contrário da varredura do worker, aqui as leituras NEUTRO vêm junto:
+    o worker não as grava porque elas não entram em estatística nenhuma, mas
+    numa consulta "e a PETR4?" a resposta "está neutro nos quatro
+    timeframes" é o dado que se foi buscar.
+
+    `erros` traz, por timeframe, o motivo de não ter dado pra analisar
+    (símbolo sem candle, só vela em formação). Um timeframe sem dado não
+    derruba os outros — mas some da resposta em silêncio se não for dito.
+    """
+
+    symbol: str
+    perfil: str
+    confirmacao: list[str]        # o par de timeframes que define "confirmado"
+    analisado_em: datetime
+    leituras: list[SignalIn]
+    erros: dict[str, str] = {}
 
 
 class StatsResponse(BaseModel):

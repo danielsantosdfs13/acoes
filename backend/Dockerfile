@@ -26,7 +26,7 @@ WORKDIR /app
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY backend/auth.py backend/db.py backend/models.py \
+COPY backend/auth.py backend/db.py backend/models.py backend/candles.py \
      backend/processor.py backend/api.py backend/analyzer.py \
      backend/migrate.py backend/schema.sql ./
 COPY daytrade_smc.py ./
