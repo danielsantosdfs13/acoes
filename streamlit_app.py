@@ -728,6 +728,10 @@ RECORTE_LABELS = {
     "por_direcao": "Direção",
     "por_faixa_score": "Faixa de score",
     "por_mtf": "Confirmado no multi-timeframe",
+    # O recorte que justifica coletar feedback: responde "acertei mais no
+    # que eu escolhi operar do que na média?". `PENDENTE` agrupa os sinais
+    # sobre os quais ninguém decidiu nada.
+    "por_feedback": "Decisão do operador",
 }
 
 
@@ -1619,54 +1623,54 @@ def render_acompanhamento() -> None:
         )
         return
     
-    # Fetch recent signals (last 24h, operaveis apenas)
+    _LIMITE = 500
     try:
-        sinais_raw = daytrade_smc.fetch_signals(
+        resposta = daytrade_smc.fetch_signals(
             origem="worker",
             perfil=st.session_state.perfil_select,
             dias=1,
-            limite=500,
+            limite=_LIMITE,
         )
-        sinais = sinais_raw.get("signals", []) if isinstance(sinais_raw, dict) else []
-    except Exception as e:
-        st.error(f"Erro ao buscar sinais: {e}")
+    except Exception as exc:
+        # SEM `except: pass`. A versão anterior engolia a falha da leitura de
+        # feedback e caía num mapa vazio, o que fazia TODO sinal aparecer como
+        # pendente — indistinguível de "ninguém decidiu nada ainda". Um erro
+        # de rede virava um número errado sem nenhum aviso.
+        st.error(f"Não foi possível carregar os sinais: {exc}")
         return
-    
+
+    sinais = resposta.get("signals", [])
+    total = resposta.get("total", len(sinais))
     if not sinais:
-        st.info("Nenhum sinal recente encontrado.")
+        st.info(
+            "Nenhum sinal do worker nas últimas 24h para o perfil "
+            f"**{st.session_state.perfil_select}**. Com o mercado fechado isso é o "
+            "esperado."
+        )
         return
-    
-    # Fetch existing feedbacks
-    try:
-        fb_data = daytrade_smc.fetch_feedback(dias=7, limite=2000)
-        fbs = fb_data.get("feedbacks", [])
-        # Map signal_id -> latest feedback acao
-        fb_map = {}
-        for fb in fbs:
-            sid = fb.get("signal_id")
-            if sid and sid not in fb_map:
-                fb_map[sid] = fb["acao"]
-    except Exception:
-        fb_map = {}
-    
-    # Classify signals
-    pendentes = []
-    acompanhando = []
-    operados = []
-    ignorados = []
-    
+    if total > len(sinais):
+        st.caption(
+            f"⚠️ {total} sinais no período, mostrando os {len(sinais)} mais recentes "
+            f"(teto de {_LIMITE})."
+        )
+
+    # A decisão vem CARIMBADA em cada sinal (`feedback`), resolvida no banco
+    # pelo `GET /signals`. Antes disto a tela buscava os feedbacks numa
+    # segunda chamada e cruzava as duas listas aqui no navegador — além de
+    # não dar pra filtrar por decisão no servidor, o cruzamento só enxergava
+    # o que coubesse nos dois limites de paginação ao mesmo tempo.
+    pendentes, acompanhando, operados, ignorados = [], [], [], []
     for s in sinais:
-        sid = s.get("id")
-        fb = fb_map.get(sid)
-        if fb == "ACOMPANHAR":
+        acao = s.get("feedback")
+        if acao == "ACOMPANHAR":
             acompanhando.append(s)
-        elif fb in ("OPERAR", "OPEREI"):
+        elif acao in ("OPERAR", "OPEREI"):
             operados.append(s)
-        elif fb == "IGNORAR":
+        elif acao in ("IGNORAR", "CANCELEI"):
             ignorados.append(s)
         else:
             pendentes.append(s)
-    
+
     baldes = {
         "⏳ Pendentes": pendentes,
         "👀 Acompanhando": acompanhando,
@@ -1728,12 +1732,22 @@ def _linha_feedback(s: dict) -> dict:
         quando = pd.Timestamp(candle).tz_convert("America/Sao_Paulo").strftime("%d/%m %H:%M")
     except (TypeError, ValueError):
         quando = str(candle or "—")
+    # Um ACOMPANHAR gerado por regra do worker não é alguém tendo escolhido
+    # acompanhar. Sem essa marca, a coluna diria que você decidiu algo que
+    # decidiu-se sozinho — e é essa diferença que o recorte por feedback na
+    # Assertividade mede.
+    acao = s.get("feedback")
+    if acao and s.get("feedback_origem") == "auto":
+        decisao = f"{acao} (auto)"
+    else:
+        decisao = acao or "—"
     return {
         "Ativo": s.get("symbol", ""),
         "Direção": s.get("direcao", "NEUTRO"),
         "TF": s.get("timeframe", ""),
         "Leitura": s.get("modalidade", ""),
         "Score": round(s.get("score") or 0, 1),
+        "Decisão": decisao,
         "Entrada": s.get("entrada"),
         "Stop": s.get("stop"),
         "Alvo": s.get("alvo_1"),

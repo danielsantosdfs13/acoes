@@ -508,10 +508,13 @@ LEFT JOIN LATERAL (
 # decidiu nada" sem inventar um segundo parâmetro booleano.
 _ACAO_PENDENTE = "PENDENTE"
 
+# Os ::text em TODAS as ocorrências, não só na primeira: cada `%(acao)s` é um
+# placeholder independente pro driver, e o mesmo problema de inferência de
+# tipo descrito no comentário de `get_signals` vale para cada um deles.
 _FEEDBACK_WHERE = f"""
   AND (%(acao)s::text IS NULL
-       OR (%(acao)s = '{_ACAO_PENDENTE}' AND fb.acao IS NULL)
-       OR fb.acao = %(acao)s)
+       OR (%(acao)s::text = '{_ACAO_PENDENTE}' AND fb.acao IS NULL)
+       OR fb.acao = %(acao)s::text)
 """
 
 
@@ -821,6 +824,7 @@ def get_signal_stats(
         "perfil": perfil, "origem": origem,
         "symbol": symbol.strip().upper() if symbol else None,
         "timeframe": timeframe.strip().upper() if timeframe else None,
+        "acao": acao.strip().upper() if acao else None,
         "dias": dias,
     }
     with conn.cursor() as cur:
@@ -830,11 +834,13 @@ def get_signal_stats(
         por_direcao = _stats_rows(cur, "direcao", filtros)
         por_faixa_score = _stats_rows(cur, "faixa_score", filtros)
         por_mtf = _stats_rows(cur, "mtf_confirmado::text", filtros)
+        por_feedback = _stats_rows(cur, "feedback", filtros)
 
     return StatsResponse(
         filtros=filtros, total=sum(linha.n for linha in geral),
         geral=geral, por_timeframe=por_timeframe, por_symbol=por_symbol,
         por_direcao=por_direcao, por_faixa_score=por_faixa_score, por_mtf=por_mtf,
+        por_feedback=por_feedback,
     )
 
 

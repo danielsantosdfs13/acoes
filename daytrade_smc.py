@@ -2972,8 +2972,10 @@ def save_feedback(signal_id: int, acao: str, origem: str = "web", nota: str | No
     """Registra feedback do usuario sobre um sinal.
 
     acao: ACOMPANHAR | OPERAR | IGNORAR | OPEREI | CANCELEI
-    origem: web | whatsapp | telegram
+    origem: web | whatsapp | telegram | auto ('auto' é do worker, não daqui)
     """
+    import requests  # import tardio — mesma convenção do resto do arquivo
+
     if not ACOES_API_URL:
         raise RuntimeError("API do homelab nao configurada.")
     response = requests.post(
@@ -2990,7 +2992,13 @@ def fetch_feedback(acao: str | None = None, origem: str | None = None,
                    signal_id: int | None = None, dias: int = 7, limite: int = 200) -> dict:
     """Lista feedbacks com filtros.
 
-    Retorna {"feedbacks": [...], "total": N, "por_acao": {...}}"""
+    Retorna {"feedbacks": [...], "total": N, "por_acao": {...}}
+
+    Para saber a decisão ATUAL de um sinal não use esta função: `fetch_signals`
+    já devolve `feedback`/`feedback_origem` resolvidos no banco. Esta aqui é o
+    histórico bruto de decisões, útil pra auditoria."""
+    import requests  # import tardio — mesma convenção do resto do arquivo
+
     if not ACOES_API_URL:
         raise RuntimeError("API do homelab nao configurada.")
     params = {"limite": limite, "dias": dias}
@@ -3030,7 +3038,13 @@ def save_signal(payload: dict) -> dict:
 
 def fetch_signals(**filtros) -> dict:
     """Histórico de sinais. Filtros aceitos: symbol, timeframe, modalidade,
-    perfil, origem, resultado, dias, limite."""
+    perfil, origem, resultado, acao, dias, limite.
+
+    `acao` é a DECISÃO do operador (ACOMPANHAR/OPERAR/IGNORAR/OPEREI/
+    CANCELEI, ou PENDENTE pros sem decisão), não confundir com `resultado`,
+    que é o desfecho do preço. Cada sinal já volta com `feedback` e
+    `feedback_origem` preenchidos — não é preciso cruzar com
+    `fetch_feedback` do lado de cá."""
     import requests
 
     response = requests.get(
@@ -3045,7 +3059,10 @@ def fetch_signals(**filtros) -> dict:
 
 def fetch_signal_stats(**filtros) -> dict:
     """Assertividade agregada. Filtros aceitos: perfil, origem, symbol,
-    timeframe, dias."""
+    timeframe, acao, dias.
+
+    A resposta traz `por_feedback` junto dos demais recortes: é ele que
+    responde "acertei mais no que eu escolhi operar do que na média?"."""
     import requests
 
     response = requests.get(
