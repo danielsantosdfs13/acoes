@@ -49,7 +49,7 @@ pip install -r requirements-local.txt
 
 1. **"Homelab (API)"** (`_fetch_ohlcv_api`) — calls `GET /candles` on the homelab `api` service, which serves what the `scraper/` persisted into the shared TimescaleDB (see `backend/` and `scraper/` above). Near-real-time (the scraper polls every few seconds), and the recommended path. Configured via `st.secrets["acoes_api_url"]`/`["acoes_api_key"]` or the `ACOES_API_URL`/`ACOES_API_KEY` env vars (env vars matter because the container in k3s has no mounted `secrets.toml`), wired into the module-level `ACOES_API_URL`/`ACOES_API_KEY` globals at the top of `streamlit_app.py`. `load_symbols()`/`save_symbols()` also become API-backed (`GET`/`PUT /watchlist`) whenever `ACOES_API_URL` is set, falling back to the local JSON file otherwise. **This source speaks HTTP, never SQL.** It used to connect to Postgres directly with `psycopg`; that was replaced so no client outside `backend/` holds a DB credential. `save_symbols` maps to `PUT /watchlist` (not `POST`) because it has always had replace-the-whole-list semantics, which a per-symbol POST/DELETE pair can't express atomically.
 2. **"Yahoo Finance"** (`_fetch_ohlcv_yahoo`) — the fallback: works anywhere, no homelab needed, ~15-20min delayed. H4 candles aren't native to Yahoo, so they're synthesized by fetching H1 and resampling (`_resample_to_h4`), anchored to local midnight (Brasília). It is the only rate-limited source, which is why the Scanner's inter-symbol pause (`_PAUSA_YAHOO` in `streamlit_app.py`) is charged to it **by name** — the guard used to be written as "everyone except MT5", so each new source was born paying Yahoo's toll by default.
-3. **"MetaTrader 5"** (`_fetch_ohlcv_mt5`) — **dispatches, but is not in `DATA_SOURCES`.** It's a local DLL binding, not a network API, so it only works on the machine with an open, logged-in MT5 terminal — never the web app, which never runs there. `scraper/scraper.py` is its sole caller and the pipeline's whole ingestion path. Removing this branch because it's absent from the UI menu would silently kill all data collection.
+3. **"MetaTrader 5"** (`_fetch_ohlcv_mt5`) — **dispatches, but is not in `DATA_SOURCES`.** It's a local DLL binding, not a network API, so it only works on the machine with an open, logged-in MT5 terminal — never the web app, which never runs there. `scraper/scraper.py` is its sole caller and the pipeline's whole ingestion path. Removing this branch because it's absent from the UI menu would silently kill all data collection. **Timezone gotcha (fixed 2026-08-10):** MT5 returns bar times in the server's *local* wall clock as if it were UTC (for Clear, Brasília, UTC-3). `_fetch_ohlcv_mt5` must interpret the epoch as `LOCAL_TZ` and convert to UTC (`tz_localize(LOCAL_TZ).tz_convert("UTC")`) — reverting to a plain `utc=True` reintroduces a 3h shift that silently defeats the `ler_candles` forming-candle guard and makes signals on forming candles. See the runbook in `docs/homelab-pipeline.md` ("O fuso do servidor MT5").
 
 Which source the sidebar defaults to depends on config: Homelab when `ACOES_API_URL` is set, Yahoo when not (`source_select` in the session-state block). The top-of-page delay warning is chosen from the selected source for the same reason — hardcoded to Yahoo's text, it announced a 20-minute delay over near-real-time data.
 
@@ -58,16 +58,19 @@ Two sources were removed on 2026-08-06: the `"GitHub (MT5 de casa)"` bridge (it 
 ## Architecture: the analysis pipeline
 
 1. `fetch_ohlcv` → raw OHLCV `DataFrame`.
-2. `build_context(df)` → a `MarketContext` dataclass: ATR/ATR%, RVOL, volatility bucket, EMAs (9/21/50/200), daily VWAP + slope/distance/rejection, swing highs/lows (`detect_swings`), BOS/CHoCH structure events (`detect_structure`), candle patterns, breakout/retest flags, FVG setup.
-3. Four independent signal generators consume `MarketContext`, each returning a `Signal` (direction, score, confidence, reasons, alerts, `RiskPlan`):
+2. `build_context(df)` → a `MarketContext` dataclass: ATR/ATR%, RVOL, volatility bucket, EMAs (9/21/50/200), daily VWAP + slope/distance/rejection, swing highs/lows (`detect_swings`), BOS/CHoCH structure events (`detect_structure`), candle patterns, breakout/retest flags, FVG setup, IFR (`compute_rsi`) plus the Diário's IFR when the caller supplies it (`higher_rsi`).
+3. Five independent signal generators consume `MarketContext`, each returning a `Signal` (direction, score, confidence, reasons, alerts, `RiskPlan`):
    - `smc_signal` — structure/BOS-CHoCH/FVG based.
    - `price_action_signal` — candle patterns + breakout/retest.
    - `moving_average_signal` — EMA stack/slope.
    - `vwap_signal` — VWAP distance/slope/rejection.
-   - `confluence_signal` — combines the other four into one blended read.
+   - `rsi_signal` — IFR **exhaustion only** (≤10 / ≥90 by default), so NEUTRO is its normal answer. There is deliberately no "approaching the zone" band: a reading that scores outside the extreme is just another trend-follower, which the other four already are.
+   - `confluence_signal` — combines the **four structural** readings into one blended read. **The IFR is not one of them** — see below.
 4. `apply_market_filter` clamps direction/score/confidence based on volatility regime (e.g. low volatility blocks entries entirely; isolated single-modality reads are capped below "confirmed" thresholds).
 5. `attach_risk` fills in each signal's `RiskPlan` (entry/stop/targets/RR) — stops come from `structural_stop`/`stop_for_signal`, targets from `alternative_targets` (ATR, Fibonacci, structure, statistical expectancy — the same formulas across all timeframes/styles, they just scale with the data).
 6. `analyze(df)` runs the full pipeline for one timeframe; `analyze_symbol_mtf(...)` runs it across the confirmation + context timeframes for one symbol, returning a `MultiTimeframeResult`.
+
+**D1 is analysed first, everywhere.** Its IFR is injected as `higher_rsi` into every other timeframe (`rsi_signal` discounts a reading by 0.55 when the Diário is exhausted the opposite way). `analyze_symbol_mtf`, the `analyzer` worker's sweep and `POST /analisar` all reorder for this — `/analisar` pulls D1 in even when nobody asked for it, the same way it already pulls the confirmation timeframes, so the agent and the UI never disagree about the same candle. The one place that can't: `analyzer.py --backfill` and `check_signal_as_of` walk a single timeframe candle-by-candle, where reconstructing the Diário as-of each past bar would risk peeking at the future. They pass `higher_rsi=None`, so a `'backfill'` row never carries the opposing-timeframe discount that a `'worker'` row does — `origem` is in the dedup key, so the two stay separable.
 
 ## Multi-timeframe confirmation & operating style
 
@@ -80,9 +83,34 @@ Two "styles," each requiring a different pair of timeframes to agree before a si
 
 If the two required timeframes disagree, the final recommendation is forced to NEUTRO even if one timeframe looks strong alone. This is enforced identically in both the individual-analysis badge and the Scanner's "Confirmado" column.
 
+## Mini Índice (WINFUT)
+
+A fifth Streamlit mode, outside the stocks watchlist, on its own timeframes: confirmation M5+M15, context M2+H1 (`WINFUT_*` in `daytrade_smc.py`). M2/M5 were added to `TIMEFRAMES`, `DEFAULT_TF_COUNTS`, `_MT5_TIMEFRAME_MAP_NAMES` and `_ANALISE_COUNTS` for it, and are used by nothing else.
+
+**`"WINFUT"` is a logical name, not a ticker.** `yahoo_symbol` passes it through untouched and Yahoo has no such symbol, so the mode is **Homelab-only** and the UI blocks it on any other source rather than surfacing a confusing "symbol not found". The MT5 contract name is broker-specific and rolls quarterly (`WIN$` continuous vs `WINZ25`); the scraper translates it via `SCRAPER_SYMBOL_MT5`, so the stored series stays continuous across the roll while only the mapping changes.
+
+`SCRAPER_TIMEFRAMES_POR_SYMBOL` exists because the scraper loop is a `symbol × timeframe` cross product — putting M2/M5 in the global `SCRAPER_TIMEFRAMES` would collect them for all eleven stocks too, two extra MT5 calls per symbol per loop for data no stock screen reads.
+
+The sidebar's "Estilo" radio is built from `STYLES.keys()`, so the WINFUT style deliberately lives in `_ESTILOS_TODOS` instead; resolve styles through `estilo(nome)`, never `STYLES[...]`, or the mode raises `KeyError`.
+
+**Known limit:** the `analyzer` worker does *not* record WINFUT signals on WINFUT's timeframes. Its `CONFIRMACAO` and `TIMEFRAMES_VARRIDOS` are global and Day Trade only, so adding WINFUT to the watchlist gets it swept at M15/H1/H4/D1 with M15+H1 confirmation. Live analysis in the UI is correct; the hit-rate history for the mini index would need per-symbol confirmation in the worker.
+
 ## Modality filter
 
-The sidebar "Modalidade" selector picks which signal drives the recommendation: one specific reading (Confluência/SMC/Price Action/Médias Móveis/VWAP), or `ALL_MODALITIES_OPTION` ("Todas as modalidades"), which averages the score across all five (`overall_score`) and takes a majority vote on direction (`overall_direction`, tie → NEUTRO). The Scanner always ranks by this overall score.
+The sidebar "Modalidade" selector picks which signal drives the recommendation: one specific reading (Confluência/SMC/Price Action/Médias Móveis/VWAP/IFR), or `ALL_MODALITIES_OPTION` ("Todas as modalidades"), which averages the score across the **aggregable** readings (`overall_score`) and takes a majority vote on direction (`overall_direction`, tie → NEUTRO). The Scanner always ranks by this overall score.
+
+## The IFR is a sixth reading, but it aggregates into nothing
+
+`rsi_signal` is in `MODALITIES`, is selectable, gets its own `signals` rows and its own Scanner column — but it is excluded from **both** aggregates: `confluence_signal` never receives it (`analyze` computes the confluence over the four structural readings, *then* appends the IFR), and `overall_score`/`overall_direction`/`overall_agreement` filter it out via `MODALIDADES_FORA_DO_AGREGADO`.
+
+That is not tidiness, it is two measured regressions. The IFR is a contrarian exhaustion read that is NEUTRO almost always (0 firings in 20 real series, matching the upstream audit's 0-in-60):
+
+- **In the confluence**, it diluted every score by ~10-12% while contributing no information, and broke comparability with every row already stored for that modality.
+- **In the aggregate**, it was worse: `overall_direction` needs an *absolute* majority, so a reading that never votes raised the bar from 3-of-5 to 4-of-6. Measured: the general direction collapsed to NEUTRO in **9 of 20 series** and the Score Geral fell ~6 points — a silent tightening of the criterion that nobody chose, in the default modality that also ranks the Scanner.
+
+`overall_agreement` filters by the same rule, or the screen would print "3 de 6" next to a direction decided by a 3-of-5 vote. If another non-voting reading is ever added, put it in `MODALIDADES_FORA_DO_AGREGADO` too.
+
+Upstream (`kleverson01/acoes`) reached the same conclusion for the confluence and documents it in its README, but did **not** apply it to `overall_*`, so it still carries the second defect.
 
 ## Streamlit-specific gotchas to preserve
 
@@ -94,11 +122,17 @@ The sidebar "Modalidade" selector picks which signal drives the recommendation: 
 
 ## Analysis parameters and signal history
 
-`AnalysisParams` (frozen dataclass in `daytrade_smc.py`) holds ~30 curated engine thresholds. It lives in that file, not a new module, because `Makefile` ships exactly `daytrade_smc.py` + `scraper/{scraper,config}.py` to the Windows VM — a new first-party import would break the scraper silently.
+`AnalysisParams` (frozen dataclass in `daytrade_smc.py`) holds ~35 curated engine thresholds. It lives in that file, not a new module, because `Makefile` ships exactly `daytrade_smc.py` + `scraper/{scraper,config}.py` to the Windows VM — a new first-party import would break the scraper silently.
 
-It reaches every scoring/risk function through a single trailing `params` field on `MarketContext`, so those signatures never changed. Defaults reproduce the old behavior exactly; `scripts/conferir-refactor-params.py` proves it by running both engines over the same series and requiring zero differences. Run it before touching any of those numbers — there is no test suite.
+It reaches every scoring/risk function through a single trailing `params` field on `MarketContext`, so those signatures never changed. `scripts/conferir-refactor-params.py` runs two engines over the same series and diffs them field by field. Run it before touching any of those numbers — there is no test suite. It compares signals **positionally** and gives up when the count differs, so a change that adds or removes a reading needs a name-matched comparison instead.
 
 Two couplings to preserve: `normalizacao_score` and `filtro_isolada_score_max` are both 79.0 by construction (an isolated reading is capped at 79 so it normalizes to exactly 1.0), and `alternative_targets`' viability threshold is wired to `rr_alvo_1`.
+
+`from_dict` pads and truncates tuple fields to the default's length. That is load-bearing, not defensive: `multiplicador_concordancia` went from 5 entries to 6 when the IFR arrived, and a profile saved before that with a customised tuple would otherwise `IndexError` the first time five readings agreed — months later, in the worker, on a rare path.
+
+`atr_suavizacao` exists so `params_hash` can tell the two ATR conventions apart. `compute_atr` used a plain rolling mean until 2026-08-10, when it moved to Wilder's smoothing (SMMA/RMA, the MT5/TradingView convention). Since `atr_periodo` stayed 14, without this field the old and new hit-rate rows would have been indistinguishable. `"simples"` reproduces the old behaviour for comparison; it is not an operating mode, which is why it has no sidebar widget. **The ATR reaches further than stops:** `detect_structure` validates BOS/CHoCH against `amplitude/ATR ≥ estrutura_range_min`, so changing the ATR changes which structure events count at all — measured on real B3 series, the two conventions differ by ~8% on average and >20% at the 95th percentile, worst on M15.
+
+`STYLE_RSI_THRESHOLDS` + `params_para_estilo` give Swing Trade 20/80 and Day Trade 10/90, but **only when the profile left both at the default** — a profile that picked its own thresholds wins. The style-adjusted params are what the UI hashes and what gets stored, so a Swing signal stays distinguishable from a Day Trade one. The `analyzer` worker never calls this: it is Day Trade only (`CONFIRMACAO` fixed at M15+H1).
 
 `POST /analisar` runs the same engine on demand (it's the tool behind "how does VALE3 look right now?") and deliberately **persists nothing** — consultation is not measurement, and writing there would mix readings nobody traded into the hit rate. Its payloads carry `origem='consulta'`, a value that exists in no row of `signals`, precisely so a response forwarded into `POST /signals` shows up as an anomaly instead of passing for `'manual'`. It also analyses the confirmation timeframes even when they weren't asked for, discarding their readings: without that, asking only for D1 would report `mtf_confirmado=false` because nobody looked, in the same field where false otherwise means the timeframes disagree.
 

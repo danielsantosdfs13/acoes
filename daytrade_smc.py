@@ -1,19 +1,20 @@
 r"""
-Analisador de Day Trade — SMC + Price Action + EMAs + VWAP
-Versão 2.0 standalone com interface gráfica para Windows/VSCode.
+Motor de análise — SMC + Price Action + EMAs + VWAP + Confluência.
 
-Instalação:
-    py -m venv .venv
-    .\.venv\Scripts\Activate.ps1
-    python -m pip install pandas numpy yfinance
+É a única casa da lógica de análise do projeto. Quem importa daqui:
 
-Uso:
-    python daytrade_smc.py
+    streamlit_app.py       a interface web (as seis leituras, o Scanner,
+                           a verificação retroativa e a assertividade)
+    backend/analyzer.py    o worker que varre a watchlist gravando sinais
+    scraper/scraper.py     a ingestão na VM Windows, via
+                           fetch_ohlcv(..., source="MetaTrader 5")
+
+Este arquivo não tem código de interface: a tela é o Streamlit. O que sobra
+de linha de comando é um relatório de um ativo, útil pra conferir o motor
+sem subir a web:
+
     python daytrade_smc.py VALE3
     python daytrade_smc.py VALE3 --timeframe M15 --count 250 --risco 500
-
-Sem informar um ativo, o programa abre a interface gráfica. Pelo terminal,
-o primeiro argumento continua sendo o ativo a analisar.
 
 Aviso: o Yahoo Finance tem atraso e pode limitar requisições. O programa
 serve para leitura técnica e estudo; não envia ordens e não substitui dados
@@ -34,7 +35,7 @@ import statistics
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from pathlib import Path
 from urllib.parse import quote
@@ -79,6 +80,22 @@ SYMBOL_ALIASES = {
     "BITCOIN": "BTC-USD",
 }
 TIMEFRAMES = {
+    # M2 e M5 existem pro Mini Índice (ver WINFUT_* abaixo) e não são
+    # usados por nenhum ativo da watchlist de ações. Os limites de
+    # `max_days` são os do Yahoo (7 dias em 2m, 60 em 5m), mas na prática
+    # o WINFUT não vem do Yahoo — ver o comentário em WINFUT_SYMBOL.
+    "M2": {
+        "interval": "2m",
+        "duration": pd.Timedelta(minutes=2),
+        "candles_day": 203,   # ~6h45 de pregão da B3
+        "max_days": 7,
+    },
+    "M5": {
+        "interval": "5m",
+        "duration": pd.Timedelta(minutes=5),
+        "candles_day": 81,
+        "max_days": 60,
+    },
     "M15": {
         "interval": "15m",
         "duration": pd.Timedelta(minutes=15),
@@ -125,10 +142,77 @@ DAYTRADE_CONTEXT_TIMEFRAMES = ("H4", "D1")
 SWING_CONFIRMATION_TIMEFRAMES = ("D1", "W1")
 SWING_CONTEXT_TIMEFRAMES = ("H4",)
 
+# Mini Índice (WINFUT) — modo dedicado, totalmente separado da watchlist
+# de ações. Timeframes próprios porque o contrato futuro se opera num
+# horizonte mais curto: confirmação em M5+M15, com M2 pra afinar o timing
+# de entrada e H1 pro contexto da sessão.
+#
+# ATENÇÃO à origem do dado: "WINFUT" é um nome LÓGICO, não um ticker do
+# Yahoo — `yahoo_symbol("WINFUT")` devolve a string intacta e o Yahoo não
+# conhece esse símbolo. O mini índice só chega aqui pelo pipeline do
+# homelab, com o scraper coletando do MT5 na VM Windows. É por isso que a
+# interface bloqueia o modo quando a fonte não é "Homelab (API)": sem
+# isso, o modo daria erro de "símbolo não encontrado" e pareceria bug.
+#
+# O nome do contrato no MT5 depende da corretora (contínuo "WIN$" ou o
+# vencimento vigente, tipo "WINZ25"). Quem faz essa tradução é o scraper,
+# via SCRAPER_SYMBOL_MT5 — aqui dentro o símbolo é sempre "WINFUT".
+WINFUT_SYMBOL = "WINFUT"
+WINFUT_CONFIRMATION_TIMEFRAMES = ("M5", "M15")
+WINFUT_CONTEXT_TIMEFRAMES = ("M2", "H1")
+
 # Mantidos por compatibilidade — apontam pro conjunto de Day Trade, que
 # é o comportamento padrão histórico deste motor.
 CONFIRMATION_TIMEFRAMES = DAYTRADE_CONFIRMATION_TIMEFRAMES
 CONTEXT_TIMEFRAMES = DAYTRADE_CONTEXT_TIMEFRAMES
+
+# Limiares de IFR sugeridos por estilo de operação. A diferença existe
+# porque o ruído muda de escala com o timeframe: em M15 o IFR bate 90/10
+# com alguma regularidade, então só o extremo verdadeiro filtra bem. Já
+# no Diário/Semanal, 90/10 é raríssimo — quase nunca dispararia — e
+# 80/20 já representa exaustão genuína naquele horizonte.
+#
+# É SUGESTÃO, não imposição: quem manda são os campos `rsi_sobrevenda` /
+# `rsi_sobrecompra` do perfil em uso. A interface só aplica esta tabela
+# quando o perfil deixou os dois no default (ver `params_para_estilo`),
+# pra não sobrescrever em silêncio uma calibragem que alguém escolheu.
+# O worker (`backend/analyzer.py`) não consome isto: ele é Day Trade
+# puro, com CONFIRMACAO fixo em M15+H1.
+STYLE_RSI_THRESHOLDS = {
+    "Day Trade": (10.0, 90.0),
+    "Swing Trade": (20.0, 80.0),
+    # O Mini Índice opera em M2/M5, prazos ainda mais curtos e ruidosos
+    # que o M15 — o extremo verdadeiro é o único que filtra alguma coisa.
+    "Mini Índice (WINFUT)": (10.0, 90.0),
+}
+
+
+def params_para_estilo(params: AnalysisParams, style: str) -> AnalysisParams:
+    """Aplica os limiares de IFR sugeridos pro estilo, SE o perfil não
+    tiver escolhido os seus.
+
+    "Não escolheu" aqui é "os dois limiares estão no default". A
+    ambiguidade é conhecida e aceita: quem cravar 10/90 num perfil de
+    Swing vai ver 20/80 mesmo assim, porque não há como distinguir o
+    valor escolhido do valor herdado. O caminho pra fixar de verdade é
+    salvar o perfil com qualquer outro par.
+
+    Devolve uma instância NOVA — `AnalysisParams` é frozen, e o
+    `params_hash` acompanha a troca, que é o ponto: um sinal de Swing
+    gravado com 20/80 tem que ficar distinguível de um de Day Trade
+    gravado com 10/90.
+    """
+    limiares = STYLE_RSI_THRESHOLDS.get(style)
+    if limiares is None:
+        return params
+    no_default = (
+        params.rsi_sobrevenda == DEFAULT_PARAMS.rsi_sobrevenda
+        and params.rsi_sobrecompra == DEFAULT_PARAMS.rsi_sobrecompra
+    )
+    if not no_default:
+        return params
+    sobrevenda, sobrecompra = limiares
+    return replace(params, rsi_sobrevenda=sobrevenda, rsi_sobrecompra=sobrecompra)
 
 
 class Direction(str, Enum):
@@ -172,6 +256,15 @@ class AnalysisParams:
 
     # --- Contexto -------------------------------------------------------
     atr_periodo: int = 14                       # compute_atr
+    # "wilder" (SMMA/RMA, convenção do MT5 e do TradingView) ou "simples"
+    # (média móvel do True Range, o que este motor fazia até 10/08/2026).
+    # Existe como CAMPO, e não como troca silenciosa, porque o ATR define
+    # a distância mínima do stop: entra no `params_hash` e portanto fica
+    # gravado em cada linha de `signals`, dizendo com que convenção
+    # aquele sinal foi medido. Sem isso, o histórico anterior e o novo
+    # ficariam indistinguíveis na taxa de acerto.
+    atr_suavizacao: str = "wilder"              # compute_atr
+    rsi_periodo: int = 14                       # compute_rsi
     swing_esquerda: int = 3                     # detect_swings
     swing_direita: int = 3                      # detect_swings
     vol_baixa_max_pct: float = 0.30             # build_context: abaixo disso, volatilidade BAIXA
@@ -189,7 +282,27 @@ class AnalysisParams:
     vwap_distancia_min_pct: float = 0.10        # abaixo disso o preço está "em cima" da VWAP
     vwap_distancia_max_pct: float = 1.5         # acima disso bloqueia entrada e alerta
 
+    # --- IFR (RSI) ------------------------------------------------------
+    # O padrão é 90/10 (extremo verdadeiro), não os convencionais 70/30.
+    # A diferença é de natureza, não só de grau: 70/30 é atingido com
+    # frequência DENTRO de tendências normais — ali o gatilho confiável
+    # seria a SAÍDA da zona, não a permanência nela. Já 90/10 marca
+    # exaustão genuína e rara, em que a própria permanência na zona já é
+    # o sinal. Muito menos sinais, porém bem mais seletivos.
+    rsi_sobrecompra: float = 90.0               # rsi_signal: acima disso, exaustão compradora -> VENDA
+    rsi_sobrevenda: float = 10.0                # rsi_signal: abaixo disso, exaustão vendedora -> COMPRA
+
     # --- Confluência ----------------------------------------------------
+    # As QUATRO categorias estruturais, e só elas. O IFR é a sexta leitura
+    # mas fica DELIBERADAMENTE fora deste cálculo (ver `analyze`): é uma
+    # leitura contrária, de exaustão, enquanto estas quatro são de
+    # estrutura e tendência. Misturar as duas naturezas tinha dois
+    # efeitos ruins, os dois medidos: como o IFR fica NEUTRO quase
+    # sempre (0 disparos em 20 séries reais), ele diluía TODO score de
+    # confluência em ~10-12% sem acrescentar informação, e ainda
+    # invalidava a comparação com todo o histórico já gravado nesta
+    # modalidade. Fora do cálculo, a Confluência segue bit a bit a de
+    # antes e o IFR continua visível como leitura própria.
     peso_smc: float = 30.0
     peso_price_action: float = 20.0
     peso_medias: float = 20.0
@@ -241,21 +354,37 @@ class AnalysisParams:
     @classmethod
     def from_dict(cls, data: dict | None) -> AnalysisParams:
         """Tolerante de propósito: chave desconhecida é ignorada, chave
-        ausente cai no default, lista vira tupla.
+        ausente cai no default, lista vira tupla, e tupla CURTA demais é
+        completada com o default.
 
         É isso que faz um perfil salvo por um build antigo continuar
         carregando depois de um parâmetro novo entrar no motor, e que faz
         `{}` significar "todos os defaults de hoje" — por isso o perfil
         'padrão' é gravado no banco como um objeto vazio, e não como o
-        dicionário completo."""
+        dicionário completo.
+
+        O completar-com-o-default cobre um caso que já mordeu: quando o
+        IFR entrou como quinta leitura isolada, `multiplicador_concordancia`
+        passou de 5 pra 6 posições. Um perfil gravado antes disso, que
+        tivesse customizado essa tupla, voltaria do banco com 5 posições e
+        estouraria `IndexError` na primeira vez que as cinco leituras
+        concordassem — meses depois de salvo, num caminho raro, no worker.
+        Uma tupla LONGA demais é truncada pelo mesmo motivo simétrico."""
         if not data:
             return cls()
-        conhecidos = {campo.name for campo in fields(cls)}
+        conhecidos = {campo.name: campo for campo in fields(cls)}
+        padrao = cls()
         kwargs = {}
         for nome, valor in data.items():
-            if nome not in conhecidos:
+            campo = conhecidos.get(nome)
+            if campo is None:
                 continue
-            kwargs[nome] = tuple(valor) if isinstance(valor, list) else valor
+            if isinstance(valor, (list, tuple)):
+                referencia = getattr(padrao, nome)
+                valor = tuple(valor)
+                if isinstance(referencia, tuple) and len(valor) != len(referencia):
+                    valor = (valor + referencia[len(valor):])[:len(referencia)]
+            kwargs[nome] = valor
         return cls(**kwargs)
 
     def params_hash(self) -> str:
@@ -307,7 +436,16 @@ class MarketContext:
     bullish_retest: bool
     bearish_retest: bool
     fvg_setup: str | None
-    # Único campo com default, e trailing de propósito: é o que torna os
+    # IFR do próprio timeframe. `rsi_series` fica guardada pro gráfico.
+    rsi: float = 50.0
+    rsi_prev: float = 50.0
+    rsi_series: pd.Series | None = None
+    # IFR do timeframe superior (Diário), injetado pelo multi-timeframe
+    # (ver `analyze_symbol_mtf`). None quando não disponível — é o caso
+    # de quem analisa um timeframe só, como a verificação retroativa e o
+    # backfill; aí a leitura de IFR opera só com o próprio prazo.
+    higher_rsi: float | None = None
+    # Último campo, e trailing de propósito: é o que torna os
     # parâmetros alcançáveis por TODA função de score/risco (que recebem
     # só o contexto) sem mexer em nenhuma assinatura.
     params: AnalysisParams = DEFAULT_PARAMS
@@ -399,14 +537,17 @@ def _resample_to_h4(df_h1: pd.DataFrame) -> pd.DataFrame:
     return resampled.tz_convert("UTC")
 
 
-DATA_SOURCES = ("Yahoo Finance", "MetaTrader 5", "GitHub (MT5 de casa)", "Homelab (API)")
-
-# Configuração da ponte GitHub — definida pelo app (a partir de
-# st.secrets) antes de qualquer chamada com source="GitHub (MT5 de casa)".
-# Fica como variável de módulo pra não precisar passar repo/token em
-# cada chamada de fetch_ohlcv/analyze_symbol_mtf/check_signal_as_of.
-GITHUB_BRIDGE_REPO: str | None = None
-GITHUB_BRIDGE_TOKEN: str | None = None
+# Fontes oferecidas no SELETOR da interface web — não é a lista completa que
+# `fetch_ohlcv` aceita. "MetaTrader 5" continua despachando normalmente logo
+# abaixo, porque o scraper na VM Windows chama
+# `fetch_ohlcv(..., source="MetaTrader 5")` direto (scraper/scraper.py). Tirar
+# o ramo do MT5 de `fetch_ohlcv` por ele não estar nesta tupla mataria a
+# ingestão do pipeline inteiro; ele só não aparece na web porque a web nunca
+# roda na máquina que tem o terminal aberto.
+#
+# Homelab vem primeiro por ser o caminho recomendado: é o default do seletor
+# quando ACOES_API_URL está configurada.
+DATA_SOURCES = ("Homelab (API)", "Yahoo Finance")
 
 # Configuração da API do homelab (serviço `api`, que lê o TimescaleDB
 # alimentado pelo `acoes-scraper`) — definida pelo app a partir de
@@ -423,7 +564,7 @@ ACOES_API_KEY: str | None = None
 # isso de dentro de um rerun, e travar a UI é pior que dar erro.
 _API_TIMEOUT_SECONDS = 10
 
-_MT5_TIMEFRAME_MAP_NAMES = {"M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4", "D1": "TIMEFRAME_D1", "W1": "TIMEFRAME_W1"}
+_MT5_TIMEFRAME_MAP_NAMES = {"M2": "TIMEFRAME_M2", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4", "D1": "TIMEFRAME_D1", "W1": "TIMEFRAME_W1"}
 
 
 def fetch_ohlcv(symbol: str, timeframe: str, count: int, source: str = "Yahoo Finance") -> pd.DataFrame:
@@ -431,10 +572,8 @@ def fetch_ohlcv(symbol: str, timeframe: str, count: int, source: str = "Yahoo Fi
     Busca candles pela fonte escolhida.
       - "Yahoo Finance": funciona em qualquer lugar (nuvem ou local), atraso de 15-20min.
       - "MetaTrader 5": dado real, sem atraso, mas só funciona rodando LOCALMENTE, na
-        máquina com o terminal MT5 aberto e logado.
-      - "GitHub (MT5 de casa)": lê o snapshot mais recente publicado no GitHub por
-        `mt5_bridge/update_data.py` — dado real do MT5, mas atualizado só quando você
-        pedir (botão "Atualizar via MT5" no app), não em tempo real contínuo.
+        máquina com o terminal MT5 aberto e logado. Não aparece no seletor da web
+        (ver DATA_SOURCES) — é por aqui que o scraper na VM ingere as velas.
       - "Homelab (API)": lê candles pela API do homelab (`GET /candles`), que serve
         o que o `acoes-scraper` persistiu no TimescaleDB rodando continuamente numa
         VM — dado real, quase em tempo real (poucos segundos de atraso), sem
@@ -450,9 +589,6 @@ def fetch_ohlcv(symbol: str, timeframe: str, count: int, source: str = "Yahoo Fi
 
     if source == "MetaTrader 5":
         return _fetch_ohlcv_mt5(symbol, timeframe, count)
-
-    if source == "GitHub (MT5 de casa)":
-        return _fetch_ohlcv_github(symbol, timeframe, count)
 
     if source == "Homelab (API)":
         return _fetch_ohlcv_api(symbol, timeframe, count)
@@ -479,7 +615,7 @@ def _api_headers() -> dict[str, str]:
 def _fetch_ohlcv_api(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
     """Lê candles pela API do homelab (`GET /candles`), que serve o que o
     `acoes-scraper` persistiu no TimescaleDB."""
-    import requests  # import tardio — mesma convenção de _fetch_ohlcv_mt5/_fetch_ohlcv_github
+    import requests  # import tardio — mesma convenção de _fetch_ohlcv_mt5
 
     try:
         response = requests.get(
@@ -504,100 +640,6 @@ def _fetch_ohlcv_api(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
     df["time"] = pd.to_datetime(df["time"], utc=True)
     df = df.set_index("time").sort_index()
     return df[["open", "high", "low", "close", "volume"]].tail(count)
-
-
-def _fetch_ohlcv_github(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
-    """Lê o snapshot de candles publicado no GitHub pelo script que roda no PC de casa via MT5."""
-    import requests
-
-    if not GITHUB_BRIDGE_REPO:
-        raise RuntimeError(
-            "Repositório do GitHub não configurado (GITHUB_BRIDGE_REPO). Configure em "
-            "st.secrets['github_repo'] no formato 'usuario/nome-do-repositorio'."
-        )
-
-    url = f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/main/data/mt5_snapshot.json"
-    headers = {"Authorization": f"token {GITHUB_BRIDGE_TOKEN}"} if GITHUB_BRIDGE_TOKEN else {}
-
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-    except Exception as exc:
-        raise RuntimeError(f"Falha ao buscar o snapshot no GitHub: {exc}") from exc
-
-    if response.status_code == 404:
-        raise RuntimeError(
-            "Ainda não existe nenhum snapshot publicado. Clique em \"Atualizar via MT5\" "
-            "primeiro, com o PC de casa ligado e o runner do GitHub Actions ativo."
-        )
-    if response.status_code != 200:
-        raise RuntimeError(f"Não foi possível buscar o snapshot do GitHub (HTTP {response.status_code}).")
-
-    snapshot = response.json()
-    symbol_data = snapshot.get("symbols", {}).get(symbol)
-    if symbol_data is None:
-        raise RuntimeError(f"'{symbol}' não está no snapshot mais recente — confirme se está na watchlist usada pelo PC de casa.")
-
-    tf_data = symbol_data.get(timeframe)
-    if tf_data is None:
-        raise RuntimeError(f"Timeframe {timeframe} não está no snapshot para {symbol}.")
-    if not tf_data.get("ok"):
-        raise RuntimeError(f"O PC de casa não conseguiu buscar {symbol} em {timeframe} via MT5: {tf_data.get('error')}")
-
-    candles = tf_data.get("candles", [])
-    if not candles:
-        raise RuntimeError(f"Snapshot sem candles para {symbol} em {timeframe}.")
-
-    df = pd.DataFrame(candles)
-    df["time"] = pd.to_datetime(df["time"], utc=True)
-    df = df.set_index("time").sort_index()
-    return df[["open", "high", "low", "close", "volume"]].tail(count)
-
-
-def fetch_snapshot_timestamp() -> str | None:
-    """Devolve o horário (ISO, UTC) do snapshot mais recente publicado no GitHub, ou None se não houver nenhum ainda."""
-    import requests
-
-    if not GITHUB_BRIDGE_REPO:
-        return None
-    url = f"https://raw.githubusercontent.com/{GITHUB_BRIDGE_REPO}/main/data/mt5_snapshot.json"
-    headers = {"Authorization": f"token {GITHUB_BRIDGE_TOKEN}"} if GITHUB_BRIDGE_TOKEN else {}
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return None
-        return response.json().get("generated_at")
-    except Exception:
-        return None
-
-
-def trigger_github_update() -> tuple[bool, str]:
-    """
-    Dispara o workflow do GitHub Actions (workflow_dispatch) que aciona
-    o runner no PC de casa. Devolve (sucesso, mensagem).
-    """
-    import requests
-
-    if not GITHUB_BRIDGE_REPO or not GITHUB_BRIDGE_TOKEN:
-        return False, "Repositório ou token do GitHub não configurados (veja st.secrets)."
-
-    url = f"https://api.github.com/repos/{GITHUB_BRIDGE_REPO}/actions/workflows/mt5-update.yml/dispatches"
-    headers = {
-        "Authorization": f"token {GITHUB_BRIDGE_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-    try:
-        response = requests.post(url, headers=headers, json={"ref": "main"}, timeout=15)
-    except Exception as exc:
-        return False, f"Falha ao chamar a API do GitHub: {exc}"
-
-    if response.status_code == 204:
-        return True, "Atualização disparada — aguardando o PC de casa processar."
-    if response.status_code == 404:
-        return False, (
-            "Workflow não encontrado (HTTP 404). Confirme se o arquivo "
-            ".github/workflows/mt5-update.yml foi commitado e se o token tem permissão 'workflow'."
-        )
-    return False, f"Falha ao disparar (HTTP {response.status_code}): {response.text[:200]}"
 
 
 def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
@@ -635,7 +677,21 @@ def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
         mt5.shutdown()
 
     df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    # O `time` devolvido pelo MT5 é o relógio LOCAL do servidor em formato
+    # epoch — o horário de parede como se fosse UTC, sem o offset. A Clear
+    # roda o servidor em horário de Brasília, então sem conversão cada vela
+    # nascia 3h atrasada em relação ao UTC verdadeiro. Isso não era só
+    # estético: como o `ler_candles` do backend corta "vela fechada"
+    # comparando com `now(UTC)`, o worker acabava analisando a vela EM
+    # FORMAÇÃO e o `ON CONFLICT DO NOTHING` congelava a leitura pela metade
+    # (medido: `criado_em − candle_time` ≈ 3h + 1min nos sinais M15).
+    #
+    # A conversão reusa o MESMO fuso que o resto da pipeline (LOCAL_TZ, que o
+    # scraper espelha em MERCADO_TIMEZONE): interpreta o epoch como hora local
+    # do mercado e converte pra UTC. Se a corretora um dia trocar o fuso do
+    # servidor, é aqui que se mexe — o restante do pipeline não muda.
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df["time"] = df["time"].dt.tz_localize(LOCAL_TZ).dt.tz_convert("UTC")
     df = df.set_index("time").sort_index()
     df = df.rename(columns={"tick_volume": "volume"})
 
@@ -716,7 +772,24 @@ def _fetch_ohlcv_yahoo(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
     return df.tail(count)
 
 
-def compute_atr(df: pd.DataFrame, period: int = DEFAULT_PARAMS.atr_periodo) -> pd.Series:
+def compute_atr(
+    df: pd.DataFrame,
+    period: int = DEFAULT_PARAMS.atr_periodo,
+    suavizacao: str = DEFAULT_PARAMS.atr_suavizacao,
+) -> pd.Series:
+    """
+    ATR pelo método de Wilder — a mesma convenção do MetaTrader e do
+    TradingView, que chamam esse suavizamento de SMMA/RMA.
+
+    Até 10/08/2026 este motor usava média SIMPLES do True Range, o que
+    dava 2-5% de divergência contra o ATR das plataformas. Parece pouco,
+    mas o ATR define a distância mínima do stop (ver `stop_for_signal` e
+    `alternative_targets`), então a diferença ia direto pro tamanho do
+    risco de cada operação.
+
+    `suavizacao="simples"` reproduz o comportamento antigo — serve pra
+    comparar o histórico gravado antes da troca, não pra operar.
+    """
     previous_close = df["close"].shift(1)
     true_range = pd.concat(
         [
@@ -726,7 +799,76 @@ def compute_atr(df: pd.DataFrame, period: int = DEFAULT_PARAMS.atr_periodo) -> p
         ],
         axis=1,
     ).max(axis=1)
-    return true_range.rolling(period, min_periods=period).mean().bfill()
+
+    if suavizacao == "simples" or len(true_range) <= period:
+        return true_range.rolling(period, min_periods=period).mean().bfill()
+
+    # Mesma semente do IFR (ver `compute_rsi`): média simples dos
+    # `period` primeiros valores posicionada no índice `period`, e daí
+    # pra frente o suavizamento de Wilder. O primeiro True Range é NaN
+    # (não há close anterior), então a média vai de 1 a `period`.
+    seeded = true_range.copy()
+    seeded.iloc[:period] = np.nan
+    seeded.iloc[period] = true_range.iloc[1:period + 1].mean()
+    return seeded.ewm(alpha=1 / period, adjust=False).mean().bfill()
+
+
+def compute_rsi(df: pd.DataFrame, period: int = DEFAULT_PARAMS.rsi_periodo) -> pd.Series:
+    """
+    IFR (Índice de Força Relativa / RSI) pelo método de Wilder — o mesmo
+    usado por padrão no MetaTrader, TradingView e Profit, pra que o
+    número daqui bata com o que aparece no gráfico.
+
+    O detalhe que faz toda a diferença, e é a fonte de erro mais comum
+    nas implementações, é a SEMENTE. Wilder inicia com a média SIMPLES
+    dos primeiros `period` ganhos/perdas e só a partir daí aplica o
+    suavizamento (`avg = (avg_anterior * (n - 1) + atual) / n`).
+
+    Um `ewm(adjust=False)` direto sobre a série inteira semeia o cálculo
+    com o primeiro ganho ISOLADO em vez dessa média. O erro chega a ~20
+    pontos no início e decai devagar ao longo da série — grande o
+    bastante pra inverter uma leitura de exaustão, e discreto o bastante
+    pra ninguém notar. É o bug que a auditoria do projeto original
+    encontrou; a correção foi validada contra os dados de referência do
+    próprio Wilder.
+    """
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+
+    if len(delta) <= period:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+
+    # A semente vai posicionada no índice `period`; tudo antes vira NaN
+    # (período de aquecimento). O `ewm` começa no primeiro valor
+    # não-nulo, então daí pra frente ele reproduz exatamente a recursão
+    # de Wilder.
+    gain_seeded = gain.copy()
+    loss_seeded = loss.copy()
+    gain_seeded.iloc[:period] = np.nan
+    loss_seeded.iloc[:period] = np.nan
+    gain_seeded.iloc[period] = gain.iloc[1:period + 1].mean()
+    loss_seeded.iloc[period] = loss.iloc[1:period + 1].mean()
+
+    avg_gain = gain_seeded.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss_seeded.ewm(alpha=1 / period, adjust=False).mean()
+
+    rsi = pd.Series(np.nan, index=df.index, dtype=float)
+    valid = avg_gain.notna() & avg_loss.notna()
+
+    # Três casos, explícitos pra não dividir por zero:
+    #   perda 0 e ganho > 0 -> alta sem nenhuma queda: IFR = 100
+    #   perda 0 e ganho 0   -> mercado parado: IFR = 50 (neutro, NÃO 100)
+    #   caso normal         -> fórmula padrão
+    sem_perda = valid & (avg_loss == 0)
+    rsi[sem_perda & (avg_gain > 0)] = 100.0
+    rsi[sem_perda & (avg_gain == 0)] = 50.0
+
+    normal = valid & (avg_loss > 0)
+    rs = avg_gain[normal] / avg_loss[normal]
+    rsi[normal] = 100 - (100 / (1 + rs))
+
+    return rsi
 
 
 def compute_emas(df: pd.DataFrame) -> pd.DataFrame:
@@ -1007,11 +1149,15 @@ def detect_fvg_setup(df: pd.DataFrame, max_age: int = DEFAULT_PARAMS.fvg_max_ida
     return None
 
 
-def build_context(df: pd.DataFrame, params: AnalysisParams = DEFAULT_PARAMS) -> MarketContext:
+def build_context(
+    df: pd.DataFrame,
+    params: AnalysisParams = DEFAULT_PARAMS,
+    higher_rsi: float | None = None,
+) -> MarketContext:
     if len(df) < 30:
         raise ValueError("São necessários pelo menos 30 candles fechados.")
 
-    atr_series = compute_atr(df, params.atr_periodo)
+    atr_series = compute_atr(df, params.atr_periodo, params.atr_suavizacao)
     atr = float(atr_series.iloc[-1])
     price = float(df["close"].iloc[-1])
     atr_pct = atr / price * 100 if price else 0.0
@@ -1035,6 +1181,14 @@ def build_context(df: pd.DataFrame, params: AnalysisParams = DEFAULT_PARAMS) -> 
     candle = df.iloc[-1]
     touched_vwap = bool(candle["low"] <= vwap <= candle["high"])
     rejection = touched_vwap and abs(vwap_distance) >= 0.15
+
+    # O IFR tem período de aquecimento (os `rsi_periodo` primeiros
+    # candles são NaN por construção da semente de Wilder), então o
+    # `dropna` antes de ler os dois últimos valores não é opcional.
+    rsi_series = compute_rsi(df, params.rsi_periodo)
+    rsi_clean = rsi_series.dropna()
+    rsi_now = float(rsi_clean.iloc[-1]) if len(rsi_clean) >= 1 else 50.0
+    rsi_before = float(rsi_clean.iloc[-2]) if len(rsi_clean) >= 2 else rsi_now
 
     volume_ma_current = float(df["volume"].rolling(20, min_periods=5).mean().iloc[-1])
     swings = detect_swings(df, params.swing_esquerda, params.swing_direita)
@@ -1067,6 +1221,10 @@ def build_context(df: pd.DataFrame, params: AnalysisParams = DEFAULT_PARAMS) -> 
         bullish_retest=bullish_retest,
         bearish_retest=bearish_retest,
         fvg_setup=detect_fvg_setup(df, params.fvg_max_idade),
+        rsi=rsi_now,
+        rsi_prev=rsi_before,
+        rsi_series=rsi_series,
+        higher_rsi=higher_rsi,
         params=params,
     )
 
@@ -1399,6 +1557,93 @@ def vwap_signal(context: MarketContext) -> Signal:
     )
 
 
+def rsi_signal(context: MarketContext) -> Signal:
+    """
+    Leitura de IFR por EXAUSTÃO. A regra é única e binária:
+
+        IFR <= rsi_sobrevenda   (padrão 10)  ->  COMPRA
+        IFR >= rsi_sobrecompra  (padrão 90)  ->  VENDA
+        no meio                              ->  NEUTRO
+
+    De propósito não existe gradação de "aproximando da zona" nem
+    "saindo da zona". Exaustão é o extremo — ou o preço está exaurido,
+    ou o IFR não tem nada a dizer. Uma leitura que pontua fora do
+    extremo descaracteriza o indicador: vira mais um seguidor de
+    tendência, que é justamente o que as outras quatro categorias já
+    fazem, e o voto dela na Confluência deixa de acrescentar informação.
+
+    O IFR do timeframe superior (Diário), quando disponível, entra como
+    reforço — exaustão simultânea nos dois prazos é a leitura de maior
+    convicção que este motor produz. Quando os dois prazos apontam pra
+    lados opostos, isso vira alerta, não cancelamento: quem decide o
+    peso disso é a Confluência.
+    """
+    params = context.params
+    rsi = context.rsi
+    sobrevenda, sobrecompra = params.rsi_sobrevenda, params.rsi_sobrecompra
+    reasons: list[str] = []
+
+    # 100.0 e não o teto direto: quem capa a leitura isolada é o
+    # `apply_market_filter` lá embaixo, com `filtro_isolada_score_max`.
+    # Cravar 79 aqui ignoraria um perfil que tivesse mudado esse teto.
+    if rsi <= sobrevenda:
+        direction, score = Direction.BUY, 100.0
+        setup = f"EXAUSTÃO VENDEDORA — IFR ≤ {sobrevenda:.0f}"
+        reasons.append(
+            f"IFR em {rsi:.1f}, abaixo de {sobrevenda:.0f} — vendedores exauridos, "
+            "entrada a favor da reversão"
+        )
+    elif rsi >= sobrecompra:
+        direction, score = Direction.SELL, 100.0
+        setup = f"EXAUSTÃO COMPRADORA — IFR ≥ {sobrecompra:.0f}"
+        reasons.append(
+            f"IFR em {rsi:.1f}, acima de {sobrecompra:.0f} — compradores exauridos, "
+            "entrada a favor da reversão"
+        )
+    else:
+        direction, score = Direction.NEUTRAL, 0.0
+        setup = "Sem exaustão"
+        reasons.append(
+            f"IFR em {rsi:.1f} — fora das zonas de exaustão "
+            f"({sobrevenda:.0f}/{sobrecompra:.0f})"
+        )
+
+    # --- Reforço (ou desconto) pelo timeframe superior (Diário) ---
+    # Prazos opostos não zeram a leitura, descontam: o extremo do
+    # próprio timeframe continua existindo, só perde convicção.
+    if context.higher_rsi is not None and direction != Direction.NEUTRAL:
+        d_rsi = context.higher_rsi
+        if direction == Direction.BUY:
+            if d_rsi <= sobrevenda:
+                reasons.append(f"Diário TAMBÉM exaurido na venda (IFR {d_rsi:.1f}) — convicção máxima")
+            elif d_rsi >= sobrecompra:
+                score *= 0.55
+                reasons.append(f"ATENÇÃO: Diário exaurido na COMPRA (IFR {d_rsi:.1f}) — sinais opostos entre prazos")
+        else:  # SELL
+            if d_rsi >= sobrecompra:
+                reasons.append(f"Diário TAMBÉM exaurido na compra (IFR {d_rsi:.1f}) — convicção máxima")
+            elif d_rsi <= sobrevenda:
+                score *= 0.55
+                reasons.append(f"ATENÇÃO: Diário exaurido na VENDA (IFR {d_rsi:.1f}) — sinais opostos entre prazos")
+
+    direction, score, confidence = apply_market_filter(
+        direction,
+        score,
+        score * 0.7,
+        context,
+        isolated=True,
+    )
+    return Signal(
+        "IFR",
+        direction,
+        score,
+        confidence,
+        setup,
+        reasons,
+        market_alerts(context) + ["LEITURA ISOLADA — confirme com outras categorias"],
+    )
+
+
 def confluence_signal(
     context: MarketContext,
     isolated: list[Signal],
@@ -1447,7 +1692,11 @@ def confluence_signal(
     # genuína e pontuação consistente das 2 categorias).
     multiplier = params.multiplicador_concordancia[agreeing]
     score = min(100.0, score * multiplier)
-    confidence = agreeing / 4 * 100
+    # Sobre `len(isolated)`, não sobre um 4 cravado: o número de leituras
+    # isoladas já mudou uma vez (quatro até a entrada do IFR) e o
+    # denominador fixo teria passado a reportar 125% de confiança na
+    # unanimidade, silenciosamente.
+    confidence = agreeing / len(isolated) * 100 if isolated else 0.0
 
     direction, score, confidence = apply_market_filter(
         direction,
@@ -1539,6 +1788,18 @@ def stop_for_signal(
             return base - context.atr * 0.3, "EMA21/EMA50"
         base = float(ema["ema_21"] if ema["ema_21"] > price else ema["ema_50"])
         return base + context.atr * 0.3, "EMA21/EMA50"
+
+    if signal.name == "IFR":
+        # O IFR não tem nível de preço próprio: é leitura de momentum, não
+        # de estrutura. Sem este ramo ele cairia no fallback da VWAP logo
+        # abaixo e sairia com um stop ancorado num nível que a leitura
+        # nunca consultou — ainda por cima numa entrada contrária, onde o
+        # preço costuma estar longe da VWAP justamente por estar exaurido.
+        # ATR puro é o honesto aqui: distância por volatilidade, sem fingir
+        # estrutura que não existe.
+        if direction == Direction.BUY:
+            return price - context.atr * 1.2, "ATR"
+        return price + context.atr * 1.2, "ATR"
 
     if direction == Direction.BUY:
         return context.vwap - context.atr * 0.5, "VWAP"
@@ -1707,8 +1968,29 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
 def analyze(
     df: pd.DataFrame,
     params: AnalysisParams = DEFAULT_PARAMS,
+    higher_rsi: float | None = None,
 ) -> tuple[MarketContext, list[Signal]]:
-    context = build_context(df, params)
+    """Roda o motor inteiro sobre UM timeframe.
+
+    `higher_rsi` é o IFR do Diário, usado pelo `rsi_signal` como filtro
+    de contexto. Quem analisa vários timeframes (`analyze_symbol_mtf`)
+    passa esse valor; quem analisa um só — a verificação retroativa
+    (`check_signal_as_of`) e o backfill do worker — deixa em None, e aí
+    a leitura de IFR opera apenas com o próprio prazo. É por isso que a
+    verificação retroativa pode divergir levemente da leitura ao vivo
+    na modalidade IFR: ao vivo ela tem o Diário, retroativa não.
+
+    O IFR entra como leitura própria, mas FORA da confluência — só as
+    quatro categorias estruturais alimentam `confluence_signal`. O
+    motivo está no comentário dos pesos, em `AnalysisParams`: as quatro
+    leem estrutura e tendência, o IFR lê exaustão e é contrário por
+    natureza. Como ele fica NEUTRO quase sempre, somá-lo ali diluía
+    todo score de confluência sem acrescentar informação — e quebrava
+    a comparação com o histórico já gravado nessa modalidade. Por isso
+    a ordem aqui importa: a confluência é calculada ANTES de o IFR ser
+    anexado à lista.
+    """
+    context = build_context(df, params, higher_rsi=higher_rsi)
     isolated = [
         smc_signal(context),
         price_action_signal(context),
@@ -1716,7 +1998,7 @@ def analyze(
         vwap_signal(context),
     ]
     confluence = confluence_signal(context, isolated)
-    signals = [confluence, *isolated]
+    signals = [confluence, *isolated, rsi_signal(context)]
 
     for signal in signals:
         attach_risk(signal, context)
@@ -1741,7 +2023,7 @@ class MultiTimeframeResult:
     confirmed_direction: Direction
 
 
-MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP")
+MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR")
 ALL_MODALITIES_OPTION = "Todas as modalidades"
 MODALITY_CHOICES = (ALL_MODALITIES_OPTION, *MODALITIES)
 
@@ -1760,7 +2042,7 @@ def mtf_confirmation(
     assertividade passaria a medir a coisa errada.
 
     Existe separado de `analyze_symbol_mtf` porque tanto a interface
-    quanto o worker precisam calcular isso pras CINCO modalidades a
+    quanto o worker precisam calcular isso pras SEIS modalidades a
     partir de um mesmo conjunto de resultados, sem reanalisar nada.
     """
     tf_a, tf_b = confirmation
@@ -1770,20 +2052,44 @@ def mtf_confirmation(
     return confirmado, dir_a if confirmado and dir_a is not None else Direction.NEUTRAL
 
 
+# Leituras que NÃO entram no agregado "Todas as modalidades". O IFR está
+# aqui pelo mesmo motivo que está fora da confluência (ver `analyze`), e
+# aqui o efeito era ainda pior: como `overall_direction` exige maioria
+# ABSOLUTA, uma sexta leitura que é NEUTRO por desenho nunca compõe a
+# maioria e só levanta a régua — de 3-de-5 pra 4-de-6. Medido nas séries
+# reais, isso virava NEUTRO em 9 de 20 casos e derrubava o Score Geral em
+# ~6 pontos, sem ninguém ter decidido endurecer o critério. O IFR segue
+# como modalidade selecionável e como coluna do Scanner; ele só não vota
+# no agregado nem entra na média.
+MODALIDADES_FORA_DO_AGREGADO = frozenset({"IFR"})
+
+
+def _agregaveis(signals: list[Signal]) -> list[Signal]:
+    return [s for s in signals if s.name not in MODALIDADES_FORA_DO_AGREGADO]
+
+
 def overall_score(signals: list[Signal]) -> float:
-    """Score geral: média do score das 5 leituras (Confluência, SMC, Price Action, Médias Móveis, VWAP) neste timeframe."""
-    return sum(s.score for s in signals) / len(signals)
+    """Score geral: média do score das 5 leituras agregáveis (Confluência, SMC, Price Action, Médias Móveis, VWAP) neste timeframe. O IFR fica fora — ver `MODALIDADES_FORA_DO_AGREGADO`."""
+    agregaveis = _agregaveis(signals)
+    if not agregaveis:
+        return 0.0
+    return sum(s.score for s in agregaveis) / len(agregaveis)
 
 
 def overall_direction(signals: list[Signal]) -> Direction:
     """
-    Direção geral: exige MAIORIA CLARA entre as 5 leituras (pelo menos
-    3 de 5 apontando pra mesma direção), não só "mais compra que
-    venda" entre poucas leituras não-neutras. Isso evita que 1 leitura
-    isolada decida a direção geral enquanto as outras 4 estão caladas
-    (NEUTRO) — nesse caso o correto é permanecer NEUTRO, não declarar
-    vencedor por W.O.
+    Direção geral: exige MAIORIA CLARA entre as 5 leituras agregáveis
+    (pelo menos 3 de 5 apontando pra mesma direção), não só "mais compra
+    que venda" entre poucas leituras não-neutras. Isso evita que 1
+    leitura isolada decida a direção geral enquanto as outras 4 estão
+    caladas (NEUTRO) — nesse caso o correto é permanecer NEUTRO, não
+    declarar vencedor por W.O.
+
+    O IFR não entra na conta (ver `MODALIDADES_FORA_DO_AGREGADO`): uma
+    leitura que é NEUTRO por desenho não pode endurecer o critério das
+    outras só por existir.
     """
+    signals = _agregaveis(signals)
     total = len(signals)
     if total == 0:
         return Direction.NEUTRAL
@@ -1798,8 +2104,13 @@ def overall_direction(signals: list[Signal]) -> Direction:
 
 
 def overall_agreement(signals: list[Signal]) -> tuple[int, int]:
-    """Quantas das leituras concordam com a direção geral, e o total avaliado — pra exibir tipo '4 de 5 leituras concordam'."""
+    """Quantas das leituras concordam com a direção geral, e o total avaliado — pra exibir tipo '3 de 5 leituras concordam'.
+
+    Filtra pelo mesmo critério de `overall_direction`. Sem isso a tela
+    diria "3 de 6" ao lado de uma direção decidida por uma regra de 3
+    de 5 — o número exibido não bateria com o número que decidiu."""
     direction = overall_direction(signals)
+    signals = _agregaveis(signals)
     total = len(signals)
     if direction == Direction.NEUTRAL:
         buy = sum(1 for s in signals if s.direction == Direction.BUY)
@@ -1807,6 +2118,66 @@ def overall_agreement(signals: list[Signal]) -> tuple[int, int]:
         return max(buy, sell), total
     agreeing = sum(1 for s in signals if s.direction == direction)
     return agreeing, total
+
+
+def rsi_extremes_across_timeframes(
+    mtf: "MultiTimeframeResult",
+    params: AnalysisParams = DEFAULT_PARAMS,
+) -> dict:
+    """
+    Consolida o IFR de TODOS os timeframes analisados e diz onde há
+    extremo. Em Day Trade isso cobre M15 e H1 (mais H4/D1 de contexto);
+    em Swing, D1/W1/H4.
+
+    Devolve:
+      - `por_tf`: {timeframe: (valor_ifr, "COMPRA"/"VENDA"/None)}
+      - `extremos_compra` / `extremos_venda`: listas de timeframes
+      - `alinhamento`: quantos timeframes estão em extremo na MESMA
+        direção (0 se não houver nenhum)
+      - `direcao`: direção do alinhamento, ou None
+
+    O `alinhamento` é o filtro forte: dois ou mais timeframes em
+    exaustão simultânea na mesma direção é bem mais raro — e bem mais
+    significativo — do que um isolado.
+
+    Recebe `params` em vez de ler limiares de variável de módulo porque
+    os limiares são por PERFIL: dois perfis podem discordar sobre o que
+    conta como exaustão, e um global faria o perfil que rodou por
+    último decidir pelos outros.
+    """
+    por_tf: dict[str, tuple[float, str | None]] = {}
+    compra: list[str] = []
+    venda: list[str] = []
+
+    for tf, resultado in mtf.results.items():
+        if resultado.context is None:
+            continue
+        valor = resultado.context.rsi
+        if valor <= params.rsi_sobrevenda:
+            por_tf[tf] = (valor, Direction.BUY.value)
+            compra.append(tf)
+        elif valor >= params.rsi_sobrecompra:
+            por_tf[tf] = (valor, Direction.SELL.value)
+            venda.append(tf)
+        else:
+            por_tf[tf] = (valor, None)
+
+    if len(compra) > len(venda):
+        alinhamento, direcao = len(compra), Direction.BUY.value
+    elif len(venda) > len(compra):
+        alinhamento, direcao = len(venda), Direction.SELL.value
+    else:
+        # Empate (inclusive 0 x 0) não configura alinhamento: extremos
+        # opostos em timeframes diferentes se anulam, não se somam.
+        alinhamento, direcao = 0, None
+
+    return {
+        "por_tf": por_tf,
+        "extremos_compra": compra,
+        "extremos_venda": venda,
+        "alinhamento": alinhamento,
+        "direcao": direcao,
+    }
 
 
 def _signal_direction(signals: list[Signal] | None, modality: str = "Confluência") -> Direction | None:
@@ -1826,7 +2197,7 @@ def _signal_score(signals: list[Signal] | None, modality: str = "Confluência") 
     return sig.score if sig else None
 
 
-DEFAULT_TF_COUNTS = {"M15": 250, "H1": 250, "H4": 150, "D1": 250, "W1": 150}
+DEFAULT_TF_COUNTS = {"M2": 300, "M5": 300, "M15": 250, "H1": 250, "H4": 150, "D1": 250, "W1": 150}
 
 
 @dataclass
@@ -1837,23 +2208,92 @@ class RetroSignalCheck:
     setup: str
     score: float
     risk: RiskPlan
-    outcome: str          # "ALVO_1", "ALVO_2", "STOP", "EM_ABERTO", "SEM_SINAL", "SEM_DADO_FUTURO"
+    outcome: str          # "ALVO_1", "ALVO_2", "STOP", "EM_ABERTO", "SEM_SINAL", "SEM_ENTRADA", "SEM_DADO_FUTURO"
     outcome_detail: str
     candles_ate_resultado: int | None
     candles_futuros_disponiveis: int
+    preco_fill: float | None = None
+    r_realizado: float | None = None
 
 
-def evaluate_signal_outcome(risk: RiskPlan, direction: Direction, future_df: pd.DataFrame) -> tuple[str, str, int | None]:
+# Custo de ida e volta como fração do valor negociado. 0.05% cobre
+# corretagem diluída + emolumentos da B3 + um slippage modesto num ativo
+# líquido. É o DEFAULT da medição, não uma verdade: quem opera com
+# corretagem fixa alta em lote pequeno paga muito mais, e isso muda o
+# resultado — por isso é parâmetro, e por isso o número aparece junto da
+# taxa de acerto em vez de ficar embutido em silêncio.
+CUSTO_ROUND_TRIP_PADRAO = 0.0005
+
+
+@dataclass(frozen=True)
+class SignalOutcome:
+    """Desfecho de um sinal, com o preço que a operação REALMENTE teria tido."""
+    resultado: str            # ALVO_1 | ALVO_2 | STOP | EM_ABERTO | SEM_SINAL | SEM_ENTRADA
+    detalhe: str
+    candles_ate_resultado: int | None
+    preco_fill: float | None  # abertura da vela seguinte — o preço de execução
+    r_realizado: float | None # R líquido de custo; None enquanto não resolveu
+
+
+def evaluate_signal_outcome(
+    risk: RiskPlan,
+    direction: Direction,
+    future_df: pd.DataFrame,
+    custo_round_trip: float = CUSTO_ROUND_TRIP_PADRAO,
+) -> SignalOutcome:
     """
-    Caminha candle a candle pelos dados REAIS que vieram depois do sinal
-    e verifica o que aconteceu primeiro: bateu o stop, o alvo 1, o alvo
-    2, ou nenhum dos dois ainda (em aberto). Quando stop e alvo são
-    tocados no mesmo candle, assume o cenário PIOR (stop primeiro) —
-    mesma convenção conservadora usada em qualquer backtest deste
-    projeto.
+    Caminha candle a candle pelos dados REAIS que vieram depois do sinal e
+    verifica o que aconteceu primeiro: stop, alvo 1, alvo 2, ou nada ainda.
+
+    EXECUÇÃO — a parte que mudou em 2026-08-06, e por quê:
+
+    `risk.entry` é o FECHAMENTO da vela que gerou o sinal (ver `attach_risk`).
+    Até aqui a avaliação assumia execução exatamente nesse preço, começando a
+    testar stop/alvo já na vela seguinte. Isso concede um preenchimento que
+    não existe quando o papel abre em gap: o modelo entrava no preço pré-gap,
+    que é justamente o preço que ninguém conseguiu. Numa medição usada pra
+    decidir calibragem, esse é um viés que se acumula em cima justamente dos
+    dias de notícia — os que mais mexem no resultado.
+
+    Agora a execução é na ABERTURA da vela seguinte (`preco_fill`), que é o
+    que uma ordem a mercado disparada pelo sinal de fato pegaria.
+
+    O denominador do R continua sendo o risco PLANEJADO (`entry - stop`),
+    porque é ele que define o tamanho da posição na hora de entrar. O
+    numerador é o resultado real a partir do fill. Quando o gap passa por
+    cima do próprio stop, não há operação a fazer: sai `SEM_ENTRADA`, não um
+    stop fictício.
+
+    Quando stop e alvo são tocados no mesmo candle, assume o cenário PIOR
+    (stop primeiro) — convenção conservadora mantida do modelo anterior.
     """
     if risk.entry is None or risk.stop is None:
-        return "SEM_SINAL", "Não havia sinal operável nesta data.", None
+        return SignalOutcome("SEM_SINAL", "Não havia sinal operável nesta data.", None, None, None)
+
+    if future_df.empty:
+        return SignalOutcome("EM_ABERTO", "Ainda não há velas seguintes para conferir.", None, None, None)
+
+    risco_planejado = abs(risk.entry - risk.stop)
+    if risco_planejado <= 0:
+        return SignalOutcome("SEM_SINAL", "Entrada e stop coincidem — não há risco definido.", None, None, None)
+
+    fill = float(future_df.iloc[0]["open"])
+    custo_r = (fill * custo_round_trip) / risco_planejado
+
+    # gap que abriu além do stop: a operação não chega a existir
+    if (direction == Direction.BUY and fill <= risk.stop) or (
+        direction == Direction.SELL and fill >= risk.stop
+    ):
+        return SignalOutcome(
+            "SEM_ENTRADA",
+            f"A vela seguinte abriu em R$ {fill:.2f}, já além do stop de R$ {risk.stop:.2f} — "
+            "o gap passou por cima da operação.",
+            None, fill, None,
+        )
+
+    def resultado_em(preco_saida: float) -> float:
+        bruto = (preco_saida - fill) if direction == Direction.BUY else (fill - preco_saida)
+        return bruto / risco_planejado - custo_r
 
     for i, (_, candle) in enumerate(future_df.iterrows(), start=1):
         if direction == Direction.BUY:
@@ -1866,13 +2306,29 @@ def evaluate_signal_outcome(risk: RiskPlan, direction: Direction, future_df: pd.
             hit_t2 = risk.target_2 is not None and candle["low"] <= risk.target_2
 
         if hit_stop:
-            return "STOP", f"Stop batido {i} candle(s) depois, em R$ {risk.stop:.2f}.", i
+            return SignalOutcome(
+                "STOP", f"Stop batido {i} candle(s) depois, em R$ {risk.stop:.2f} "
+                        f"(entrada real R$ {fill:.2f}).",
+                i, fill, resultado_em(risk.stop),
+            )
         if hit_t2:
-            return "ALVO_2", f"Alvo 2 batido {i} candle(s) depois, em R$ {risk.target_2:.2f}.", i
+            return SignalOutcome(
+                "ALVO_2", f"Alvo 2 batido {i} candle(s) depois, em R$ {risk.target_2:.2f} "
+                          f"(entrada real R$ {fill:.2f}).",
+                i, fill, resultado_em(risk.target_2),
+            )
         if hit_t1:
-            return "ALVO_1", f"Alvo 1 batido {i} candle(s) depois, em R$ {risk.target_1:.2f}.", i
+            return SignalOutcome(
+                "ALVO_1", f"Alvo 1 batido {i} candle(s) depois, em R$ {risk.target_1:.2f} "
+                          f"(entrada real R$ {fill:.2f}).",
+                i, fill, resultado_em(risk.target_1),
+            )
 
-    return "EM_ABERTO", f"Nenhum nível tocado nos {len(future_df)} candle(s) seguintes disponíveis até agora.", None
+    return SignalOutcome(
+        "EM_ABERTO",
+        f"Nenhum nível tocado nos {len(future_df)} candle(s) seguintes disponíveis até agora.",
+        None, fill, None,
+    )
 
 
 def check_signal_as_of(
@@ -1890,7 +2346,7 @@ def check_signal_as_of(
     sinal, sem espiar o futuro) e o que veio DEPOIS (usado só pra
     conferir o resultado, nunca pra gerar o sinal).
 
-    `modality` escolhe qual das 5 leituras é avaliada: "Confluência"
+    `modality` escolhe qual das 6 leituras é avaliada: "Confluência"
     (padrão), "SMC", "Price Action", "Médias Móveis" ou "VWAP".
     """
     as_of_utc = as_of.tz_localize(LOCAL_TZ) if as_of.tzinfo is None else as_of
@@ -1914,14 +2370,16 @@ def check_signal_as_of(
         confluence = next(s for s in signals if s.name == "Confluência")
         # só usa o plano de risco da Confluência se ela concordar com a
         # maioria — senão não há um único conjunto de entrada/stop/alvo
-        # coerente pra representar "as 5 leituras", só a votação em si
+        # coerente pra representar "as 6 leituras", só a votação em si
         risk = confluence.risk if confluence.direction == direction else RiskPlan()
-        setup = f"Votação das 5 leituras ({confluence.setup} é a leitura combinada)"
+        setup = f"Votação das 6 leituras ({confluence.setup} é a leitura combinada)"
         chosen = Signal("Todas as modalidades", direction, score, score, setup, risk=risk)
     else:
         chosen = next(s for s in signals if s.name == modality)
 
-    outcome, detail, candles_to_result = evaluate_signal_outcome(chosen.risk, chosen.direction, future)
+    desfecho = evaluate_signal_outcome(chosen.risk, chosen.direction, future)
+    outcome, detail = desfecho.resultado, desfecho.detalhe
+    candles_to_result = desfecho.candles_ate_resultado
     if chosen.direction == Direction.NEUTRAL or chosen.risk.entry is None:
         outcome, detail, candles_to_result = "SEM_SINAL", "Não havia sinal operável nesta data.", None
     elif future.empty:
@@ -1938,6 +2396,8 @@ def check_signal_as_of(
         outcome_detail=detail,
         candles_ate_resultado=candles_to_result,
         candles_futuros_disponiveis=len(future),
+        preco_fill=desfecho.preco_fill,
+        r_realizado=desfecho.r_realizado,
     )
 
 
@@ -1957,7 +2417,7 @@ def analyze_symbol_mtf(
     mesma direção) e de CONTEXTO (informativos, não bloqueiam nem
     confirmam nada sozinhos).
 
-    `modality` escolhe QUAL das 5 leituras decide a confirmação:
+    `modality` escolhe QUAL das 6 leituras decide a confirmação:
     "Confluência" (padrão, combina tudo), "SMC", "Price Action",
     "Médias Móveis" ou "VWAP". Serve tanto pra Day Trade (confirmação
     M15+H1, contexto H4+D1) quanto pra Swing Trade (confirmação D1+W1,
@@ -1986,15 +2446,27 @@ def analyze_symbol_mtf(
     if needs_h1_only_for_h4:
         fetch_list.insert(0, "H1")
 
+    # O Diário tem que ser processado ANTES dos demais: o IFR dele é
+    # injetado como filtro de contexto nas outras leituras (ver
+    # `rsi_signal`). Na ordem natural, M15/H1 seriam analisados enquanto
+    # `daily_rsi` ainda fosse None e ficariam sem o filtro — sem erro
+    # nenhum, só sem o reforço, que é o tipo de perda que não aparece.
+    if "D1" in fetch_list:
+        fetch_list = ["D1"] + [tf for tf in fetch_list if tf != "D1"]
+
     results: dict[str, TimeframeResult] = {}
     h1_df: pd.DataFrame | None = None
+    daily_rsi: float | None = None
 
     for tf in fetch_list:
         count = counts.get(tf, DEFAULT_TF_COUNTS.get(tf, 200))
         try:
             df = fetcher(symbol, tf, count)
-            ctx, signals = analyze(df, params)
+            # O próprio D1 não recebe filtro de si mesmo; os demais sim.
+            ctx, signals = analyze(df, params, higher_rsi=None if tf == "D1" else daily_rsi)
             results[tf] = TimeframeResult(tf, ctx, signals, None)
+            if tf == "D1":
+                daily_rsi = ctx.rsi
             if tf == "H1":
                 h1_df = ctx.df
         except Exception as exc:  # noqa: BLE001 — mostra a falha, não derruba os outros timeframes
@@ -2005,7 +2477,7 @@ def analyze_symbol_mtf(
             try:
                 h4_df = _resample_to_h4(h1_df)
                 if len(h4_df) >= 30:
-                    ctx4, sig4 = analyze(h4_df, params)
+                    ctx4, sig4 = analyze(h4_df, params, higher_rsi=daily_rsi)
                     results["H4"] = TimeframeResult("H4", ctx4, sig4, None)
                 else:
                     results["H4"] = TimeframeResult(
@@ -2248,9 +2720,8 @@ def _save_symbols_api(symbols: list[str]) -> None:
 
 def load_symbols() -> list[str]:
     """Lê a watchlist da API do homelab quando configurada (ACOES_API_URL),
-    com fallback pro arquivo local `daytrade_symbols.json` — usado pelo
-    Tkinter, pelo CLI, e por qualquer deploy que não use o homelab (ex:
-    Streamlit Cloud com Yahoo Finance)."""
+    com fallback pro arquivo local `daytrade_symbols.json` — usado por
+    qualquer deploy que não tenha o homelab, rodando com a fonte Yahoo."""
     if ACOES_API_URL:
         try:
             symbols = _load_symbols_api()
@@ -2544,504 +3015,50 @@ def fetch_signal_stats(**filtros) -> dict:
     return response.json()
 
 
-def launch_gui() -> None:
-    """Abre a interface gráfica. Tkinter acompanha o Python oficial no Windows."""
+def fetch_last_candle_time() -> pd.Timestamp | None:
+    """Horário (UTC) da vela mais recente que a API tem, de qualquer par —
+    o sinal de frescor da barra lateral.
+
+    Lê `last_candle_time` do `GET /status`, e NÃO `last_ingested_at`. Os dois
+    parecem servir aqui e só um serve: desde que o processor passou a gravar
+    só vela que mudou de verdade, `last_ingested_at` significa "última vez que
+    o dado MUDOU" e congela com o mercado fechado (ver o docstring do endpoint
+    em backend/api.py). Uma legenda montada em cima dele acusaria scraper
+    morto toda noite e todo fim de semana.
+
+    Devolve None em qualquer falha: isto alimenta uma legenda, e uma legenda
+    não pode derrubar a barra lateral inteira — sem a API a fonte Yahoo
+    continua utilizável."""
+    import requests
+
     try:
-        import tkinter as tk
-        from tkinter import messagebox, ttk
-    except ImportError as exc:
-        raise RuntimeError(
-            "A interface gráfica Tkinter não está disponível nesta instalação "
-            "do Python. Reinstale o Python marcando o componente Tcl/Tk."
-        ) from exc
+        response = requests.get(
+            f"{_api_base_url()}/status",
+            headers=_api_headers(),
+            timeout=_API_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        horarios = [
+            pd.to_datetime(linha["last_candle_time"], utc=True)
+            for linha in response.json()
+            if linha.get("last_candle_time")
+        ]
+    except Exception:
+        return None
 
-    class DayTradeApp:
-        def __init__(self, root: tk.Tk) -> None:
-            self.root = root
-            self.root.title("Day Trade SMC · Analisador Técnico")
-            self.root.geometry("1160x780")
-            self.root.minsize(900, 620)
-
-            self.symbols = load_symbols()
-            self.result_queue: queue.Queue[tuple[bool, str]] = queue.Queue()
-            self.running = False
-
-            self.symbol_var = tk.StringVar(
-                value=self.symbols[0] if self.symbols else "VALE3"
-            )
-            self.timeframe_var = tk.StringVar(value="M15")
-            self.count_var = tk.StringVar(value="250")
-            self.risk_var = tk.StringVar(value="500")
-            self.new_symbol_var = tk.StringVar()
-            self.status_var = tk.StringVar(value="Pronto para analisar.")
-
-            self._configure_style()
-            self._build_interface()
-            self._refresh_symbol_widgets()
-            self.root.after(150, self._poll_results)
-
-        def _configure_style(self) -> None:
-            style = ttk.Style(self.root)
-            try:
-                style.theme_use("clam")
-            except tk.TclError:
-                pass
-
-            self.root.configure(background="#edf1f5")
-            style.configure("TFrame", background="#edf1f5")
-            style.configure("TLabel", background="#edf1f5", foreground="#17202a")
-            style.configure(
-                "Title.TLabel",
-                font=("Segoe UI", 18, "bold"),
-                foreground="#123b2c",
-            )
-            style.configure(
-                "Subtitle.TLabel",
-                font=("Segoe UI", 10),
-                foreground="#52606d",
-            )
-            style.configure(
-                "Analyze.TButton",
-                font=("Segoe UI", 10, "bold"),
-                foreground="#ffffff",
-                background="#18794e",
-                padding=(18, 8),
-            )
-            style.map(
-                "Analyze.TButton",
-                background=[
-                    ("disabled", "#9aa5b1"),
-                    ("active", "#0f6841"),
-                ],
-            )
-            style.configure("TNotebook", background="#edf1f5", borderwidth=0)
-            style.configure("TNotebook.Tab", padding=(16, 8))
-
-        def _build_interface(self) -> None:
-            header = ttk.Frame(self.root, padding=(18, 14, 18, 8))
-            header.pack(fill="x")
-            ttk.Label(
-                header,
-                text="Analisador Day Trade · SMC",
-                style="Title.TLabel",
-            ).pack(anchor="w")
-            ttk.Label(
-                header,
-                text=(
-                    "SMC, Price Action, EMA9/21/50/200 e VWAP · "
-                    "dados do Yahoo Finance com atraso"
-                ),
-                style="Subtitle.TLabel",
-            ).pack(anchor="w", pady=(3, 0))
-
-            self.notebook = ttk.Notebook(self.root)
-            self.notebook.pack(fill="both", expand=True, padx=18, pady=(4, 16))
-
-            self.analysis_tab = ttk.Frame(self.notebook, padding=12)
-            self.assets_tab = ttk.Frame(self.notebook, padding=16)
-            self.notebook.add(self.analysis_tab, text="Análise")
-            self.notebook.add(self.assets_tab, text="Meus ativos")
-
-            self._build_analysis_tab()
-            self._build_assets_tab()
-
-        def _build_analysis_tab(self) -> None:
-            controls = ttk.Frame(self.analysis_tab)
-            controls.pack(fill="x", pady=(0, 10))
-
-            ttk.Label(controls, text="Ativo").grid(
-                row=0, column=0, sticky="w", padx=(0, 6)
-            )
-            self.symbol_combo = ttk.Combobox(
-                controls,
-                textvariable=self.symbol_var,
-                width=15,
-                state="normal",
-            )
-            self.symbol_combo.grid(row=1, column=0, padx=(0, 12), sticky="ew")
-            self.symbol_combo.bind("<Return>", lambda _event: self.start_analysis())
-
-            ttk.Label(controls, text="Período").grid(
-                row=0, column=1, sticky="w", padx=(0, 6)
-            )
-            ttk.Combobox(
-                controls,
-                textvariable=self.timeframe_var,
-                values=tuple(TIMEFRAMES),
-                state="readonly",
-                width=9,
-            ).grid(row=1, column=1, padx=(0, 12), sticky="ew")
-
-            ttk.Label(controls, text="Candles fechados").grid(
-                row=0, column=2, sticky="w", padx=(0, 6)
-            )
-            ttk.Spinbox(
-                controls,
-                from_=30,
-                to=1000,
-                increment=10,
-                textvariable=self.count_var,
-                width=11,
-            ).grid(row=1, column=2, padx=(0, 12), sticky="ew")
-
-            ttk.Label(controls, text="Risco máximo (R$)").grid(
-                row=0, column=3, sticky="w", padx=(0, 6)
-            )
-            ttk.Entry(
-                controls,
-                textvariable=self.risk_var,
-                width=14,
-            ).grid(row=1, column=3, padx=(0, 12), sticky="ew")
-
-            self.analyze_button = ttk.Button(
-                controls,
-                text="Analisar agora",
-                style="Analyze.TButton",
-                command=self.start_analysis,
-            )
-            self.analyze_button.grid(row=1, column=4, padx=(4, 8))
-
-            ttk.Button(
-                controls,
-                text="Limpar resultado",
-                command=self.clear_output,
-            ).grid(row=1, column=5)
-
-            controls.columnconfigure(0, weight=1)
-
-            status_frame = ttk.Frame(self.analysis_tab)
-            status_frame.pack(fill="x", pady=(0, 7))
-            ttk.Label(
-                status_frame,
-                textvariable=self.status_var,
-            ).pack(side="left")
-            ttk.Label(
-                status_frame,
-                text="BRA50 usa o Ibovespa (^BVSP) como referência no Yahoo.",
-                style="Subtitle.TLabel",
-            ).pack(side="right")
-
-            result_frame = ttk.Frame(self.analysis_tab)
-            result_frame.pack(fill="both", expand=True)
-            result_frame.rowconfigure(0, weight=1)
-            result_frame.columnconfigure(0, weight=1)
-
-            self.output = tk.Text(
-                result_frame,
-                wrap="none",
-                font=("Consolas", 10),
-                background="#101820",
-                foreground="#e8f1ed",
-                insertbackground="#ffffff",
-                selectbackground="#2b6f55",
-                padx=12,
-                pady=12,
-                relief="flat",
-            )
-            vertical = ttk.Scrollbar(
-                result_frame,
-                orient="vertical",
-                command=self.output.yview,
-            )
-            horizontal = ttk.Scrollbar(
-                result_frame,
-                orient="horizontal",
-                command=self.output.xview,
-            )
-            self.output.configure(
-                yscrollcommand=vertical.set,
-                xscrollcommand=horizontal.set,
-            )
-            self.output.grid(row=0, column=0, sticky="nsew")
-            vertical.grid(row=0, column=1, sticky="ns")
-            horizontal.grid(row=1, column=0, sticky="ew")
-            self.output.insert(
-                "1.0",
-                "Selecione ou digite um ativo e clique em “Analisar agora”.\n"
-                "Exemplos: VALE3, PETR4, PRIO3, BRA50, AAPL, BTC-USD.\n",
-            )
-
-        def _build_assets_tab(self) -> None:
-            ttk.Label(
-                self.assets_tab,
-                text="Lista personalizada de ativos",
-                style="Title.TLabel",
-            ).pack(anchor="w")
-            ttk.Label(
-                self.assets_tab,
-                text=(
-                    "Adicione os códigos que acompanha. A lista fica salva ao "
-                    "lado do programa e reaparece nas próximas execuções."
-                ),
-                style="Subtitle.TLabel",
-            ).pack(anchor="w", pady=(3, 14))
-
-            add_frame = ttk.Frame(self.assets_tab)
-            add_frame.pack(fill="x", pady=(0, 10))
-            self.new_symbol_entry = ttk.Entry(
-                add_frame,
-                textvariable=self.new_symbol_var,
-                width=24,
-            )
-            self.new_symbol_entry.pack(side="left", padx=(0, 8))
-            self.new_symbol_entry.bind(
-                "<Return>",
-                lambda _event: self.add_symbol(),
-            )
-            ttk.Button(
-                add_frame,
-                text="Adicionar ativo",
-                command=self.add_symbol,
-            ).pack(side="left", padx=(0, 8))
-            ttk.Button(
-                add_frame,
-                text="Restaurar lista padrão",
-                command=self.restore_default_symbols,
-            ).pack(side="left")
-
-            list_frame = ttk.Frame(self.assets_tab)
-            list_frame.pack(fill="both", expand=True)
-            list_frame.rowconfigure(0, weight=1)
-            list_frame.columnconfigure(0, weight=1)
-
-            self.symbol_list = tk.Listbox(
-                list_frame,
-                font=("Consolas", 12),
-                selectmode="browse",
-                background="#ffffff",
-                foreground="#17202a",
-                selectbackground="#18794e",
-                selectforeground="#ffffff",
-                activestyle="none",
-                relief="solid",
-                borderwidth=1,
-            )
-            symbol_scroll = ttk.Scrollbar(
-                list_frame,
-                orient="vertical",
-                command=self.symbol_list.yview,
-            )
-            self.symbol_list.configure(yscrollcommand=symbol_scroll.set)
-            self.symbol_list.grid(row=0, column=0, sticky="nsew")
-            symbol_scroll.grid(row=0, column=1, sticky="ns")
-            self.symbol_list.bind(
-                "<Double-Button-1>",
-                lambda _event: self.use_selected_symbol(),
-            )
-
-            actions = ttk.Frame(list_frame, padding=(12, 0, 0, 0))
-            actions.grid(row=0, column=2, sticky="n")
-            ttk.Button(
-                actions,
-                text="Usar na análise",
-                command=self.use_selected_symbol,
-            ).pack(fill="x", pady=(0, 8))
-            ttk.Button(
-                actions,
-                text="Analisar selecionado",
-                style="Analyze.TButton",
-                command=lambda: self.use_selected_symbol(analyze=True),
-            ).pack(fill="x", pady=(0, 8))
-            ttk.Button(
-                actions,
-                text="Remover da lista",
-                command=self.remove_selected_symbol,
-            ).pack(fill="x")
-
-            alias_text = (
-                "Atalhos reconhecidos:\n\n"
-                "BRA50 / IBOV / IBOVESPA  →  ^BVSP\n"
-                "DOLAR / USDBRL           →  BRL=X\n"
-                "SP500                    →  ^GSPC\n"
-                "NASDAQ                   →  ^IXIC\n"
-                "BTC / BITCOIN            →  BTC-USD\n\n"
-                "Você também pode informar diretamente um ticker do Yahoo."
-            )
-            ttk.Label(
-                self.assets_tab,
-                text=alias_text,
-                justify="left",
-                style="Subtitle.TLabel",
-            ).pack(anchor="w", pady=(14, 0))
-
-        def _refresh_symbol_widgets(self) -> None:
-            self.symbol_combo.configure(values=self.symbols)
-            self.symbol_list.delete(0, tk.END)
-            for symbol in self.symbols:
-                self.symbol_list.insert(tk.END, symbol)
-
-        def _persist_symbols(self) -> None:
-            try:
-                save_symbols(self.symbols)
-            except OSError as exc:
-                messagebox.showwarning(
-                    "Lista não salva",
-                    f"Não foi possível salvar a lista de ativos:\n{exc}",
-                )
-
-        def add_symbol(self, symbol: str | None = None) -> None:
-            value = (symbol or self.new_symbol_var.get()).strip().upper()
-            value = value.replace(" ", "")
-            if not value:
-                messagebox.showinfo("Informe o ativo", "Digite um símbolo.")
-                return
-            if value not in self.symbols:
-                self.symbols.append(value)
-                self._refresh_symbol_widgets()
-                self._persist_symbols()
-            self.new_symbol_var.set("")
-            self.symbol_var.set(value)
-
-        def remove_selected_symbol(self) -> None:
-            selection = self.symbol_list.curselection()
-            if not selection:
-                messagebox.showinfo(
-                    "Selecione o ativo",
-                    "Selecione um ativo da lista para remover.",
-                )
-                return
-            symbol = self.symbol_list.get(selection[0])
-            self.symbols = [item for item in self.symbols if item != symbol]
-            self._refresh_symbol_widgets()
-            self._persist_symbols()
-
-        def restore_default_symbols(self) -> None:
-            self.symbols = DEFAULT_SYMBOLS.copy()
-            self._refresh_symbol_widgets()
-            self._persist_symbols()
-
-        def use_selected_symbol(self, analyze: bool = False) -> None:
-            selection = self.symbol_list.curselection()
-            if not selection:
-                messagebox.showinfo(
-                    "Selecione o ativo",
-                    "Selecione um ativo da lista.",
-                )
-                return
-            self.symbol_var.set(self.symbol_list.get(selection[0]))
-            self.notebook.select(self.analysis_tab)
-            if analyze:
-                self.start_analysis()
-
-        def clear_output(self) -> None:
-            self.output.delete("1.0", tk.END)
-
-        def start_analysis(self) -> None:
-            if self.running:
-                return
-
-            symbol = self.symbol_var.get().strip().upper().replace(" ", "")
-            if not symbol:
-                messagebox.showerror("Ativo obrigatório", "Informe um ativo.")
-                return
-
-            try:
-                count = int(self.count_var.get())
-                if count < 30:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror(
-                    "Candles inválidos",
-                    "Informe um número inteiro igual ou superior a 30.",
-                )
-                return
-
-            risk_text = self.risk_var.get().strip().replace(",", ".")
-            try:
-                risk_budget = float(risk_text) if risk_text else None
-                if risk_budget is not None and risk_budget <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror(
-                    "Risco inválido",
-                    "Informe um valor de risco maior que zero ou deixe em branco.",
-                )
-                return
-
-            if symbol not in self.symbols:
-                self.add_symbol(symbol)
-
-            timeframe = self.timeframe_var.get()
-            self.running = True
-            self.analyze_button.state(["disabled"])
-            self.status_var.set(
-                f"Buscando candles e analisando {symbol}. Aguarde..."
-            )
-            self.output.delete("1.0", tk.END)
-            self.output.insert(
-                "1.0",
-                f"Processando {symbol} em {timeframe}...\n",
-            )
-
-            worker = threading.Thread(
-                target=self._analysis_worker,
-                args=(symbol, timeframe, count, risk_budget),
-                daemon=True,
-            )
-            worker.start()
-
-        def _analysis_worker(
-            self,
-            symbol: str,
-            timeframe: str,
-            count: int,
-            risk_budget: float | None,
-        ) -> None:
-            try:
-                report = build_report(
-                    symbol,
-                    timeframe,
-                    count,
-                    risk_budget,
-                )
-                self.result_queue.put((True, report))
-            except Exception as exc:
-                self.result_queue.put(
-                    (
-                        False,
-                        f"[ERRO] {exc}\n\n"
-                        "Se o Yahoo estiver limitando consultas, aguarde alguns "
-                        "minutos e tente novamente.",
-                    )
-                )
-
-        def _poll_results(self) -> None:
-            try:
-                while True:
-                    success, text = self.result_queue.get_nowait()
-                    self.running = False
-                    self.analyze_button.state(["!disabled"])
-                    self.output.delete("1.0", tk.END)
-                    self.output.insert("1.0", text)
-                    self.output.see("1.0")
-                    self.status_var.set(
-                        "Análise concluída."
-                        if success
-                        else "Não foi possível concluir a análise."
-                    )
-                    if not success:
-                        messagebox.showerror("Falha na análise", text)
-            except queue.Empty:
-                pass
-            finally:
-                self.root.after(150, self._poll_results)
-
-    root = tk.Tk()
-    DayTradeApp(root)
-    root.mainloop()
+    return max(horarios) if horarios else None
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Analisador standalone de SMC, Price Action, EMAs e VWAP. "
-            "Sem ativo, abre a interface gráfica."
+            "Relatório de SMC, Price Action, EMAs e VWAP para um ativo, no "
+            "terminal. A interface completa é a web: streamlit run streamlit_app.py"
         )
     )
     parser.add_argument(
         "symbol",
-        nargs="?",
-        help="Ticker, por exemplo VALE3 ou PETR4; omita para abrir a interface.",
+        help="Ticker, por exemplo VALE3 ou PETR4.",
     )
     parser.add_argument(
         "--timeframe",
@@ -3060,19 +3077,7 @@ def main() -> None:
         default=None,
         help="Risco financeiro máximo por operação.",
     )
-    parser.add_argument(
-        "--gui",
-        action="store_true",
-        help="Abre a interface gráfica.",
-    )
     args = parser.parse_args()
-
-    if args.gui or args.symbol is None:
-        try:
-            launch_gui()
-        except RuntimeError as exc:
-            parser.exit(1, f"[ERRO] {exc}\n")
-        return
 
     try:
         report = build_report(

@@ -7,7 +7,7 @@ faz duas coisas, em passes separados a cada iteração:
   1. VARREDURA — para cada símbolo da watchlist × timeframe × perfil,
      roda o motor (`daytrade_smc.analyze_symbol_mtf`) sobre os candles já
      gravados no TimescaleDB e grava uma linha em `signals` por leitura
-     (Confluência, SMC, Price Action, Médias Móveis, VWAP).
+     (Confluência, SMC, Price Action, Médias Móveis, VWAP, IFR).
 
   2. DESFECHO — para cada sinal ainda sem resultado, caminha pelos
      candles que vieram depois e registra o que aconteceu primeiro (alvo
@@ -286,10 +286,22 @@ def varrer(conn) -> tuple[int, int]:
             # confirmação multi-timeframe precisa dos dois lados do par na
             # mão, e reler os candles por modalidade seria desperdício
             analisado: dict[str, tuple] = {}
-            for timeframe in TIMEFRAMES_VARRIDOS:
+            # D1 primeiro, pelo mesmo motivo de `analyze_symbol_mtf`: o
+            # IFR do Diário entra como filtro de contexto nas demais
+            # leituras. Sem essa ordem o worker gravaria, pro MESMO
+            # candle, uma leitura de IFR diferente da que a interface
+            # mostra — e é a linha do worker que alimenta a assertividade.
+            ordem = sorted(TIMEFRAMES_VARRIDOS, key=lambda tf: tf != "D1")
+            daily_rsi: float | None = None
+            for timeframe in ordem:
                 try:
                     df = _ler_candles(conn, symbol, timeframe, COUNTS.get(timeframe, 250))
-                    analisado[timeframe] = analyze(df, params)
+                    contexto, sinais = analyze(
+                        df, params, higher_rsi=None if timeframe == "D1" else daily_rsi
+                    )
+                    analisado[timeframe] = (contexto, sinais)
+                    if timeframe == "D1":
+                        daily_rsi = contexto.rsi
                 except Exception as exc:  # noqa: BLE001 — um par ruim não derruba a varredura
                     log.warning("%s %s (%s): %s", symbol, timeframe, nome_perfil, exc)
 
@@ -534,6 +546,15 @@ def _backfill_symbol(conn, symbol: str, nome_perfil: str, params: AnalysisParams
             # (o modo "Verificação retroativa" da interface) já dá.
             historico = df.iloc[: i + 1]
             futuro = df.iloc[i + 1 :]
+            # Sem `higher_rsi`: reconstruir o IFR do Diário VIGENTE em
+            # cada candle passado exigiria varrer a série diária em
+            # paralelo, alinhada por tempo, e um desalinhamento aqui
+            # espiaria o futuro — que é justamente o que este laço
+            # existe pra evitar. A consequência é conhecida e restrita:
+            # na modalidade IFR, uma linha 'backfill' não leva o
+            # desconto de prazos opostos que uma linha 'worker' leva.
+            # `origem` faz parte da chave de dedup, então as duas
+            # convivem e continuam separáveis na assertividade.
             contexto, sinais = analyze(historico, params)
 
             if timeframe in por_tf:

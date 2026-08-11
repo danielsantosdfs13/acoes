@@ -22,6 +22,45 @@ SCRAPER_TIMEFRAMES = tuple(
     tf.strip() for tf in os.environ.get("SCRAPER_TIMEFRAMES", "M15,H1,H4,D1").split(",") if tf.strip()
 )
 
+
+def _mapa_por_symbol(bruto: str) -> dict[str, str]:
+    """Lê "CHAVE=valor;CHAVE2=valor2" num dicionário. Formato pequeno de
+    propósito: são duas variáveis de ambiente, não um arquivo de config."""
+    mapa: dict[str, str] = {}
+    for parte in bruto.split(";"):
+        parte = parte.strip()
+        if not parte or "=" not in parte:
+            continue
+        chave, valor = parte.split("=", 1)
+        if chave.strip() and valor.strip():
+            mapa[chave.strip().upper()] = valor.strip()
+    return mapa
+
+
+# Timeframes DIFERENTES pra símbolos específicos. O loop é um produto
+# cartesiano (símbolo × timeframe), então pôr M2/M5 no SCRAPER_TIMEFRAMES
+# global faria o scraper coletar 2 e 5 minutos das ONZE ações também —
+# duas requisições a mais por ativo por loop, pra um dado que nenhuma
+# tela de ação usa. O Mini Índice é o único que precisa desses prazos.
+SCRAPER_TIMEFRAMES_POR_SYMBOL = {
+    symbol: tuple(tf.strip() for tf in tfs.split(",") if tf.strip())
+    for symbol, tfs in _mapa_por_symbol(
+        os.environ.get("SCRAPER_TIMEFRAMES_POR_SYMBOL", "WINFUT=M2,M5,M15,H1")
+    ).items()
+}
+
+# Tradução do nome LÓGICO (o que trafega na API e no banco) pro ticker do
+# MT5. Existe porque o mini índice não tem nome estável: dependendo da
+# corretora é o contínuo ("WIN$", "WIN$N") ou o vencimento vigente
+# ("WINZ25"), que muda a cada trimestre. Fixar o vencimento no banco
+# quebraria a série histórica na virada; o nome lógico "WINFUT" não muda
+# nunca, e só esta tradução acompanha o rolo do contrato.
+#
+# Ajuste `WINFUT=` pro que aparece no Observador de Mercado do SEU MT5.
+SCRAPER_SYMBOL_MT5 = _mapa_por_symbol(
+    os.environ.get("SCRAPER_SYMBOL_MT5", "WINFUT=WIN$")
+)
+
 # Quantas velas (mais recentes) reenviar a cada loop, por symbol/timeframe.
 # Cobre reinícios, loops perdidos e a vela em formação (que muda de OHLC a
 # cada tick até fechar) — ver scraper.py para o raciocínio completo.

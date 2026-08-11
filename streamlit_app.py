@@ -1,20 +1,22 @@
 """
 streamlit_app.py
 
-Interface WEB para o motor de análise em `daytrade_smc.py`. Não altera
-nada do motor — só importa as funções e desenha por cima.
+Interface WEB para o motor de análise em `daytrade_smc.py`. Não tem lógica
+de análise nenhuma — só importa as funções do motor e desenha por cima.
 
-Dois modos (barra lateral):
+Quatro modos (seletor no topo do corpo, não na barra lateral — desde 2026-08-06):
     - Análise individual: gráfico de candles com EMAs/VWAP/swings/BOS-CHoCH/
-      zonas de FVG, mais os painéis das 5 leituras. Pode auto-atualizar.
+      zonas de FVG, mais os painéis das 6 leituras. Pode auto-atualizar.
     - Scanner: roda a análise em TODOS os ativos da watchlist de uma vez e
-      mostra um ranking por score de confluência (o "Top N" do requisito
-      original), com atalho pra abrir qualquer um na análise individual.
+      mostra um ranking pelo score geral, com atalho pra abrir qualquer um
+      na análise individual.
+    - Verificação retroativa: roda a análise numa data passada usando só o
+      que se sabia até lá, e confere o desfecho nos candles seguintes.
+    - Assertividade: taxa de acerto e expectativa em R do histórico de
+      sinais gravado. Depende da API do homelab — é onde o histórico mora.
 
-Rodar localmente (se algum dia tiver Python disponível):
+Rodar:
     streamlit run streamlit_app.py
-
-Rodar pela internet sem instalar nada: ver README.md.
 """
 
 from __future__ import annotations
@@ -40,39 +42,31 @@ from daytrade_smc import (
     MODALITY_CHOICES,
     Signal,
     SWING_CONFIRMATION_TIMEFRAMES,
+    WINFUT_CONFIRMATION_TIMEFRAMES,
+    WINFUT_CONTEXT_TIMEFRAMES,
+    WINFUT_SYMBOL,
     SWING_CONTEXT_TIMEFRAMES,
     analyze_symbol_mtf,
     check_signal_as_of,
     delete_profile,
-    fetch_snapshot_timestamp,
     load_profiles,
     load_symbols,
     overall_agreement,
     overall_direction,
     overall_score,
+    params_para_estilo,
     quality,
+    rsi_extremes_across_timeframes,
     save_profile,
     save_symbols,
-    trigger_github_update,
     yahoo_symbol,
 )
-
-# Configura a ponte GitHub a partir dos secrets do Streamlit (Settings
-# → Secrets no Streamlit Cloud, ou .streamlit/secrets.toml localmente).
-# Sem isso configurado, a fonte "GitHub (MT5 de casa)" dá erro claro em
-# vez de travar — ver README.
-try:
-    daytrade_smc.GITHUB_BRIDGE_REPO = st.secrets.get("github_repo")
-    daytrade_smc.GITHUB_BRIDGE_TOKEN = st.secrets.get("github_token")
-except Exception:
-    daytrade_smc.GITHUB_BRIDGE_REPO = None
-    daytrade_smc.GITHUB_BRIDGE_TOKEN = None
 
 # Configura a API do homelab (serviço `api`, que serve o TimescaleDB
 # alimentado pelo acoes-scraper). O fallback em variável de ambiente existe
 # porque o container no k3s não popula st.secrets a menos que monte um
 # secrets.toml — sem nenhum dos dois configurado, a fonte "Homelab (API)"
-# dá erro claro em vez de travar, mesmo padrão da ponte GitHub.
+# dá erro claro em vez de travar, e a Yahoo continua utilizável.
 #
 # Note que aqui não há mais DSN nenhum: este processo não fala SQL, só HTTP.
 try:
@@ -95,6 +89,27 @@ STYLES = {
     },
 }
 
+# O Mini Índice tem estilo próprio, e de propósito NÃO entra no STYLES
+# acima: aquele dicionário alimenta o radio "Estilo de operação" da barra
+# lateral (`list(STYLES.keys())`), que se aplica à watchlist de AÇÕES.
+# Somar o WINFUT ali colocaria um terceiro botão no seletor errado.
+WINFUT_STYLE = "Mini Índice (WINFUT)"
+_ESTILOS_TODOS = {
+    **STYLES,
+    WINFUT_STYLE: {
+        "confirmation": WINFUT_CONFIRMATION_TIMEFRAMES,
+        "context": WINFUT_CONTEXT_TIMEFRAMES,
+        "count_label": "Candles fechados (5 e 15 minutos)",
+    },
+}
+
+
+def estilo(nome: str) -> dict:
+    """Resolve um estilo pelos DOIS conjuntos — os da barra lateral e o do
+    Mini Índice. Quem renderiza análise passa por aqui em vez de indexar
+    `STYLES` direto, senão o modo WINFUT levanta KeyError."""
+    return _ESTILOS_TODOS[nome]
+
 st.set_page_config(page_title="Day Trade SMC", page_icon="📊", layout="wide")
 
 DIRECTION_COLOR = {
@@ -104,11 +119,16 @@ DIRECTION_COLOR = {
 }
 
 SOURCE_LABELS = {
-    "Yahoo Finance": "Yahoo Finance (atraso ~15-20min)",
-    "MetaTrader 5": "MT5 (tempo real)",
-    "GitHub (MT5 de casa)": "GitHub (MT5 de casa)",
     "Homelab (API)": "Homelab (API, quase em tempo real)",
+    "Yahoo Finance": "Yahoo Finance (atraso ~15-20min)",
 }
+
+# Folga entre ativos no Scanner, cobrada SÓ do Yahoo — é a única fonte com
+# rate limit. A API do homelab é uma chamada de rede local; pagar essa pausa
+# por ativo ali só somaria segundos à varredura em troca de nada. A regra
+# antes estava escrita ao contrário ("todo mundo menos o MT5"), o que fazia
+# cada fonte nova nascer pagando o pedágio do Yahoo sem ninguém decidir isso.
+_PAUSA_YAHOO = 0.3
 
 
 # ========================================================================
@@ -121,18 +141,6 @@ def _cached_mtf_yahoo(symbol: str, count: int, confirmation: tuple[str, str], co
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def _cached_mtf_mt5(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, params_items: tuple):
-    counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="MetaTrader 5", params=AnalysisParams.from_items(params_items))
-
-
-@st.cache_data(ttl=10, show_spinner=False)
-def _cached_mtf_github(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, params_items: tuple):
-    counts = {tf: count for tf in (*confirmation, *context)}
-    return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="GitHub (MT5 de casa)", params=AnalysisParams.from_items(params_items))
-
-
-@st.cache_data(ttl=3, show_spinner=False)
 def _cached_mtf_api(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, params_items: tuple):
     counts = {tf: count for tf in (*confirmation, *context)}
     return analyze_symbol_mtf(symbol, confirmation=confirmation, context=context, counts=counts, modality=modality, source="Homelab (API)", params=AnalysisParams.from_items(params_items))
@@ -140,13 +148,12 @@ def _cached_mtf_api(symbol: str, count: int, confirmation: tuple[str, str], cont
 
 def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: tuple[str, ...], modality: str, source: str, params: AnalysisParams = DEFAULT_PARAMS):
     """
-    Cacheia o pacote de timeframes. Yahoo Finance usa 60s de cache (tem
-    rate limit); MetaTrader 5 direto e Homelab (API) usam 3s (dado
-    quase em tempo real nos dois casos); GitHub (MT5 de casa) usa 10s (só
-    muda quando você clica em "Atualizar via MT5", então não precisa ser
-    tão curto). Funções fixas em vez de decoradas dinamicamente, pelo
-    mesmo motivo dos fragmentos de auto-refresh: evita o bug de identidade
-    de widget no React já corrigido antes neste projeto.
+    Cacheia o pacote de timeframes. Homelab (API) usa 3s (o scraper alimenta
+    o banco a cada poucos segundos, então cache longo só esconde dado que já
+    chegou); Yahoo Finance usa 60s, porque tem rate limit e o dado nasce
+    ~15-20min atrasado de qualquer jeito. Funções fixas em vez de decoradas
+    dinamicamente, pelo mesmo motivo dos fragmentos de auto-refresh: evita o
+    bug de identidade de widget no React já corrigido antes neste projeto.
 
     Os parâmetros de análise entram na chave de cache como TUPLA DE PARES
     (`params.to_items()`), nunca como o dataclass e nunca por variável
@@ -159,11 +166,60 @@ def cached_mtf(symbol: str, count: int, confirmation: tuple[str, str], context: 
     params_items = params.to_items()
     if source == "Homelab (API)":
         return _cached_mtf_api(symbol, count, confirmation, context, modality, params_items)
-    if source == "MetaTrader 5":
-        return _cached_mtf_mt5(symbol, count, confirmation, context, modality, params_items)
-    if source == "GitHub (MT5 de casa)":
-        return _cached_mtf_github(symbol, count, confirmation, context, modality, params_items)
     return _cached_mtf_yahoo(symbol, count, confirmation, context, modality, params_items)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _ultima_vela():
+    """Vela mais recente que a API tem, pra legenda de frescor da sidebar.
+
+    TTL de 30s em vez dos 3s da análise: isto roda em TODO rerun da página,
+    inclusive nos do auto-refresh, e é informação de rodapé — não vale uma
+    ida à rede por clique de widget. `fetch_last_candle_time` já engole as
+    falhas e devolve None."""
+    return daytrade_smc.fetch_last_candle_time()
+
+
+# Piso de sinais resolvidos, dos dois lados (confirmado e não confirmado),
+# pra uma taxa entrar na tela. Abaixo disso é ruído, não medição — comparar
+# 40% de 3 sinais contra 42% de 3000 daria peso igual a acaso e a estatística.
+_TAXA_MTF_RESOLVIDOS_MINIMO = 30
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _taxa_mtf(modalidade: str, timeframe: str, dias: int = 365) -> dict[bool, dict] | None:
+    """Taxa de acerto medida, confirmado vs não confirmado, pra uma
+    leitura+timeframe. Devolve {True: linha, False: linha} — os dois lados
+    do recorte `por_mtf` de `/signals/stats`, filtrado por timeframe (o
+    filtro recorta a CTE base ANTES do GROUP BY, então uma chamada só já
+    cobre os dois lados).
+
+    None quando a API não está configurada, quando falta um dos dois lados,
+    quando algum deles não bate `_TAXA_MTF_RESOLVIDOS_MINIMO`, ou em
+    qualquer falha de rede — isto alimenta uma caption do veredito, não
+    pode derrubar a tela por causa disso.
+
+    TTL de 1h: é histórico medido, não dado ao vivo — não vale uma chamada
+    de rede por rerun da página, muito menos por candidato do Scanner.
+    """
+    if not daytrade_smc.ACOES_API_URL:
+        return None
+    try:
+        stats = daytrade_smc.fetch_signal_stats(timeframe=timeframe, dias=dias)
+    except Exception:
+        return None
+
+    linhas = {
+        linha["recorte"] == "true": linha
+        for linha in stats.get("por_mtf") or []
+        if linha["modalidade"] == modalidade
+    }
+    if True not in linhas or False not in linhas:
+        return None
+    if (linhas[True]["resolvidos"] < _TAXA_MTF_RESOLVIDOS_MINIMO
+            or linhas[False]["resolvidos"] < _TAXA_MTF_RESOLVIDOS_MINIMO):
+        return None
+    return linhas
 
 
 def find_fvg_zone(df: pd.DataFrame, max_age: int = DEFAULT_PARAMS.fvg_max_idade) -> dict | None:
@@ -298,6 +354,42 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
 # ========================================================================
 # Painéis
 # ========================================================================
+def _salvar_sinal(signal: Signal, symbol: str, timeframe: str, context, mtf, params: AnalysisParams,
+                  perfil: str, style: str) -> None:
+    """Grava um sinal manual e dá o feedback (sucesso/duplicado/erro).
+
+    Fatorado em 2026-08-06 pra ser chamado tanto pelo botão em destaque no
+    veredito quanto pelo botão dentro do expander de detalhe — sem duplicar
+    a lógica de confirmação+gravação entre os dois. É o mecanismo PRINCIPAL
+    de geração de sinal agora (o worker automático foi reduzido a propósito,
+    ver docs/homelab-pipeline.md).
+
+    A confirmação gravada é a DESTA leitura (`signal.name`), não
+    necessariamente a modalidade escolhida na sidebar — reaproveitar a
+    confirmação de outra leitura falsearia o recorte de assertividade."""
+    confirmado, direcao_mtf = (False, Direction.NEUTRAL)
+    if mtf is not None:
+        confirmado, direcao_mtf = daytrade_smc.mtf_confirmation(
+            {tf: r.signals for tf, r in mtf.results.items()},
+            estilo(style)["confirmation"],
+            signal.name,
+        )
+    try:
+        resultado = daytrade_smc.save_signal(
+            daytrade_smc.signal_payload(
+                symbol, timeframe, signal, context, perfil, params, "manual",
+                confirmado, direcao_mtf,
+            )
+        )
+    except Exception as exc:
+        st.error(f"Não foi possível salvar: {exc}")
+    else:
+        if resultado.get("duplicado"):
+            st.info("Este sinal já estava salvo (mesma vela, mesma leitura).")
+        else:
+            st.success(f"Sinal salvo — {signal.name} de {symbol} em {timeframe}.")
+
+
 def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None, timeframe: str = "", context=None, mtf=None, params: AnalysisParams = DEFAULT_PARAMS, perfil: str = DEFAULT_PROFILE_NAME) -> None:
     color = DIRECTION_COLOR[signal.direction]
     q = quality(signal.score, params)
@@ -366,33 +458,13 @@ def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None, 
         # A garantia contra clique duplo, essa sim, é o índice único no
         # banco: (symbol, timeframe, modalidade, candle_time, perfil, origem).
         if st.button("💾 Salvar sinal", key=f"salvar_{symbol}_{timeframe}_{signal.name}"):
-            # A confirmação gravada é a DESTA leitura, não a da modalidade
-            # selecionada na sidebar: o painel mostra as cinco, e reaproveitar
-            # a confirmação de outra falsearia o recorte de assertividade.
-            confirmado, direcao_mtf = (False, Direction.NEUTRAL)
-            if mtf is not None:
-                confirmado, direcao_mtf = daytrade_smc.mtf_confirmation(
-                    {tf: r.signals for tf, r in mtf.results.items()},
-                    STYLES[st.session_state.style_select]["confirmation"],
-                    signal.name,
-                )
-            try:
-                resultado = daytrade_smc.save_signal(
-                    daytrade_smc.signal_payload(
-                        symbol, timeframe, signal, context, perfil, params, "manual",
-                        confirmado, direcao_mtf,
-                    )
-                )
-            except Exception as exc:
-                st.error(f"Não foi possível salvar: {exc}")
-            else:
-                if resultado.get("duplicado"):
-                    st.info("Este sinal já estava salvo (mesma vela, mesma leitura).")
-                else:
-                    st.success(f"Sinal salvo — {signal.name} de {symbol} em {timeframe}.")
+            _salvar_sinal(signal, symbol, timeframe, context, mtf, params, perfil,
+                         st.session_state.style_select)
 
 
 TIMEFRAME_LABELS = {
+    "M2": "2 minutos",
+    "M5": "5 minutos",
     "M15": "15 minutos",
     "H1": "60 minutos",
     "H4": "240 minutos",
@@ -401,54 +473,138 @@ TIMEFRAME_LABELS = {
 }
 
 
-def render_confirmation_badge(mtf, confirmation: tuple[str, str], params: AnalysisParams = DEFAULT_PARAMS) -> None:
+def leitura_ativa(signals: list[Signal], modality: str) -> Signal | None:
+    """O sinal que a Modalidade escolhida na sidebar designa.
+
+    A tela inteira passou a girar em torno desta função. Antes a Modalidade
+    decidia só a confirmação e a ordenação do Scanner: a Análise individual
+    ignorava a escolha e desenhava as CINCO leituras, em abas dentro de abas
+    (4 timeframes × 6 leituras = 24 painéis por ativo). Pedir uma decisão ao
+    usuário e depois não usá-la é a origem da queixa de "tela confusa".
+
+    Com "Todas as modalidades" não existe um Signal só, e devolver um
+    sintético seria mentira: o plano de risco de uma média de seis leituras
+    não existe no motor. Nesse caso devolve None e quem chama usa a
+    Confluência como portadora do plano — que é a regra que o Scanner já
+    seguia, agora explicitada num lugar só em vez de repetida."""
+    if modality == ALL_MODALITIES_OPTION:
+        return None
+    return next((s for s in signals if s.name == modality), None)
+
+
+def portadora_do_plano(signals: list[Signal], modality: str) -> Signal | None:
+    """Qual leitura carrega entrada/stop/alvo quando a modalidade é a média.
+
+    A Confluência, e só quando ela concorda com a direção geral — senão não
+    há um plano coerente pra mostrar, só uma votação. Mesma regra do
+    `run_scanner`."""
+    ativa = leitura_ativa(signals, modality)
+    if ativa is not None:
+        return ativa
+    confluencia = next((s for s in signals if s.name == "Confluência"), None)
+    if confluencia is None or confluencia.direction != overall_direction(signals):
+        return None
+    return confluencia
+
+
+def render_veredito(mtf, confirmation: tuple[str, str], symbol: str, risk_budget: float | None,
+                    params: AnalysisParams = DEFAULT_PARAMS) -> Signal | None:
+    """O bloco de resposta, no topo da tela. Devolve a leitura que carrega o
+    plano de risco (ou None), pra quem chama desenhar o gráfico e oferecer
+    "salvar sinal" com ela.
+
+    Uma tela, uma resposta. O que existia antes era um selo de confirmação
+    seguido de vinte painéis — o usuário tinha que montar o veredito sozinho
+    lendo abas. Aqui ou tem operação (com preço, stop e alvo na mesma frase)
+    ou tem o motivo de não ter, escrito por extenso.
+
+    2026-08-06: a concordância entre os dois timeframes obrigatórios DEIXOU
+    DE SER GATE. Medimos 81 mil sinais resolvidos e a confirmação
+    multi-timeframe rendeu PIOR que a ausência dela (37,0% vs 42,1% de
+    acerto, z=-10,7, nas leituras sem exceção) — travar a tela nisso
+    escondia justamente o subconjunto que media melhor. Agora `mtf.confirmed`
+    vira só mais um fato na caption, ao lado da taxa medida quando existir
+    (`_taxa_mtf`), e quem decide se o plano aparece é só ele ter entrada
+    válida — não mais concordância entre timeframes."""
     tf_a, tf_b = confirmation
-    result_a = mtf.results[tf_a]
-    result_b = mtf.results[tf_b]
+    result_a, result_b = mtf.results[tf_a], mtf.results[tf_b]
 
     if result_a.error or result_b.error:
-        st.warning(
-            f"⚠️ Não foi possível confirmar — falha ao buscar {tf_a} e/ou {tf_b}. "
+        st.error(
+            f"Não dá pra concluir nada sobre {symbol}: falha ao buscar "
+            f"{TIMEFRAME_LABELS[tf_a]} e/ou {TIMEFRAME_LABELS[tf_b]}. "
             f"{result_a.error or ''} {result_b.error or ''}".strip()
         )
-        return
+        return None
 
+    plano = portadora_do_plano(result_a.signals, mtf.modality)
+    risk = plano.risk if plano else None
+
+    # Concordância entre os dois timeframes — informativo em qualquer
+    # caminho agora, não decide mais se o plano aparece.
     if mtf.modality == ALL_MODALITIES_OPTION:
-        dir_a = overall_direction(result_a.signals)
-        dir_b = overall_direction(result_b.signals)
-        agree_a, total_a = overall_agreement(result_a.signals)
-        agree_b, total_b = overall_agreement(result_b.signals)
-        agreement_note = f" ({tf_a}: {agree_a}/{total_a} leituras concordam · {tf_b}: {agree_b}/{total_b})"
+        dir_a, dir_b = overall_direction(result_a.signals), overall_direction(result_b.signals)
+        ag_a, tot_a = overall_agreement(result_a.signals)
+        ag_b, tot_b = overall_agreement(result_b.signals)
+        detalhe = (f"{TIMEFRAME_LABELS[tf_a]}: **{dir_a.value}** ({ag_a} de {tot_a} leituras) · "
+                   f"{TIMEFRAME_LABELS[tf_b]}: **{dir_b.value}** ({ag_b} de {tot_b})")
     else:
         dir_a = next(s.direction for s in result_a.signals if s.name == mtf.modality)
         dir_b = next(s.direction for s in result_b.signals if s.name == mtf.modality)
-        agreement_note = ""
+        detalhe = (f"{TIMEFRAME_LABELS[tf_a]}: **{dir_a.value}** · "
+                   f"{TIMEFRAME_LABELS[tf_b]}: **{dir_b.value}**")
 
-    if mtf.confirmed:
-        color = DIRECTION_COLOR[mtf.confirmed_direction]
-        if mtf.modality == ALL_MODALITIES_OPTION:
-            score_for_badge = overall_score(result_a.signals)
-        else:
-            score_for_badge = next(s.score for s in result_a.signals if s.name == mtf.modality)
-        star = "🌟 " if quality(score_for_badge, params) == "OPORTUNIDADE EXCEPCIONAL" else ""
+    # ---- caminho 1: sem leitura operável no timeframe de entrada ----
+    if plano is None or risk is None or risk.entry is None:
         st.markdown(
-            f'<div style="border:1px solid {color}; border-radius:8px; padding:12px 16px; '
-            f'background:{color}18; margin-bottom:14px;">'
-            f'{star}✅ <b style="color:{color}">CONFIRMADO: {mtf.confirmed_direction.value}</b> — '
-            f"{tf_a} e {tf_b} concordam na mesma direção, segundo a leitura <b>{mtf.modality}</b>."
-            f"{agreement_note}"
+            f'<div style="border-left:4px solid #8291a1; border-radius:4px; padding:14px 18px; '
+            f'background:#8291a114; margin-bottom:16px;">'
+            f'<div style="font-size:20px; font-weight:600; color:#8291a1;">SEM OPERAÇÃO EM {symbol}</div>'
+            f'<div style="margin-top:6px; opacity:.85;">Sem sinal operável em {mtf.modality} '
+            f"em {TIMEFRAME_LABELS[tf_a]} — entrada, stop e alvo foram bloqueados.</div>"
             f"</div>",
             unsafe_allow_html=True,
+        )
+        st.caption(f"{detalhe} · leitura: {mtf.modality}")
+        return plano
+
+    # ---- caminho 2: operação. Mostra sempre que houver plano válido —
+    # concordância entre timeframes virou dado na caption, não condição. ----
+    cor = DIRECTION_COLOR[plano.direction]
+    acao = "COMPRAR" if plano.direction == Direction.BUY else "VENDER"
+    st.markdown(
+        f'<div style="border-left:4px solid {cor}; border-radius:4px; padding:14px 18px; '
+        f'background:{cor}14; margin-bottom:16px;">'
+        f'<div style="font-size:20px; font-weight:600; color:{cor};">'
+        f'{acao} {symbol} · R$ {risk.entry:.2f}</div>'
+        f'<div style="margin-top:6px; opacity:.9;">'
+        f"stop <b>R$ {risk.stop:.2f}</b> · alvo <b>R$ {risk.target_1:.2f}</b> · "
+        f"R/R <b>1:{risk.rr:.2f}</b> · score {plano.score:.0f}/100</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    concordam = "concordam" if mtf.confirmed else "discordam"
+    linha = f"{TIMEFRAME_LABELS[tf_a]} e {TIMEFRAME_LABELS[tf_b]} {concordam}"
+    taxa = _taxa_mtf(plano.name, tf_a)
+    if taxa is not None:
+        t_sim, t_nao = taxa[True], taxa[False]
+        linha += (
+            f" · medição de {plano.name} em {TIMEFRAME_LABELS[tf_a]}: "
+            f"{t_sim['taxa_acerto'] * 100:.0f}% quando concorda (n={t_sim['resolvidos']}) "
+            f"vs {t_nao['taxa_acerto'] * 100:.0f}% quando discorda (n={t_nao['resolvidos']})"
         )
     else:
-        st.markdown(
-            f'<div style="border:1px solid #8291a1; border-radius:8px; padding:12px 16px; '
-            f'background:#8291a118; margin-bottom:14px;">'
-            f"❌ <b>NÃO CONFIRMADO</b> (leitura: <b>{mtf.modality}</b>) — {tf_a} diz <b>{dir_a.value}</b>, "
-            f"{tf_b} diz <b>{dir_b.value}</b>. Só é recomendação operável quando os dois concordam."
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+        linha += " · sem dado histórico suficiente pra comparar ainda"
+    linha += f" · leitura: {mtf.modality} · {plano.setup}"
+    if risk_budget:
+        risco_acao = abs(risk.entry - risk.stop)
+        if risco_acao > 0:
+            qtd = int(risk_budget // risco_acao)
+            linha += (f" · com R$ {risk_budget:.0f} de risco: **{qtd} ações** "
+                      f"(R$ {qtd * risk.entry:.2f} no total)")
+    st.caption(linha)
+    return plano
 
 
 OUTCOME_LABELS = {
@@ -457,6 +613,10 @@ OUTCOME_LABELS = {
     "STOP": ("❌ Bateu o Stop", "#ff5470"),
     "EM_ABERTO": ("⏳ Ainda em aberto", "#f0b429"),
     "SEM_SINAL": ("— Sem sinal operável nesta data", "#8291a1"),
+    # Não é acerto nem erro: a vela seguinte abriu além do stop, então a
+    # operação não chegou a existir. Contar isso como stop seria inventar uma
+    # perda que ninguém teve; contar como acerto, o oposto. Fica fora da conta.
+    "SEM_ENTRADA": ("— Gap abriu além do stop; sem operação", "#8291a1"),
     "SEM_DADO_FUTURO": ("⏳ Sem candles seguintes disponíveis ainda", "#8291a1"),
 }
 
@@ -468,7 +628,7 @@ def render_retro_check(symbol: str, style: str, modality: str, source: str, coun
         "entrada, alvo ou stop."
     )
 
-    all_tfs = list(dict.fromkeys([*STYLES[style]["confirmation"], *STYLES[style]["context"]]))
+    all_tfs = list(dict.fromkeys([*estilo(style)["confirmation"], *estilo(style)["context"]]))
     col1, col2 = st.columns(2)
     with col1:
         check_tf = st.selectbox("Timeframe a verificar", all_tfs, format_func=lambda tf: TIMEFRAME_LABELS[tf])
@@ -493,8 +653,10 @@ def render_retro_check(symbol: str, style: str, modality: str, source: str, coun
 
         color = DIRECTION_COLOR[check.direction]
         action = "COMPRAR" if check.direction == Direction.BUY else "VENDER"
-        if quality(check.score, params) == "OPORTUNIDADE EXCEPCIONAL":
-            st.markdown("🌟 **OPORTUNIDADE EXCEPCIONAL** nesta data")
+        # Sem selo de "oportunidade excepcional" aqui — a faixa de score 80+
+        # mediu como a SEGUNDA PIOR em expectativa nos 81 mil sinais
+        # analisados em 2026-08-06 (ver render_veredito). Destacar
+        # visualmente o que a medição contradiz seria o mesmo erro de novo.
         st.markdown(
             f'> **{action} {symbol}** perto de **R$ {check.risk.entry:.2f}**, stop em '
             f'**R$ {check.risk.stop:.2f}**, alvo em **R$ {check.risk.target_1:.2f}** '
@@ -509,6 +671,9 @@ def render_retro_check(symbol: str, style: str, modality: str, source: str, coun
             f'</div>',
             unsafe_allow_html=True,
         )
+
+        if check.r_realizado is not None:
+            st.caption(f"R realizado: {check.r_realizado:+.2f} (fill em R$ {check.preco_fill:.2f})")
 
         if check.outcome in ("EM_ABERTO", "STOP", "ALVO_1", "ALVO_2"):
             st.caption(f"Candles disponíveis após a data escolhida: {check.candles_futuros_disponiveis}")
@@ -577,9 +742,11 @@ def render_assertividade(perfis: list[str]) -> None:
     with col1:
         f_perfil = st.selectbox("Perfil", ["Todos"] + perfis, key="assert_perfil")
     with col2:
-        # 'backfill' é o passe único que reconstrói os sinais das velas já
-        # guardadas (`analyzer.py --backfill`). Sem ele aqui, a maior parte
-        # do histórico ficaria invisível no filtro.
+        # 'backfill' segue como opção de filtro (a reconstrução em massa não
+        # é mais a fonte principal desde 2026-08-06, mas o comando ainda
+        # existe pra casos pontuais — ex: bootstrapar histórico de um ativo
+        # novo). 'manual' é o caminho principal agora: o botão "💾 Salvar
+        # este sinal" no veredito de cada análise.
         f_origem = st.selectbox("Origem", ["Todas", "worker", "manual", "backfill"],
                                 key="assert_origem")
     with col3:
@@ -603,11 +770,12 @@ def render_assertividade(perfis: list[str]) -> None:
 
     if not stats["geral"]:
         st.info(
-            "Nenhum sinal com desfecho neste recorte ainda. O worker grava os sinais assim "
-            "que a vela fecha, mas o desfecho só aparece depois que o preço bate o alvo ou "
-            "o stop — em D1 isso leva dias. Pra não esperar, rode o backfill "
-            "(`analyzer.py --backfill`), que reconstrói os sinais das velas já guardadas "
-            "e já com o desfecho resolvido."
+            "Nenhum sinal com desfecho neste recorte ainda. A partir de 2026-08-06 a geração "
+            "de sinal deixou de ser em massa — use o botão \"💾 Salvar este sinal\" na Análise "
+            "individual pra registrar o que você realmente decidiu operar, ou aguarde o worker "
+            "reduzido acumular histórico (ele só grava leitura operável, não mais toda "
+            "varredura). O desfecho aparece depois que o preço bate o alvo ou o stop — em D1 "
+            "isso leva dias."
         )
         return
 
@@ -632,6 +800,21 @@ def render_assertividade(perfis: list[str]) -> None:
         help="Retorno médio em múltiplos de risco, usando o R que cada sinal realmente tinha "
              "(alvo 1 e alvo 2 são parâmetros do perfil, não valores fixos).",
     )
+
+    # `modelo_atual` conta quantos dos resolvidos já foram avaliados pelo
+    # modelo de execução corrigido (fill na abertura seguinte, R líquido de
+    # custo — ver evaluate_signal_outcome). Abaixo de `total_res`, parte da
+    # expectativa acima ainda fala o modelo antigo, que inflava o resultado
+    # justamente nos dias de gap — e isso precisa ficar visível, não
+    # silenciosamente misturado numa média só.
+    total_modelo_atual = sum(linha.get("modelo_atual", 0) for linha in stats["geral"])
+    if total_res and total_modelo_atual < total_res:
+        st.warning(
+            f"⚠️ {total_res - total_modelo_atual} de {total_res} sinais resolvidos ainda "
+            "estão com o modelo de execução ANTIGO (assumia fill no fechamento da vela do "
+            "sinal, sem custo) — a expectativa acima mistura os dois modelos. Rode "
+            "`analyzer.py --reavaliar-tudo` pra recalcular tudo com o modelo atual."
+        )
 
     st.markdown("### Por tipo de análise")
     st.dataframe(_tabela_assertividade(stats["geral"], None), hide_index=True, use_container_width=True)
@@ -675,56 +858,192 @@ def render_assertividade(perfis: list[str]) -> None:
     )
 
 
+def _linha_leitura(s: Signal) -> dict:
+    """Uma leitura virada linha de tabela. É aqui que as leituras sem entrada
+    param de virar painel: elas viram uma linha dizendo que não têm nada, em
+    vez de meia tela de métricas zeradas e um aviso azul."""
+    return {
+        "Leitura": s.name,
+        "Direção": s.direction.value,
+        "Score": round(s.score, 1),
+        "Entrada": round(s.risk.entry, 2) if s.risk.entry else None,
+        "Stop": round(s.risk.stop, 2) if s.risk.stop else None,
+        "Alvo 1": round(s.risk.target_1, 2) if s.risk.target_1 else None,
+        "Setup": s.setup,
+    }
+
+
+def render_rsi_multi_tf(mtf, params: AnalysisParams) -> None:
+    """Consolida os extremos de IFR de todos os timeframes analisados.
+
+    Exaustão simultânea em 2+ timeframes é rara e é a leitura de maior
+    convicção que o motor produz — vale mais que qualquer leitura
+    isolada com score alto. Por isso fica no topo, não num expander.
+    """
+    consolidado = rsi_extremes_across_timeframes(mtf, params)
+    por_tf = consolidado["por_tf"]
+    if not por_tf:
+        return
+
+    alinhamento = consolidado["alinhamento"]
+    direcao = consolidado["direcao"]
+
+    if alinhamento >= 2:
+        cor = DIRECTION_COLOR[Direction(direcao)]
+        titulo = f'<b style="color:{cor}">🎯 Exaustão em {alinhamento} timeframes — {direcao}</b>'
+    elif alinhamento == 1:
+        cor = DIRECTION_COLOR[Direction(direcao)]
+        titulo = f'<b style="color:{cor}">Exaustão em 1 timeframe — {direcao}</b>'
+    else:
+        cor = DIRECTION_COLOR[Direction.NEUTRAL]
+        titulo = '<span style="color:#8291a1">Nenhum timeframe em exaustão</span>'
+
+    partes = []
+    for tf, (valor, zona) in por_tf.items():
+        rotulo = TIMEFRAME_LABELS.get(tf, tf)
+        if zona is None:
+            partes.append(f'{rotulo} {valor:.0f}')
+        else:
+            partes.append(f'<b style="color:{DIRECTION_COLOR[Direction(zona)]}">{rotulo} {valor:.0f}</b>')
+
+    st.markdown(
+        f'<div style="border:1px solid {cor}; border-radius:8px; padding:8px 14px; '
+        f'background:{cor}18; margin:6px 0 14px 0;">{titulo}<br>'
+        f'<span style="font-size:0.92em">IFR({params.rsi_periodo}) — {" · ".join(partes)}'
+        f' · exaustão em ≤{params.rsi_sobrevenda:.0f} ou ≥{params.rsi_sobrecompra:.0f}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_rsi_badge(context, params: AnalysisParams) -> None:
+    """Faixa visual do IFR do timeframe atual, com o Diário ao lado quando disponível."""
+    rsi = context.rsi
+    sobrevenda, sobrecompra = params.rsi_sobrevenda, params.rsi_sobrecompra
+
+    if rsi <= sobrevenda:
+        zona, cor = f"EXAUSTÃO VENDEDORA (≤{sobrevenda:.0f}) → COMPRA", DIRECTION_COLOR[Direction.BUY]
+    elif rsi >= sobrecompra:
+        zona, cor = f"EXAUSTÃO COMPRADORA (≥{sobrecompra:.0f}) → VENDA", DIRECTION_COLOR[Direction.SELL]
+    else:
+        zona, cor = "Sem exaustão", DIRECTION_COLOR[Direction.NEUTRAL]
+
+    diario = ""
+    if context.higher_rsi is not None:
+        d = context.higher_rsi
+        d_zona = "exaurido ↓" if d <= sobrevenda else "exaurido ↑" if d >= sobrecompra else "sem exaustão"
+        diario = f" · <b>Diário:</b> {d:.1f} ({d_zona})"
+
+    st.markdown(
+        f'<div style="border:1px solid {cor}; border-radius:8px; padding:10px 14px; '
+        f'background:{cor}18; margin:6px 0 14px 0;">'
+        f'<b>IFR ({params.rsi_periodo}):</b> <b style="color:{cor}">{rsi:.1f} — {zona}</b>{diario}'
+        f'<div style="background:#8291a133; height:8px; border-radius:4px; margin-top:8px; position:relative;">'
+        f'<div style="position:absolute; left:{sobrevenda:.0f}%; top:0; bottom:0; width:1px; background:#8291a1;"></div>'
+        f'<div style="position:absolute; left:{sobrecompra:.0f}%; top:0; bottom:0; width:1px; background:#8291a1;"></div>'
+        f'<div style="position:absolute; left:calc({min(max(rsi, 0), 100):.0f}% - 4px); top:-2px; '
+        f'width:8px; height:12px; border-radius:2px; background:{cor};"></div>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_individual_analysis(symbol: str, style: str, modality: str, source: str, count: int, risk_budget: float | None, params: AnalysisParams = DEFAULT_PARAMS, perfil: str = DEFAULT_PROFILE_NAME) -> None:
-    confirmation = STYLES[style]["confirmation"]
-    context_tfs = STYLES[style]["context"]
-    all_tfs = list(confirmation) + [tf for tf in context_tfs if tf not in confirmation]
+    """Uma tela, uma resposta.
+
+    A ordem é deliberada e é o oposto da anterior: veredito primeiro, prova
+    depois, detalhe só a pedido. A tela antiga abria com quatro abas de
+    timeframe, cada uma com cinco abas de leitura, e deixava a conclusão pro
+    usuário montar. Aqui o gráfico é UM (o timeframe de entrada), as outras
+    leituras são linhas de tabela, e os timeframes de contexto são uma linha
+    cada — não abas."""
+    confirmation = estilo(style)["confirmation"]
+    context_tfs = estilo(style)["context"]
+    tf_entrada = confirmation[0]
 
     fonte_label = SOURCE_LABELS.get(source, source)
-    with st.spinner(f"Buscando {', '.join(TIMEFRAME_LABELS[tf] for tf in all_tfs)} de {symbol} via {fonte_label}..."):
+    with st.spinner(f"Analisando {symbol} via {fonte_label}..."):
         mtf = cached_mtf(symbol, count, confirmation, context_tfs, modality, source, params)
 
-    render_confirmation_badge(mtf, confirmation, params)
+    plano = render_veredito(mtf, confirmation, symbol, risk_budget, params)
+    render_rsi_multi_tf(mtf, params)
 
-    tf_tabs = st.tabs([TIMEFRAME_LABELS[tf] + (" (contexto)" if tf not in confirmation else "") for tf in all_tfs])
-    for tab, tf in zip(tf_tabs, all_tfs):
-        with tab:
-            result = mtf.results[tf]
-            if result.error:
-                st.error(f"Não foi possível analisar {symbol} em {tf}: {result.error}")
-                continue
-            render_timeframe_panel(symbol, tf, result.context, result.signals, risk_budget, mtf, params, perfil)
+    if plano is not None and plano.risk.entry is not None and daytrade_smc.ACOES_API_URL:
+        # Caminho PRINCIPAL de geração de sinal agora — o worker automático
+        # foi reduzido de propósito em 2026-08-06 (ver
+        # docs/homelab-pipeline.md): a maioria do que ele gravava era leitura
+        # sem sinal, e a confirmação multi-timeframe que a tela usava como
+        # filtro de qualidade mediu PIOR que a ausência dela. Fica logo
+        # abaixo do veredito, não enterrado num expander de detalhe — antes
+        # disso o botão de salvar nunca tinha sido usado nem uma vez.
+        if st.button("💾 Salvar este sinal", type="primary",
+                     key=f"salvar_veredito_{symbol}_{tf_entrada}_{plano.name}"):
+            _salvar_sinal(plano, symbol, tf_entrada, mtf.results[tf_entrada].context, mtf,
+                         params, perfil, style)
 
+    resultado_entrada = mtf.results[tf_entrada]
+    if resultado_entrada.error:
+        return
 
-def render_timeframe_panel(symbol: str, timeframe: str, context, signals, risk_budget: float | None, mtf=None, params: AnalysisParams = DEFAULT_PARAMS, perfil: str = DEFAULT_PROFILE_NAME) -> None:
-    by_name = {s.name: s for s in signals}
-    last_open = context.df.index[-1].tz_convert("America/Sao_Paulo")
-    st.caption(f"{symbol} ({yahoo_symbol(symbol)}) · {timeframe} · último candle: {last_open} · "
-              f"ATR {context.atr:.2f} ({context.atr_pct:.2f}%) · RVOL {context.rvol:.2f}x · "
-              f"Volatilidade {context.volatility} · atualizado às "
-              f"{pd.Timestamp.now(tz='America/Sao_Paulo').strftime('%H:%M:%S')}")
+    contexto = resultado_entrada.context
+    sinais = resultado_entrada.signals
 
-    chart_choice = st.selectbox(
-        "Ver entrada/stop/alvo de qual leitura no gráfico:",
-        [s.name for s in signals], index=0, key=f"chart_choice_{timeframe}",
+    st.caption(
+        f"{symbol} ({yahoo_symbol(symbol)}) · gráfico em {TIMEFRAME_LABELS[tf_entrada]} · "
+        f"último candle {contexto.df.index[-1].tz_convert('America/Sao_Paulo'):%d/%m %H:%M} · "
+        f"ATR {contexto.atr:.2f} ({contexto.atr_pct:.2f}%) · RVOL {contexto.rvol:.2f}x · "
+        f"volatilidade {contexto.volatility} · atualizado {pd.Timestamp.now(tz='America/Sao_Paulo'):%H:%M:%S}"
     )
-    st.plotly_chart(build_chart(context, by_name[chart_choice], symbol), use_container_width=True, key=f"chart_{timeframe}_{chart_choice}")
-
-    tabs = st.tabs([s.name for s in signals])
-    for tab, s in zip(tabs, signals):
-        with tab:
-            render_signal_panel(s, symbol, risk_budget, timeframe, context, mtf, params, perfil)
-
-    st.markdown("### Resumo — as 5 leituras lado a lado")
-    st.dataframe(
-        [{
-            "Análise": s.name, "Direção": s.direction.value, "Score": round(s.score, 1),
-            "Entrada": round(s.risk.entry, 2) if s.risk.entry else None,
-            "Stop": round(s.risk.stop, 2) if s.risk.stop else None,
-            "Alvo 1": round(s.risk.target_1, 2) if s.risk.target_1 else None,
-        } for s in signals],
-        hide_index=True, use_container_width=True,
+    render_rsi_badge(contexto, params)
+    st.plotly_chart(
+        build_chart(contexto, plano, symbol),
+        use_container_width=True, key=f"chart_{symbol}_{tf_entrada}",
     )
+
+    # ---- a prova: as seis leituras nos dois timeframes que decidem ----
+    st.markdown("#### O que sustenta (ou derruba) o veredito")
+    for tf in confirmation:
+        resultado = mtf.results[tf]
+        if resultado.error:
+            st.warning(f"{TIMEFRAME_LABELS[tf]}: {resultado.error}")
+            continue
+        st.caption(f"**{TIMEFRAME_LABELS[tf]}**")
+        st.dataframe(
+            pd.DataFrame([_linha_leitura(s) for s in resultado.signals]),
+            hide_index=True, use_container_width=True,
+        )
+
+    # ---- contexto: uma linha por timeframe, não uma aba ----
+    linhas_contexto = []
+    for tf in context_tfs:
+        resultado = mtf.results.get(tf)
+        if resultado is None or resultado.error:
+            continue
+        s = leitura_ativa(resultado.signals, modality)
+        direcao = s.direction if s else overall_direction(resultado.signals)
+        score = s.score if s else overall_score(resultado.signals)
+        linhas_contexto.append({
+            "Timeframe": TIMEFRAME_LABELS[tf],
+            "Direção": direcao.value,
+            "Score": round(score, 1),
+        })
+    if linhas_contexto:
+        st.caption("**Contexto** — tendência mais ampla. Não confirma nem bloqueia a recomendação.")
+        st.dataframe(pd.DataFrame(linhas_contexto), hide_index=True, use_container_width=True)
+
+    # ---- detalhe: só a pedido, e só da leitura que decide ----
+    nome_detalhe = plano.name if plano else "Confluência"
+    with st.expander(f"Detalhe da leitura {nome_detalhe} em {TIMEFRAME_LABELS[tf_entrada]}"):
+        alvo = next((s for s in sinais if s.name == nome_detalhe), None)
+        if alvo is not None:
+            render_signal_panel(alvo, symbol, risk_budget, tf_entrada, contexto, mtf, params, perfil)
+
+    with st.expander("Ver todas as leituras em detalhe"):
+        outras = [s for s in sinais if s.name != nome_detalhe]
+        abas = st.tabs([s.name for s in outras])
+        for aba, s in zip(abas, outras):
+            with aba:
+                render_signal_panel(s, symbol, risk_budget, tf_entrada, contexto, mtf, params, perfil)
 
 
 # ========================================================================
@@ -766,12 +1085,30 @@ _AUTO_REFRESH_FRAGMENTS = {
 
 
 def run_scanner(symbols: list[str], style: str, modality: str, source: str, count: int, risk_budget: float | None, params: AnalysisParams = DEFAULT_PARAMS) -> pd.DataFrame:
+    """
+    2026-08-06: parou de ordenar por "Confirmado" e de destacar score 80+.
+    Os 81 mil sinais medidos mostraram os dois como PIORES que a ausência
+    deles (confirmação: 37,0% vs 42,1% de acerto; faixa 80+: segunda pior
+    expectativa) — usá-los como critério de ranking apontaria justamente
+    pro pior subconjunto primeiro. "Confirmado" continua na tabela como
+    dado; "Score Geral" continua ordenando por não termos, ainda, um
+    critério validado melhor — mas sem pretender que é garantia de nada.
+    """
     rows = []
     progress = st.progress(0.0, text="Iniciando scanner...")
-    confirmation = STYLES[style]["confirmation"]
-    context_tfs = STYLES[style]["context"]
+    confirmation = estilo(style)["confirmation"]
+    context_tfs = estilo(style)["context"]
     tf_a, tf_b = confirmation
     col_a, col_b = f"Score {tf_a}", f"Score {tf_b}"
+
+    # Não depende do símbolo — uma leitura só (cacheada por _taxa_mtf) serve
+    # a tabela inteira, não é uma chamada de rede por ativo escaneado.
+    modalidade_taxa = modality if modality != ALL_MODALITIES_OPTION else "Confluência"
+    taxa_hist = _taxa_mtf(modalidade_taxa, tf_a)
+    taxa_col = (
+        f"{taxa_hist[True]['taxa_acerto'] * 100:.0f}%/{taxa_hist[False]['taxa_acerto'] * 100:.0f}%"
+        if taxa_hist is not None else "—"
+    )
 
     for i, symbol in enumerate(symbols):
         progress.progress((i + 1) / len(symbols), text=f"Analisando {symbol} ({i+1}/{len(symbols)})...")
@@ -781,51 +1118,67 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
 
         if result_a.error or result_b.error:
             err = (result_a.error or result_b.error or "")[:60]
-            rows.append({"Ativo": symbol, "Confirmado": "ERRO", "Destaque": "", "Direção": "ERRO", col_a: None,
-                        col_b: None, "Score Geral": None, "Setup": err, "Entrada": None, "Stop": None,
-                        "Alvo 1": None, "Quantidade": None, "Total (R$)": None})
-            if source != "MetaTrader 5":
-                time.sleep(0.3)
+            rows.append({"Ativo": symbol, "Confirmado": "ERRO", "Direção": "ERRO", col_a: None,
+                        col_b: None, "Score Geral": None, "Exaustão": "",
+                        "Taxa hist. (conf./não)": taxa_col, "Setup": err,
+                        "Entrada": None, "Stop": None, "Alvo 1": None, "Quantidade": None, "Total (R$)": None})
+            if source == "Yahoo Finance":
+                time.sleep(_PAUSA_YAHOO)
             continue
+
+        # mesma leitura que decide o veredito da Análise individual — sem
+        # exigir mtf.confirmed pra mostrar o plano (ver render_veredito)
+        plano = portadora_do_plano(result_a.signals, modality)
+        risk = plano.risk if plano else None
 
         if modality == ALL_MODALITIES_OPTION:
             score_a = round(overall_score(result_a.signals), 1)
             score_b = round(overall_score(result_b.signals), 1)
             confluence_a = next(s for s in result_a.signals if s.name == "Confluência")
-            setup_text = (
-                f"Score geral (média de 5 leituras) — {confluence_a.setup}" if mtf.confirmed
-                else f"Score geral (média de 5 leituras) — sem confirmação entre {tf_a}/{tf_b}"
-            )
-            risk = confluence_a.risk if (mtf.confirmed and confluence_a.direction == mtf.confirmed_direction) else None
+            setup_text = f"Score geral (média de 5 leituras) — {confluence_a.setup}"
+            direction_label = overall_direction(result_a.signals).value
         else:
             conf_a = next(s for s in result_a.signals if s.name == modality)
             conf_b = next(s for s in result_b.signals if s.name == modality)
             score_a = round(conf_a.score, 1)
             score_b = round(conf_b.score, 1)
-            setup_text = conf_a.setup if mtf.confirmed else f"{tf_a}={conf_a.direction.value} / {tf_b}={conf_b.direction.value}"
-            risk = conf_a.risk if mtf.confirmed else None
-
-        direction_label = mtf.confirmed_direction.value if mtf.confirmed else "NEUTRO"
+            setup_text = conf_a.setup
+            direction_label = conf_a.direction.value
 
         qty = None
         total = None
-        if mtf.confirmed and risk_budget and risk and risk.entry is not None and risk.stop is not None:
+        if risk_budget and risk and risk.entry is not None and risk.stop is not None:
             risk_per_share = abs(risk.entry - risk.stop)
             if risk_per_share > 0:
                 qty = int(risk_budget // risk_per_share)
                 total = round(qty * risk.entry, 2) if qty > 0 else 0.0
 
         score_geral = round((score_a + score_b) / 2, 1)
-        destaque = "🌟 Excepcional" if (mtf.confirmed and quality(score_geral, params) == "OPORTUNIDADE EXCEPCIONAL") else ""
+
+        # Exaustão de IFR alinhada em vários timeframes é o filtro mais
+        # seletivo da tabela: é raro, e quando aparece diz mais que um
+        # score alto isolado. Fica como COLUNA, não como ordenação — o
+        # ranking segue no Score Geral pelo motivo do docstring acima.
+        exaustao_tf = rsi_extremes_across_timeframes(mtf, params)
+        n_extremos = exaustao_tf["alinhamento"]
+        if n_extremos >= 2:
+            seta = "↑" if exaustao_tf["direcao"] == Direction.BUY.value else "↓"
+            exaustao = f"🎯 {n_extremos} TFs {seta}"
+        elif n_extremos == 1:
+            seta = "↑" if exaustao_tf["direcao"] == Direction.BUY.value else "↓"
+            exaustao = f"1 TF {seta}"
+        else:
+            exaustao = ""
 
         rows.append({
             "Ativo": symbol,
             "Confirmado": "✅" if mtf.confirmed else "❌",
-            "Destaque": destaque,
             "Direção": direction_label,
             col_a: score_a,
             col_b: score_b,
             "Score Geral": score_geral,
+            "Exaustão": exaustao,
+            "Taxa hist. (conf./não)": taxa_col,
             "Setup": setup_text,
             "Entrada": round(risk.entry, 2) if risk and risk.entry else None,
             "Stop": round(risk.stop, 2) if risk and risk.stop else None,
@@ -833,15 +1186,13 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
             "Quantidade": qty,
             "Total (R$)": total,
         })
-        if source != "MetaTrader 5":
-            time.sleep(0.3)  # folga entre chamadas — reduz risco de rate limit do Yahoo (MT5 é chamada local, sem esse limite)
+        if source == "Yahoo Finance":
+            time.sleep(_PAUSA_YAHOO)
 
     progress.empty()
     result = pd.DataFrame(rows)
     if "Score Geral" in result.columns:
-        # As recomendações são ordenadas pelo Score Geral (média das leituras em ambos os
-        # timeframes de confirmação) — confirmadas primeiro, da maior pontuação pra menor.
-        result = result.sort_values(["Confirmado", "Score Geral"], ascending=[True, False], na_position="last")
+        result = result.sort_values("Score Geral", ascending=False, na_position="last")
         result = result.reset_index(drop=True)
         # Posição: 1 = melhor colocado, numeração crescente conforme desce no ranking
         result.insert(0, "Posição", range(1, len(result) + 1))
@@ -855,6 +1206,16 @@ def run_scanner(symbols: list[str], style: str, modality: str, source: str, coun
 # ========================================================================
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = load_symbols()
+
+# Fonte padrão conforme o ambiente: com a API do homelab configurada ela é o
+# caminho recomendado; sem ela, cair no Homelab só produziria uma tela de
+# erro na primeira visita. Fixado aqui, e não via `index=` no `st.radio`,
+# porque o widget tem `key="source_select"` — com key, o Streamlit ignora o
+# `index` a partir do segundo rerun e passa a mandar o session_state.
+if "source_select" not in st.session_state:
+    st.session_state.source_select = (
+        "Homelab (API)" if daytrade_smc.ACOES_API_URL else "Yahoo Finance"
+    )
 
 if "symbol_select" not in st.session_state:
     st.session_state.symbol_select = st.session_state.watchlist[0]
@@ -895,6 +1256,7 @@ PARAM_ESCALARES = [nome for nome, valor in DEFAULT_PARAMS.to_items() if not isin
 PARAM_UI = {
     "Contexto": [
         ("atr_periodo", "Período do ATR", 2, 200, 1),
+        ("rsi_periodo", "Período do IFR", 2, 200, 1),
         ("swing_esquerda", "Swing — velas à esquerda", 1, 20, 1),
         ("swing_direita", "Swing — velas à direita", 1, 20, 1),
         ("vol_baixa_max_pct", "Volatilidade BAIXA abaixo de (ATR %)", 0.0, 5.0, 0.05),
@@ -913,6 +1275,10 @@ PARAM_UI = {
     "VWAP": [
         ("vwap_distancia_min_pct", "Distância mínima pra contar (%)", 0.0, 2.0, 0.01),
         ("vwap_distancia_max_pct", "Distância que bloqueia a entrada (%)", 0.1, 10.0, 0.1),
+    ],
+    "IFR": [
+        ("rsi_sobrevenda", "Exaustão vendedora — IFR abaixo de", 0.0, 50.0, 1.0),
+        ("rsi_sobrecompra", "Exaustão compradora — IFR acima de", 50.0, 100.0, 1.0),
     ],
     "Confluência": [
         ("peso_smc", "Peso — SMC", 0.0, 100.0, 1.0),
@@ -954,7 +1320,10 @@ PARAM_AJUDA = {
     "evento_max_idade": "Um BOS/CHoCH mais velho que isso deixa de contar como sinal recente.",
     "normalizacao_score": "Divide o score de cada leitura antes de aplicar o peso. Acoplado ao teto da leitura isolada.",
     "confluencia_banda_empate": "Diferença mínima entre compra e venda pra a confluência sair de NEUTRO.",
-    "multiplicador_concordancia": "Multiplicador do score da confluência por quantas das 4 leituras concordam (0 a 4)",
+    "multiplicador_concordancia": "Multiplicador do score da confluência por quantas das 4 categorias estruturais concordam (0 a 4). O IFR não entra nessa conta.",
+    "rsi_periodo": "Período do IFR. 14 é a convenção de Wilder, a mesma do MT5 e do TradingView.",
+    "rsi_sobrevenda": "Abaixo disso o IFR marca exaustão vendedora e aponta COMPRA. O padrão 10 é extremo de propósito: dispara pouco, mas quando dispara vale.",
+    "rsi_sobrecompra": "Acima disso o IFR marca exaustão compradora e aponta VENDA. Ver a observação do limiar de sobrevenda.",
     "bandas_qualidade": "Score a partir do qual cada rótulo de qualidade começa",
     "score_minimo_operavel": "Abaixo disso a direção vira NEUTRO, qualquer que seja a leitura.",
     "stop_minimo_atr": "Piso da distância entrada→stop, pra um stop estrutural colado demais não virar risco irreal.",
@@ -1023,72 +1392,65 @@ def _persist_watchlist() -> None:
 
 
 # ========================================================================
+# Modo — no corpo, não na sidebar (2026-08-06: a navegação entre os 4 modos
+# sentia fragmentada com o seletor escondido lá embaixo, entre outras
+# configurações). Calculado ANTES do bloco da sidebar porque os widgets lá
+# dentro (ex: qual seletor de ativo aparece) dependem de `mode` já estar
+# definido — a ordem de EXECUÇÃO no script decide a ordem dentro de cada
+# container, não a posição visual entre corpo e sidebar, então isto roda
+# aqui e mesmo assim aparece no topo do corpo, acima do título.
+#
+# `st.segmented_control`, não `st.tabs`: tabs executam o corpo de TODAS as
+# abas a cada rerun — é só disposição visual, não controle de fluxo. Trocar
+# o if/elif atual (mais abaixo) por tabs faria Scanner/Análise
+# individual/Retroativa rodarem seus fetches (alguns custosos — o Yahoo tem
+# rate limit documentado) toda vez que qualquer widget mudasse, mesmo com
+# outra aba visível. segmented_control preserva o if/elif: só o modo
+# escolhido executa, exatamente como o st.radio que ele substitui.
+# ========================================================================
+mode = st.segmented_control(
+    "Modo",
+    ["Análise individual", "Scanner (todos os ativos)", "Verificação retroativa", "Assertividade",
+     "Mini Índice (WINFUT)"],
+    key="mode_select", default="Análise individual", required=True,
+    # `required=True` é obrigatório aqui, não estético: sem ele,
+    # segmented_control deixa clicar no pill já selecionado pra DESMARCAR e
+    # devolver None — e o if/elif abaixo termina num `else` que assume
+    # Assertividade. Sem o required, um duplo-clique acidental trocaria de
+    # modo em silêncio pro usuário achar que ainda está na tela anterior.
+)
+
+# ========================================================================
 # Sidebar
 # ========================================================================
 with st.sidebar:
     st.markdown("## 📊 Day Trade SMC")
-    st.caption("SMC · Price Action · Médias Móveis · VWAP")
-
-    mode = st.radio(
-        "Modo",
-        ["Análise individual", "Scanner (todos os ativos)", "Verificação retroativa", "Assertividade"],
-        key="mode_select",
-    )
+    st.caption("SMC · Price Action · Médias Móveis · VWAP · IFR")
 
     st.markdown("### Fonte de dados")
     source = st.radio(
         "Fonte", DATA_SOURCES, key="source_select", horizontal=True,
-        help="Yahoo Finance funciona em qualquer lugar, com atraso de ~15-20min. MetaTrader 5 "
-             "direto é tempo real, mas só funciona rodando este app na máquina com o MT5 aberto. "
-             "\"GitHub (MT5 de casa)\" funciona de qualquer lugar (inclusive do trabalho) e busca "
-             "dado real do MT5, mas só atualiza quando você clicar em \"Atualizar via MT5\". "
-             "\"Homelab (API)\" lê candles pela API do homelab, alimentada por um scraper "
-             "MT5 rodando continuamente numa VM — dado real, quase em tempo real.",
+        help="\"Homelab (API)\" lê candles pela API do homelab, alimentada por um scraper "
+             "MT5 que roda continuamente numa VM — dado real, poucos segundos de atraso. "
+             "É o caminho recomendado. \"Yahoo Finance\" funciona em qualquer lugar, sem "
+             "depender de nada seu estar no ar, mas o dado nasce ~15-20min atrasado.",
     )
-    if source == "MetaTrader 5":
-        st.caption(
-            "⚠️ Só funciona rodando localmente, na máquina com o MT5 aberto. Se você estiver "
-            "vendo isso no Streamlit Cloud, vai dar erro de conexão — o servidor da nuvem não "
-            "tem o MT5 instalado. Veja o README pra rodar local e acessar remoto."
-        )
-    elif source == "Homelab (API)":
-        st.caption(
-            "🏠 Lê candles pela API do homelab, alimentada por um scraper MT5 contínuo "
-            "numa VM. Requer ACOES_API_URL configurada (st.secrets ou variável de ambiente) "
-            "e o scraper rodando — veja `scraper/README.md`."
-        )
-    elif source == "GitHub (MT5 de casa)":
-        last_update = fetch_snapshot_timestamp()
-        if last_update:
-            st.caption(f"📅 Última atualização: {pd.Timestamp(last_update).tz_convert('America/Sao_Paulo').strftime('%d/%m/%Y %H:%M:%S')}")
+    if source == "Homelab (API)":
+        if not daytrade_smc.ACOES_API_URL:
+            st.caption(
+                "⚠️ ACOES_API_URL não está configurada (st.secrets ou variável de "
+                "ambiente) — esta fonte vai dar erro. Use Yahoo Finance enquanto isso."
+            )
         else:
-            st.caption("Nenhuma atualização publicada ainda — clique no botão abaixo.")
-
-        if st.button("🔄 Atualizar via MT5 (casa)", use_container_width=True):
-            ok, msg = trigger_github_update()
-            if not ok:
-                st.error(msg)
+            ultima = _ultima_vela()
+            if ultima is None:
+                st.caption("🏠 API do homelab · não consegui ler o `/status` agora.")
             else:
-                st.cache_data.clear()
-                with st.spinner("Aguardando seu computador em casa processar (isso leva alguns segundos)..."):
-                    trigger_time = pd.Timestamp.now(tz="UTC")
-                    updated = False
-                    for _ in range(30):  # até ~90s de espera (30 x 3s)
-                        time.sleep(3)
-                        ts = fetch_snapshot_timestamp()
-                        if ts and pd.Timestamp(ts) > trigger_time:
-                            updated = True
-                            break
-                if updated:
-                    st.cache_data.clear()
-                    st.success("Dados atualizados!")
-                    st.rerun()
-                else:
-                    st.warning(
-                        "Não detectei a atualização em 90s. Confirme se o PC de casa está "
-                        "ligado, o MT5 aberto e logado, e o runner do GitHub Actions rodando. "
-                        "Pode levar mais tempo em alguns casos — tenta de novo em instantes."
-                    )
+                st.caption(
+                    "🏠 Última vela: "
+                    f"{ultima.tz_convert('America/Sao_Paulo').strftime('%d/%m/%Y %H:%M')} · "
+                    "congela com o mercado fechado, isso é o esperado."
+                )
 
     st.markdown("### Estilo de operação")
     style = st.radio(
@@ -1096,39 +1458,47 @@ with st.sidebar:
         help="Day Trade confirma em M15+H1 (posições no mesmo dia). "
              "Swing Trade confirma em Diário+Semanal (posições de dias a semanas), com H4 como contexto de timing de entrada.",
     )
-    conf_a, conf_b = STYLES[style]["confirmation"]
+    conf_a, conf_b = estilo(style)["confirmation"]
 
     st.markdown("### Modalidade")
     modality = st.selectbox(
         "Qual leitura usar como base da recomendação", MODALITY_CHOICES, key="modality_select",
-        help="Confluência combina as 4 categorias. SMC/Price Action/Médias Móveis/VWAP usam só a "
-             "leitura isolada daquela categoria. \"Todas as modalidades\" calcula um SCORE GERAL "
-             "(média das 5 leituras) e usa ele — não uma única leitura — pra decidir a confirmação "
-             "e ordenar o Scanner.",
+        help="Confluência combina as 4 categorias estruturais (SMC, Price Action, Médias Móveis, "
+             "VWAP). SMC/Price Action/Médias Móveis/VWAP/IFR usam só a leitura isolada daquela "
+             "categoria. O IFR é leitura de EXAUSTÃO, contrária por natureza: só aponta direção "
+             "em ≤10 ou ≥90, fica NEUTRO quase sempre (de propósito) e por isso NÃO entra nem na "
+             "Confluência nem no Score Geral. \"Todas as modalidades\" calcula um SCORE GERAL "
+             "(média das 5 leituras agregáveis) e usa ele — não uma única leitura — pra decidir "
+             "a confirmação e ordenar o Scanner.",
     )
 
-    st.markdown("### Ativos monitorados")
-    new_symbol = st.text_input("Adicionar ativo (ex: VALE3)", key="new_symbol_input")
-    if st.button("Adicionar", use_container_width=True) and new_symbol.strip():
-        value = new_symbol.strip().upper().replace(" ", "")
-        if value not in st.session_state.watchlist:
-            st.session_state.watchlist.append(value)
-            _persist_watchlist()
-        st.rerun()
-
+    # "Ativo para análise" fica SEMPRE visível — é o que se mexe todo dia.
+    # Gerenciar a watchlist é configuração de uma vez só, então desce pro
+    # expander. Separação sugerida pela auditoria do projeto original.
     if mode in ("Análise individual", "Verificação retroativa"):
+        st.markdown("### Ativo")
         st.selectbox("Ativo para análise", st.session_state.watchlist, key="symbol_select")
 
-    remove_symbol = st.selectbox("Remover ativo", ["—"] + st.session_state.watchlist, key="remove_symbol_select")
-    if st.button("Remover", use_container_width=True) and remove_symbol != "—":
-        st.session_state.watchlist = [s for s in st.session_state.watchlist if s != remove_symbol]
-        _persist_watchlist()
-        st.rerun()
+    with st.expander("Gerenciar watchlist", expanded=False):
+        st.caption(f"{len(st.session_state.watchlist)} ativo(s) monitorado(s)")
+        new_symbol = st.text_input("Adicionar ativo (ex: VALE3)", key="new_symbol_input")
+        if st.button("Adicionar", use_container_width=True) and new_symbol.strip():
+            value = new_symbol.strip().upper().replace(" ", "")
+            if value not in st.session_state.watchlist:
+                st.session_state.watchlist.append(value)
+                _persist_watchlist()
+            st.rerun()
 
-    if st.button("Restaurar lista padrão", use_container_width=True):
-        st.session_state.watchlist = DEFAULT_SYMBOLS.copy()
-        _persist_watchlist()
-        st.rerun()
+        remove_symbol = st.selectbox("Remover ativo", ["—"] + st.session_state.watchlist, key="remove_symbol_select")
+        if st.button("Remover", use_container_width=True) and remove_symbol != "—":
+            st.session_state.watchlist = [s for s in st.session_state.watchlist if s != remove_symbol]
+            _persist_watchlist()
+            st.rerun()
+
+        if st.button("Restaurar lista padrão", use_container_width=True):
+            st.session_state.watchlist = DEFAULT_SYMBOLS.copy()
+            _persist_watchlist()
+            st.rerun()
 
     st.markdown("### Perfil de análise")
     perfil = st.selectbox(
@@ -1137,8 +1507,23 @@ with st.sidebar:
              "guarda o perfil que o gerou, então dá pra comparar a assertividade de uma "
              "calibragem contra a outra no modo Assertividade.",
     )
-    params = _params_da_sessao()
-    st.caption(f"hash `{params.params_hash()[:8]}`" + ("" if params == st.session_state.perfis.get(perfil) else " · **alterado, não salvo**"))
+    # O estilo pode trocar os limiares do IFR (Swing opera 20/80, Day
+    # Trade 10/90) quando o perfil não escolheu os seus. A comparação
+    # do "alterado, não salvo" aplica o MESMO ajuste no perfil salvo,
+    # senão todo perfil apareceria como alterado em Swing sem ninguém
+    # ter mexido em nada.
+    params = params_para_estilo(_params_da_sessao(), style)
+    _salvo = st.session_state.perfis.get(perfil)
+    _alterado = _salvo is None or params != params_para_estilo(_salvo, style)
+    st.caption(f"hash `{params.params_hash()[:8]}`" + (" · **alterado, não salvo**" if _alterado else ""))
+    if (params.rsi_sobrevenda, params.rsi_sobrecompra) != (
+        _params_da_sessao().rsi_sobrevenda, _params_da_sessao().rsi_sobrecompra
+    ):
+        st.caption(
+            f"IFR ajustado pro estilo: exaustão em "
+            f"{params.rsi_sobrevenda:.0f}/{params.rsi_sobrecompra:.0f}. "
+            "Salve o perfil com outro par pra fixar."
+        )
 
     if params.normalizacao_score != params.filtro_isolada_score_max:
         st.warning(
@@ -1195,8 +1580,8 @@ with st.sidebar:
     st.markdown("### Parâmetros")
     st.caption(f"A recomendação exige **{TIMEFRAME_LABELS[conf_a]}** e **{TIMEFRAME_LABELS[conf_b]}** concordando "
               f"(ver \"Filtro multi-timeframe\" no rodapé). "
-              f"{', '.join(TIMEFRAME_LABELS[tf] for tf in STYLES[style]['context'])} aparece como contexto adicional.")
-    count = st.slider(STYLES[style]["count_label"], min_value=50, max_value=400, value=250, step=10)
+              f"{', '.join(TIMEFRAME_LABELS[tf] for tf in estilo(style)['context'])} aparece como contexto adicional.")
+    count = st.slider(estilo(style)["count_label"], min_value=50, max_value=400, value=250, step=10)
     risk_budget = st.number_input("Risco máximo (R$) — opcional", min_value=0.0, value=0.0, step=50.0)
     risk_budget = risk_budget if risk_budget > 0 else None
 
@@ -1223,13 +1608,27 @@ with st.sidebar:
 # Corpo principal
 # ========================================================================
 st.title("📊 Day Trade SMC — Análise Técnica")
-st.warning(
-    "⚠️ **Dados do Yahoo Finance com atraso de ~15-20 minutos.** Use esta ferramenta para "
-    "**viés e estrutura** (tendência, níveis, força relativa entre ativos) — **nunca para o "
-    "preço/timing exato de execução.** Antes de entrar numa operação, confirme o preço real "
-    "no ProfitChart ou na tela da sua corretora.",
-    icon="⏱️",
-)
+
+# O aviso ACOMPANHA a fonte. Fixo no texto do Yahoo, ele mentia toda vez que
+# a fonte era o homelab: anunciava 20 minutos de atraso num dado de poucos
+# segundos, e um aviso que mente é pior que nenhum — o usuário aprende a
+# ignorar a faixa amarela inteira.
+if source == "Homelab (API)":
+    st.warning(
+        "⚠️ **Dado real do MT5, com poucos segundos de atraso** — mas é **candle "
+        "fechado, não book.** Use para **viés e estrutura** (tendência, níveis, força "
+        "relativa entre ativos). Antes de entrar numa operação, confirme o preço e a "
+        "liquidez na tela da sua corretora.",
+        icon="🏠",
+    )
+else:
+    st.warning(
+        "⚠️ **Dados do Yahoo Finance com atraso de ~15-20 minutos.** Use esta ferramenta para "
+        "**viés e estrutura** (tendência, níveis, força relativa entre ativos) — **nunca para o "
+        "preço/timing exato de execução.** Antes de entrar numa operação, confirme o preço real "
+        "no ProfitChart ou na tela da sua corretora.",
+        icon="⏱️",
+    )
 
 if mode == "Análise individual":
     symbol = st.session_state.symbol_select
@@ -1262,14 +1661,38 @@ elif mode == "Scanner (todos os ativos)":
                 return "color: #ff5470; font-weight: 600"
             return "color: #8291a1"
 
+        def _color_exaustao(val):
+            if not val:
+                return "color: #8291a1"
+            cor = "#2ed3a3" if "↑" in str(val) else "#ff5470"
+            return f"color: {cor}; font-weight: 600"
+
+        vista = result_df
+        if "Exaustão" in result_df.columns:
+            n_exaustao = int((result_df["Exaustão"] != "").sum())
+            if n_exaustao:
+                st.caption(
+                    f"🎯 {n_exaustao} ativo(s) com exaustão de IFR. Exaustão simultânea em "
+                    "2+ timeframes é rara e vale mais que score alto isolado."
+                )
+                if st.checkbox("Só com exaustão de IFR", value=False, key="scan_f_exaustao"):
+                    vista = result_df[result_df["Exaustão"] != ""]
+
         st.dataframe(
-            result_df.style.map(_color_direction, subset=["Direção"]),
-            hide_index=True, use_container_width=True, height=min(450, 45 + 35 * len(result_df)),
+            vista.style.map(_color_direction, subset=["Direção"])
+                       .map(_color_exaustao, subset=["Exaustão"]),
+            hide_index=True, use_container_width=True, height=min(450, 45 + 35 * len(vista)),
+            column_config={
+                "Exaustão": st.column_config.TextColumn(
+                    "Exaustão IFR", width="small",
+                    help="Timeframes em exaustão simultânea na mesma direção",
+                ),
+            },
         )
 
         st.markdown("#### Abrir análise completa de um ativo")
         pick = st.selectbox("Ativo", result_df["Ativo"].tolist(), key="scanner_pick_select")
-        if st.button("Ver gráfico e as 5 leituras completas"):
+        if st.button("Ver gráfico e as 6 leituras completas"):
             st.session_state.jump_to_symbol = pick
             st.rerun()
     else:
@@ -1279,5 +1702,42 @@ elif mode == "Verificação retroativa":
     symbol = st.session_state.symbol_select
     render_retro_check(symbol, style, modality, source, count, params)
 
-else:  # Assertividade
+elif mode == "Assertividade":
     render_assertividade(sorted(st.session_state.perfis))
+
+else:  # Mini Índice (WINFUT)
+    # O mini índice NÃO existe no Yahoo: "WINFUT" atravessa `yahoo_symbol`
+    # intacto e o Yahoo devolve "símbolo não encontrado", que pareceria bug
+    # da ferramenta. Bloqueia antes de tentar, dizendo o que fazer.
+    if source != "Homelab (API)":
+        st.warning(
+            "O Mini Índice só existe pela **Homelab (API)** — ele vem do MetaTrader 5 "
+            "pelo scraper, e o Yahoo Finance não tem esse contrato. Troque a fonte na "
+            "barra lateral.",
+            icon="🏠",
+        )
+    elif WINFUT_SYMBOL not in st.session_state.watchlist:
+        st.warning(
+            f"**{WINFUT_SYMBOL}** ainda não está na watchlist, então o scraper não está "
+            "coletando as velas dele. Adicione em *Gerenciar watchlist* na barra lateral "
+            "e confira no scraper da VM se `SCRAPER_SYMBOL_MT5` aponta pro nome do "
+            "contrato no seu MT5 (contínuo `WIN$` ou o vencimento vigente).",
+            icon="📋",
+        )
+    else:
+        conf_win = ", ".join(TIMEFRAME_LABELS[tf] for tf in WINFUT_CONFIRMATION_TIMEFRAMES)
+        ctx_win = ", ".join(TIMEFRAME_LABELS[tf] for tf in WINFUT_CONTEXT_TIMEFRAMES)
+        st.caption(
+            f"📈 Contrato futuro do mini índice · leitura: {modality} · perfil: {perfil} · "
+            f"{count} candles · recomendação exige {conf_win} concordando · contexto: {ctx_win}"
+        )
+        st.info(
+            "**Contrato futuro, não é ação.** Alavancagem e horário de negociação são "
+            "diferentes, e o contrato vira de vencimento periodicamente — o histórico é "
+            "contínuo aqui porque o scraper traduz o nome, não porque o papel é o mesmo.",
+            icon="⚠️",
+        )
+        render_individual_analysis(
+            WINFUT_SYMBOL, WINFUT_STYLE, modality, source, count, risk_budget,
+            params_para_estilo(params, WINFUT_STYLE), perfil,
+        )

@@ -11,13 +11,17 @@ design por trás de cada peça.
 
 ## Por que isso existe
 
+*(Histórico: as fontes descritas abaixo, menos a Yahoo, foram removidas em
+2026-08-06 — ver a seção "A ponte GitHub, removida" no fim. Fica registrado
+porque é a motivação do pipeline inteiro.)*
+
 As três fontes de dados originais (`daytrade_smc.py`, `DATA_SOURCES`)
 tinham uma lacuna: "Yahoo Finance" funciona em qualquer lugar mas com
 15-20min de atraso; "MetaTrader 5" direto é tempo real mas só rodando na
 mesma máquina do terminal; "GitHub (MT5 de casa)" tentava ser uma ponte
 pra usar dado real do MT5 a partir da nuvem, mas nunca foi terminada
 (`mt5_bridge/update_data.py` e `data/mt5_snapshot.json`, que o workflow
-`.github/workflows/mt5-update.yml` espera, nunca existiram no repo) — e,
+`.github/workflows/mt5-update.yml` esperava, nunca existiram no repo) — e,
 mesmo terminada, seria só sob demanda (botão), não contínua.
 
 Com um homelab disponível, a solução deixa de depender do GitHub Actions e
@@ -269,6 +273,8 @@ Bootstrap da VM (OpenSSH Server, chave pública, NSSM) está em
 - [x] `make release` + `bootstrap/applications/acoes.yaml` — Application `Synced`/`Healthy`
 - [x] Migration PreSync rodou: `candles` (hypertable) + `watchlist` com 11 símbolos
 - [x] DNS de `acoes` e `acoes-api` — hoje por **Cloudflare Tunnel** (`cloudflared` como serviço systemd no host); o `cloudflare-ddns` está em `replicas: 0`
+- [x] **`deployment-analyzer.yaml`** (2026-08-04): worker no ar, `1/1 Running`, gate de pregão funcionando. Varredura única confere: 200 sinais = 10 símbolos × 4 timeframes × 5 leituras (o BRA50 falha, ver abaixo), e rerodar grava 0
+- [x] **Backfill histórico rodado** (2026-08-04): ~165 mil sinais reconstruídos das velas já guardadas, com desfecho resolvido — ver "Backfill" abaixo
 
 **Já feito na VM Windows:**
 
@@ -373,6 +379,88 @@ Volume esperado: ~2.090 linhas por pregão, ~110 MB por ano — irrelevante
 perto da `candles`. Por isso `signals` **não** é hypertable; a justificativa
 completa está no comentário da tabela em `backend/schema.sql`.
 
+## O fuso do servidor MT5 (correção de 2026-08-10)
+
+O `time` que o MT5 devolve em `copy_rates_from_pos` é o relógio **local do
+servidor** em formato epoch — o horário de parede como se fosse UTC, sem o
+offset. `_fetch_ohlcv_mt5` tratava isso como UTC de verdade, e o servidor da
+Clear roda em horário de Brasília (UTC-3). Resultado: **toda vela ingerida
+nascia 3 horas atrasada** em relação ao UTC verdadeiro. Não era estético: era
+a armadilha número um do worker (o corte de vela fechada) sendo derrotada
+sem ninguém mexer nela.
+
+**Como foi descoberto.** No `GET /status`, `last_ingested_at` avançava até
+~21:00 UTC (17:55 Brasília, fim do after-market) enquanto `last_candle_time`
+do M15 parava em 17:45Z — os dois só divergem se o tempo gravado não for o
+real. Confirmando, nos sinais M15 de `origem='worker'`, `criado_em −
+candle_time` era sistematicamente **~181 min** (3h + 1min) em todas as linhas:
+correto seria ~15 min (a vela analisada logo depois de fechar).
+
+**Por que isso corrompe os sinais ao vivo.** `ler_candles` corta "vela
+fechada" comparando `index + duracao <= now(UTC)`. Com os timestamps 3h
+atrasados, o `now()` real está sempre ~3h "à frente" do relógio armazenado, e
+a vela em formação passa no filtro assim que abre. O worker analisava cada
+vela M15 **~1 minuto depois de aberta**, e o `ON CONFLICT DO NOTHING`
+congelava aquela leitura pela metade como se fosse definitiva. Os sinais de
+`origem='worker'` (a medição "em tempo real") são, portanto, lixo: computados
+sobre vela ainda em formação. O `POST /analisar` e a análise individual do
+Streamlit também liam vela aberta durante o pregão, e os gráficos/legenda de
+frescor mostravam horários 3h fora.
+
+O que **não** foi corrompido: o backfill (`origem='backfill'`) reconstrói os
+sinais de velas **fechadas** do histórico — a análise em si é válida — e o D1
+escapou do bug de vela em formação só por timing do gate (o corte só passa com
+a vela do dia seguinte já aberta, quando o worker está dormindo). Mas ambos
+carregam `candle_time` 3h deslocado, autoconsistente enquanto só o MT5
+alimenta a estatística.
+
+**A correção** (em `daytrade_smc.py`, `_fetch_ohlcv_mt5`): interpretar o epoch
+como hora local do mercado e converter pra UTC, reusando o mesmo fuso do resto
+da pipeline (`LOCAL_TZ`/`MERCADO_TIMEZONE`) — em vez de adivinhar o offset do
+servidor em runtime, que não tem como distinguir "fuso" de "idade do último
+tick" num tick velho (fim de semana, after-market). Se a corretora trocar o
+fuso do servidor, mexe-se numa constante, não no pipeline.
+
+### Runbook — migrar o que já está gravado
+
+A ordem importa: a migração dos candles tem que rodar **antes** de subir o
+scraper corrigido, senão as velas recentes reenviadas com o timestamp correto
+colidem com as antigas no índice único `(symbol, timeframe, time)` e o UPDATE
+abaixo quebra. Com o mercado fechado:
+
+```sql
+-- 1. Alinha os candles antigos ao UTC verdadeiro (offset fixo: Brasília,
+--    sem DST desde 2019). Bijectivo no índice, não colide internamente.
+--    NÃO rode `UPDATE candles SET time = time + '3 hours'`: `time` é o eixo
+--    de partição da hypertable, e mover linhas entre chunks checa o índice
+--    único do chunk-alvo antes de a linha que ocupava o slot ser removida —
+--    cada par trocado dispara "duplicate key violates unique constraint
+--    ..._pkey" mesmo sem duplicata real (confira antes: 0 duplicatas nas
+--    41700 velas; a série é contínua e uniforme). O caminho é derrubar a PK,
+--    deslocar e recriar — a recriação re-valida a unicidade, então continua
+--    seguro contra colisão real:
+ALTER TABLE candles DROP CONSTRAINT candles_pkey;
+UPDATE candles SET time = time + interval '3 hours' WHERE source = 'MetaTrader 5';
+ALTER TABLE candles ADD CONSTRAINT candles_pkey PRIMARY KEY (symbol, timeframe, time);
+
+-- 2. Alinha o candle_time dos sinais antigos ao mesmo UTC. O desfecho de
+--    cada um foi avaliado sobre velas que também serão deslocadas, então a
+--    validade do resultado não muda — só o carimbo.
+UPDATE signals SET candle_time = candle_time + interval '3 hours'
+WHERE origem IN ('backfill', 'manual');
+
+-- 3. Sinais 'worker' são inservíveis (vela em formação) — apaga, não tenta
+--    consertar. Fica só o 'backfill' (válido, alinhado em 2).
+--    NÃO use analyzer.py --purgar-automaticos: ele também apaga o 'backfill'.
+DELETE FROM signals WHERE origem = 'worker';
+```
+
+Depois: `make release-scraper` (envia o `daytrade_smc.py` corrigido e
+reinicia o serviço na VM) e, por higiene, `make release` (a imagem do backend
+embute o mesmo arquivo). O volume da `candles` não tem watermark nem precisa:
+o upsert deduplica no próprio índice, agora com o mesmo timestamp dos dois
+lados.
+
 ## Backfill — por que o worker sozinho não basta
 
 `varrer()` analisa só a **última** vela fechada, então ele constrói o
@@ -408,10 +496,68 @@ Quatro decisões, todas com armadilha do outro lado:
 4. **Warm-up de 250 velas.** O motor calcula EMA200; numa fatia mais curta
    a leitura nasce degenerada e não seria produzida pela interface nunca.
 
+**Custo medido em 2026-08-04**: 169s e 15.000 linhas por ativo (4
+timeframes × 750 velas), ou ~31 min e ~165 mil linhas pra watchlist
+inteira. Rodar assim:
+
+```bash
+sudo k3s kubectl exec -n acoes deploy/analyzer -- python analyzer.py --backfill
+```
+
+É `ON CONFLICT DO NOTHING` como a varredura, então rerodar com uma janela
+maior (`--backfill-velas`) só acrescenta o que faltava.
+
 Consequência disso tudo numa consulta: `GET /signals` e `GET /signals/stats`
 passaram a janelar por **`candle_time`**, não por `criado_em`. Enquanto só
 o worker escrevia, em tempo real, os dois davam no mesmo; com o backfill um
 sinal de D1 de 2022 gravado hoje cairia no recorte de "últimos 7 dias".
+
+## Geração em massa, abandonada em 2026-08-06
+
+O backfill acima funcionou — 165 mil sinais reconstruídos, base grande o
+bastante pra medir de verdade. E a medição foi o que derrubou a própria
+abordagem: com os 81 mil sinais resolvidos analisados, a confirmação
+multi-timeframe mediu **pior** que sua ausência (37,0% de acerto confirmado
+contra 42,1% não confirmado, z=-10,7, nas 5 leituras sem exceção) e a faixa
+de score 80+ — a que ganhava 🌟 na interface — foi a **segunda pior** em
+expectativa. Nada que a varredura automática gravava provou, na prática,
+separar sinal bom de ruim.
+
+E o volume não vinha de onde parecia. Contando por origem:
+
+| Origem | Linhas | Das quais `SEM_SINAL` |
+|---|---:|---:|
+| `backfill` | 150.000 | ~71.000 (reconstrução de todo candle, mesmo sem leitura operável) |
+| `worker` | 2.300 (poucos dias ao vivo) | 1.307 (57%) |
+| `manual` | 0 | — (o botão de salvar nunca foi clicado) |
+
+Mais da metade do que o worker gravava automaticamente era `SEM_SINAL`
+(NEUTRO ou sem entrada) — já excluído de toda estatística de assertividade
+(`resultado NOT IN ('SEM_SINAL', 'SEM_ENTRADA')` em `_STATS_BASE`), só
+inflando a tabela sem entrar em nenhuma conta.
+
+**Decisão:** parar de gerar sinal em escala e voltar pra curadoria do
+operador. Três mudanças, todas em `backend/analyzer.py`:
+
+1. `varrer()` e `backfill()` **não gravam mais `SEM_SINAL`** — pulam o
+   INSERT quando a leitura é NEUTRO ou não tem entrada, em vez de gravar e
+   deixar a consulta filtrar depois. Corta o volume automático em mais da
+   metade sem presumir nenhum critério de "sinal bom" — só para de logar
+   não-evento.
+2. `analyzer.py --purgar-automaticos` apaga (`DELETE`, irreversível) todo
+   `origem IN ('worker', 'backfill')`. Não toca em `manual`. Rodado uma vez,
+   à mão, depois do release desta mudança — não é rotina, é a limpeza da
+   abordagem anterior.
+3. O botão "💾 Salvar sinal" da interface, que nunca tinha sido usado, saiu
+   de dentro de um expander de detalhe pra um botão em destaque logo abaixo
+   do veredito de cada análise — vira o mecanismo principal de geração de
+   sinal, não mais um acessório.
+
+O worker **continua rodando** (não foi desligado) — ele segue varrendo a
+watchlist e alimentando Scanner/Análise individual, que sempre calcularam
+ao vivo e nunca dependeram da tabela `signals`. O que mudou é só o que ele
+persiste como histórico rastreável: sinal operável, sim; ruído de leitura
+neutra, não.
 
 ## Endpoints (referência rápida)
 
@@ -475,33 +621,55 @@ por símbolo removido não expressa isso atomicamente.
 | `MERCADO_FECHAMENTO_HORA` | scraper | `19` | fim da janela (exclusivo); folga proposital pra cobrir after-market e fechamento do D1 |
 | `MERCADO_FECHADO_SLEEP_SECONDS` | scraper | `300` | intervalo do loop fora do pregão |
 
-## O que fica obsoleto (mantido, não removido)
+## A ponte GitHub, removida em 2026-08-06
 
 `_fetch_ohlcv_github`, `trigger_github_update`, `fetch_snapshot_timestamp`,
 os globais `GITHUB_BRIDGE_REPO`/`GITHUB_BRIDGE_TOKEN` e
-`.github/workflows/mt5-update.yml` continuam no repo, intocados. Remover é
-uma decisão separada, ainda não tomada.
+`.github/workflows/mt5-update.yml` **saíram do repo**. A decisão que este
+documento registrava como pendente foi tomada.
 
-## O que falta pro analyzer entrar em produção
+O que decidiu não foi só "o homelab substituiu": é que a ponte **nunca
+funcionou**. Ela lia `data/mt5_snapshot.json`, escrito por
+`mt5_bridge/update_data.py`, e nenhum dos dois jamais existiu neste
+repositório. O seletor de fonte oferecia a opção, e o botão "Atualizar via
+MT5 (casa)" disparava um workflow sem script, esperava 90 segundos e depois
+sugeria que o problema era o PC de casa estar desligado. Código morto se
+ignora; código que erra o diagnóstico ativamente, não.
 
-O código e a imagem estão prontos; o que falta mora no **repo `homelab`**,
-que este repo não pode tocar. Em `applications/acoes/`, um
-`deployment-analyzer.yaml` novo, partindo de uma cópia do `deployment-api.yaml`:
+Junto saíram a GUI Tkinter de `daytrade_smc.py` (~490 linhas, sem chamador
+desde que o Streamlit existe) e a opção `"MetaTrader 5"` do seletor da web.
+**O ramo `source == "MetaTrader 5"` de `fetch_ohlcv` continua lá** — é por
+onde o scraper ingere, e virou seu único chamador. `DATA_SOURCES` passou a
+ser o menu da interface, não a tabela de despacho; o comentário em cima dela
+diz isso, porque a distância entre as duas coisas é justamente onde alguém
+"limpando" mataria a ingestão inteira.
 
-- `metadata.name: analyzer`, `command: ["python", "analyzer.py"]`
-- **remover** `ports`, `readinessProbe` e `livenessProbe` — não sobe servidor HTTP
-- **manter na ordem** o trio `DATABASE_USER` → `DATABASE_PASSWORD` → `DATABASE_URL`
-  (a expansão de `$(VAR)` do Kubernetes depende dela)
-- acrescentar as `ANALYZER_*` e `MERCADO_*` da tabela de variáveis acima
-- `replicas: 1` + `strategy: {type: Recreate}` — dois analyzers não corrompem
-  nada (o índice único protege), só dobram trabalho à toa
-- `resources: requests {cpu: 200m, memory: 384Mi}, limits {memory: 1Gi}` —
-  pandas precisa de mais folga que os 384Mi da api
-- **nada** em `service-*.yaml`, `gateway.yaml` ou `virtualservice.yaml`
+## O analyzer no cluster
 
-O `sed` do alvo `manifests:` do Makefile já reescreve `image: acoes-backend:`
-em todo `*.yaml` da pasta, então o arquivo novo é carimbado sozinho — não há
-alvo novo pra criar.
+O manifest é `homelab/applications/acoes/deployment-analyzer.yaml`, cópia do
+`deployment-api.yaml` com quatro diferenças que **não** são cosméticas:
+
+- `command: ["python", "analyzer.py"]` — quarto entrypoint da mesma imagem
+- **sem** `ports`, `readinessProbe`, `livenessProbe` nem Service: não sobe
+  servidor HTTP, e uma probe herdada por cópia poria o pod em CrashLoop
+  esperando um `/health` que não existe
+- **sem** `ACOES_API_KEY`: o analyzer fala SQL direto (ele *é* o backend) e
+  nunca chama a api. Herdar a chave sugeriria que ele é cliente dela
+- `strategy: {type: Recreate}` e `resources: requests {cpu: 200m, memory:
+  384Mi}, limits {memory: 1Gi}` — pandas precisa de mais folga que os 384Mi
+  da api; dois analyzers não corrompem nada (o índice único protege), só
+  dobram trabalho à toa
+
+Mantido do original, e igualmente obrigatório: a ordem `DATABASE_USER` →
+`DATABASE_PASSWORD` → `DATABASE_URL`, de que a expansão de `$(VAR)` do
+Kubernetes depende.
+
+O `sed` do alvo `manifests:` do Makefile reescreve `image: acoes-backend:`
+em todo `*.yaml` da pasta, então o arquivo é carimbado sozinho — não há alvo
+novo pra criar. **Cuidado ao acrescentar outro manifest:** o alvo `publish`
+decide se há o que publicar com `git diff --quiet`, que **não enxerga
+arquivo novo não rastreado**. Num release em que a tag não mude, o arquivo
+novo seria ignorado em silêncio.
 
 **Custo da imagem, medido em 2026-08-04**: `acoes-backend` foi pra **536 MB**,
 dos quais 279 MB são a camada do `pip install`; `pandas` (68 MB), `numpy`
@@ -511,6 +679,14 @@ que é justamente por que eles continuam numa imagem só, e não em duas.
 
 ## Fase opcional (não bloqueia o pipeline funcionando)
 
-Legenda de "última atualização" na sidebar usando `GET /status`; rotação de
-log do scraper; incluir o database `daytrade` na rotina de backup do
-`homelab/backup/`.
+Rotação de log do scraper; incluir o database `daytrade` na rotina de backup
+do `homelab/backup/`.
+
+- [x] **Legenda de frescor na sidebar** (2026-08-06): `fetch_last_candle_time()`
+  em `daytrade_smc.py` lê `GET /status` e devolve a vela mais recente de
+  qualquer par. Lê `last_candle_time`, **não `last_ingested_at`** — pelo
+  motivo documentado no endpoint: `last_ingested_at` é "última vez que o dado
+  mudou" e congela com o mercado fechado, então uma legenda montada em cima
+  dele acusaria scraper morto toda noite e todo fim de semana. Devolve `None`
+  em qualquer falha, porque isso alimenta uma legenda e uma legenda não pode
+  derrubar a sidebar — sem a API, a fonte Yahoo continua utilizável.

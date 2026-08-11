@@ -717,7 +717,7 @@ def get_signal_stats(
 # velas. Divergir aqui produziria duas respostas diferentes pra mesma vela,
 # sem nada na resposta explicando a diferença.
 _ANALISE_TIMEFRAMES_PADRAO = ("M15", "H1", "H4", "D1")
-_ANALISE_COUNTS = {"M15": 250, "H1": 250, "H4": 150, "D1": 250, "W1": 250}
+_ANALISE_COUNTS = {"M2": 300, "M5": 300, "M15": 250, "H1": 250, "H4": 150, "D1": 250, "W1": 250}
 
 # `origem` que NUNCA existe na tabela `signals` — esta rota não grava nada. O
 # valor viaja no payload porque `signal_payload` monta o corpo inteiro de uma
@@ -755,13 +755,16 @@ def _params_do_perfil(conn, nome: str | None) -> tuple[str, AnalysisParams]:
     summary="Rodar a análise técnica de uma ação agora",
     description=(
         "Roda o motor AGORA sobre os dados já coletados e devolve, por timeframe, as "
-        "cinco leituras (Confluência, SMC, Price Action, Médias Móveis, VWAP) com "
+        "seis leituras (Confluência, SMC, Price Action, Médias Móveis, VWAP, IFR) com "
         "direção, score, entrada, stop e alvos. É a tool para 'como está a VALE3?' ou "
         "'tem entrada em PETR4?'.\n\n"
         "O que a resposta significa:\n"
         "- `mtf_confirmado` é o que separa um sinal sério de um ruído: só é true quando "
         "os dois timeframes de confirmação concordam na mesma direção naquela "
         "modalidade. Sem ele, trate a leitura como fraca mesmo com score alto.\n"
+        "- `IFR` só opera em EXAUSTÃO (≤10 ou ≥90 por padrão), então NEUTRO é a resposta "
+        "quase sempre — isso é o desenho, não falta de dado. Quando ele dispara, é raro "
+        "e vale mais que as outras leituras isoladas.\n"
         "- `direcao` NEUTRO com `entrada` nula é resposta legítima e comum: quer dizer "
         "que não há entrada, não que faltou dado.\n"
         "- `erros` lista os timeframes que não puderam ser analisados e por quê.\n\n"
@@ -805,14 +808,26 @@ def analisar(body: AnaliseIn, conn: Connection = Depends(get_conn)) -> AnaliseRe
     # timeframes discordam, mas porque ninguém olhou —, e um false que
     # significa "não sei" no mesmo campo que um false que significa "não
     # concordam" é pior que não ter o campo.
-    a_analisar = list(dict.fromkeys([*pedidos, *DAYTRADE_CONFIRMATION_TIMEFRAMES]))
+    #
+    # O Diário entra pela MESMA razão, agora que o IFR dele filtra as
+    # leituras dos outros prazos (ver `rsi_signal`): sem ele, esta rota
+    # devolveria pro agente uma leitura de IFR diferente da que a
+    # interface mostra pro mesmo candle. Ele vem PRIMEIRO na lista porque
+    # o valor precisa existir antes de ser injetado nos demais.
+    a_analisar = list(dict.fromkeys(["D1", *pedidos, *DAYTRADE_CONFIRMATION_TIMEFRAMES]))
 
     analisado: dict[str, tuple] = {}
     erros: dict[str, str] = {}
+    daily_rsi: float | None = None
     for timeframe in a_analisar:
         try:
             df = ler_candles(conn, symbol, timeframe, _ANALISE_COUNTS[timeframe])
-            analisado[timeframe] = analyze(df, params)
+            contexto, sinais = analyze(
+                df, params, higher_rsi=None if timeframe == "D1" else daily_rsi
+            )
+            analisado[timeframe] = (contexto, sinais)
+            if timeframe == "D1":
+                daily_rsi = contexto.rsi
         except Exception as exc:  # noqa: BLE001 — um timeframe sem dado não derruba os outros
             erros[timeframe] = str(exc)
 

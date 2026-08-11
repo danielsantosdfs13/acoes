@@ -10,7 +10,7 @@
 -- do Timescale de a coluna de particionamento (time) estar na chave.
 CREATE TABLE IF NOT EXISTS candles (
     symbol      TEXT             NOT NULL,
-    timeframe   TEXT             NOT NULL,   -- 'M15' | 'H1' | 'H4' | 'D1' | 'W1'
+    timeframe   TEXT             NOT NULL,   -- 'M2' | 'M5' | 'M15' | 'H1' | 'H4' | 'D1' | 'W1'
     time        TIMESTAMPTZ      NOT NULL,   -- UTC, mesmo índice que fetch_ohlcv já produz
     open        DOUBLE PRECISION NOT NULL,
     high        DOUBLE PRECISION NOT NULL,
@@ -120,7 +120,7 @@ ON CONFLICT (nome) DO NOTHING;
 -- perfil que os tivesse mudado. O R realizado fica gravado por linha.
 --
 -- NÃO é hypertable, de propósito. O volume é de ~2 mil linhas por pregão
--- (11 símbolos × 4 timeframes × 5 modalidades, uma linha por VELA e não
+-- (11 símbolos × 4 timeframes × 6 modalidades, uma linha por VELA e não
 -- por varredura), ~110 MB por ano. Chunk do Timescale é dimensionado pra
 -- milhões de linhas — a lição de 2026-08 na `candles` logo acima foi
 -- exatamente essa: 213 chunks pra 40 mil linhas custaram 150 ms de
@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS signals (
     id                BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     symbol            TEXT        NOT NULL,
     timeframe         TEXT        NOT NULL,
-    modalidade        TEXT        NOT NULL,   -- Confluência | SMC | Price Action | Médias Móveis | VWAP
+    modalidade        TEXT        NOT NULL,   -- Confluência | SMC | Price Action | Médias Móveis | VWAP | IFR
     candle_time       TIMESTAMPTZ NOT NULL,   -- UTC, abertura da vela FECHADA que gerou o sinal
     perfil            TEXT        NOT NULL REFERENCES analysis_profiles(nome),
     params_hash       TEXT        NOT NULL,
@@ -159,12 +159,24 @@ CREATE TABLE IF NOT EXISTS signals (
     detalhes          JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- motivos, alertas, alvos alternativos
     criado_em         TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- Desfecho, preenchido pelo segundo passe do analyzer.
-    resultado             TEXT,               -- ALVO_1 | ALVO_2 | STOP | EM_ABERTO | SEM_SINAL
+    resultado             TEXT,               -- ALVO_1 | ALVO_2 | STOP | EM_ABERTO | SEM_SINAL | SEM_ENTRADA
     resultado_detalhe     TEXT,
     candles_ate_resultado INT,
     avaliado_em           TIMESTAMPTZ,
-    avaliado_ate          TIMESTAMPTZ         -- até que vela o desfecho foi conferido
+    avaliado_ate          TIMESTAMPTZ,        -- até que vela o desfecho foi conferido
+    -- Execução real (2026-08-06). `entrada` é o FECHAMENTO da vela do sinal;
+    -- `preco_fill` é a ABERTURA da vela seguinte, que é onde uma ordem a
+    -- mercado disparada pelo sinal realmente executaria. Os dois divergem
+    -- exatamente nos gaps — e era ali que o modelo antigo se dava um preço
+    -- que ninguém conseguiu. `r_realizado` já vem líquido de custo.
+    preco_fill            DOUBLE PRECISION,
+    r_realizado           DOUBLE PRECISION
 );
+
+-- Colunas novas em base já existente: o schema é aplicado por `migrate.py` a
+-- cada deploy e precisa ser idempotente, então nada de recriar a tabela.
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS preco_fill  DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS r_realizado DOUBLE PRECISION;
 
 -- ÚNICO índice obrigatório: é a chave de deduplicação E o alvo do
 -- ON CONFLICT do worker. Sem ele, (a) o worker recriaria a mesma linha a

@@ -4,9 +4,13 @@ scraper/scraper.py
 Roda continuamente na VM Windows onde o terminal MetaTrader 5 está aberto
 e logado. A cada `POLL_INTERVAL_SECONDS`, busca as últimas velas de cada
 símbolo/timeframe da watchlist via `daytrade_smc.fetch_ohlcv(...,
-source="MetaTrader 5")` — a mesma função já usada pelo modo "MetaTrader 5"
-do app, sem reimplementar nada da conexão com o MT5 — e envia pro
-processor via HTTP POST /candles.
+source="MetaTrader 5")` — sem reimplementar nada da conexão com o MT5 — e
+envia pro processor via HTTP POST /candles.
+
+Este é hoje o ÚNICO chamador de `source="MetaTrader 5"`. A opção saiu do
+seletor da interface web (a web nunca roda na máquina com o terminal
+aberto), mas o ramo continua em `fetch_ohlcv` justamente por causa daqui —
+ver o comentário de `DATA_SOURCES` em daytrade_smc.py.
 
 Sem watermark de "o que já foi enviado": `copy_rates_from_pos(..., 0,
 count)` sempre inclui a vela ainda em formação, cujo OHLC muda a cada tick
@@ -55,7 +59,9 @@ from config import (  # noqa: E402
     POLL_INTERVAL_SECONDS,
     PROCESSOR_URL,
     REQUEST_TIMEOUT_SECONDS,
+    SCRAPER_SYMBOL_MT5,
     SCRAPER_TIMEFRAMES,
+    SCRAPER_TIMEFRAMES_POR_SYMBOL,
     TRAILING_WINDOW,
     WATCHLIST_REFRESH_SECONDS,
 )
@@ -119,10 +125,15 @@ def _refresh_watchlist(fallback: list[str]) -> list[str]:
 
 
 def _post_candles(symbol: str, timeframe: str) -> None:
+    # Busca pelo ticker do MT5, publica pelo nome lógico. Os dois só
+    # diferem no mini índice (ver SCRAPER_SYMBOL_MT5): é o que permite o
+    # contrato rolar de vencimento sem partir a série no banco.
+    ticker = SCRAPER_SYMBOL_MT5.get(symbol.upper(), symbol)
     try:
-        df = fetch_ohlcv(symbol, timeframe, TRAILING_WINDOW, source="MetaTrader 5")
+        df = fetch_ohlcv(ticker, timeframe, TRAILING_WINDOW, source="MetaTrader 5")
     except Exception as exc:
-        log.warning("Falha ao buscar %s/%s no MT5: %s", symbol, timeframe, exc)
+        alias = f" (MT5: {ticker})" if ticker != symbol else ""
+        log.warning("Falha ao buscar %s/%s%s no MT5: %s", symbol, timeframe, alias, exc)
         return
 
     candles = [
@@ -178,7 +189,7 @@ def main() -> None:
             continue
 
         for symbol in watchlist:
-            for timeframe in SCRAPER_TIMEFRAMES:
+            for timeframe in SCRAPER_TIMEFRAMES_POR_SYMBOL.get(symbol.upper(), SCRAPER_TIMEFRAMES):
                 _post_candles(symbol, timeframe)
 
         time.sleep(POLL_INTERVAL_SECONDS)

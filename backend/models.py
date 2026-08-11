@@ -190,7 +190,7 @@ class AnaliseIn(BaseModel):
     symbol: str
     timeframes: list[str] | None = None   # default: os quatro varridos pelo worker
     perfil: str | None = None             # default: 'padrão'
-    modalidade: str | None = None         # default: todas as cinco
+    modalidade: str | None = None         # default: todas as seis
 
 
 class AnaliseResponse(BaseModel):
