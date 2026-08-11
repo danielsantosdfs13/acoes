@@ -56,6 +56,8 @@ from models import (
     AnaliseResponse,
     CandleOut,
     CandlesResponse,
+    FeedbackIn,
+    FeedbackOut,
     ProfileAtivoIn,
     ProfileOut,
     ProfileIn,
@@ -69,6 +71,7 @@ from models import (
     SymbolStatus,
     WatchlistReplace,
     WatchlistResponse,
+    WebhookPayload,
 )
 
 # `candles.py` já fez o `sys.path.insert` que põe a raiz do repo no caminho —
