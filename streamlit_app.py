@@ -4,16 +4,19 @@ streamlit_app.py
 Interface WEB para o motor de análise em `daytrade_smc.py`. Não tem lógica
 de análise nenhuma — só importa as funções do motor e desenha por cima.
 
-Quatro modos (seletor no topo do corpo, não na barra lateral — desde 2026-08-06):
-    - Análise individual: gráfico de candles com EMAs/VWAP/swings/BOS-CHoCH/
-      zonas de FVG, mais os painéis das 6 leituras. Pode auto-atualizar.
-    - Scanner: roda a análise em TODOS os ativos da watchlist de uma vez e
-      mostra um ranking pelo score geral, com atalho pra abrir qualquer um
-      na análise individual.
-    - Verificação retroativa: roda a análise numa data passada usando só o
-      que se sabia até lá, e confere o desfecho nos candles seguintes.
-    - Assertividade: taxa de acerto e expectativa em R do histórico de
-      sinais gravado. Depende da API do homelab — é onde o histórico mora.
+Seis rotas, agrupadas em quatro pills no topo do corpo. Cada uma tem URL
+própria (`st.navigation` + `st.Page`), então recarregar, favoritar e o
+voltar/avançar do navegador funcionam — ver o bloco "Rotas" mais abaixo.
+
+    🎯 Oportunidades  /               os melhores sinais operáveis agora
+    🔍 Scanner        /scanner        a watchlist inteira, ranqueada
+    📈 Ativo          /ativo          gráfico + as 6 leituras de um ativo
+                      /retroativa     como o sinal teria se saído numa data
+    📋 Sinais         /acompanhar     triagem do que o worker gravou
+                      /assertividade  taxa de acerto medida do histórico
+
+O Mini Índice não tem rota própria: `WINFUT` é uma opção do seletor de ativo,
+e `/ativo` troca sozinho para os timeframes dele.
 
 Rodar:
     streamlit run streamlit_app.py
@@ -30,9 +33,6 @@ import streamlit as st
 
 import daytrade_smc
 from daytrade_smc import (
-    save_feedback,
-    fetch_feedback,
-    
     ALL_MODALITIES_OPTION,
     AnalysisParams,
     DATA_SOURCES,
@@ -62,7 +62,6 @@ from daytrade_smc import (
     rsi_extremes_across_timeframes,
     save_profile,
     save_symbols,
-    yahoo_symbol,
 )
 
 # Configura a API do homelab (serviço `api`, que serve o TimescaleDB
@@ -115,16 +114,52 @@ def estilo(nome: str) -> dict:
 
 st.set_page_config(page_title="Day Trade SMC", page_icon="📊", layout="wide")
 
+# Paleta única do app. Antes destes nomes, os mesmos quatro hexes estavam
+# copiados como literal em nove lugares (cards, styler do Scanner, veredito,
+# badge de IFR, caixa de desfecho da retroativa, linha de feedback...), então
+# mexer numa cor exigia caçar todas as cópias e sempre sobrava uma.
+# Os mesmos valores estão em `.streamlit/config.toml`, que declara o tema
+# escuro que `build_chart` já assumia — mudar aqui pede mudar lá.
+PALETA = {
+    "compra": "#2ed3a3",
+    "venda": "#ff5470",
+    "neutro": "#8291a1",
+    "alerta": "#f0b429",
+    "fundo": "#0a0e13",
+    "texto": "#e7ecf1",
+    # séries do gráfico — sem leitura semântica, só precisam ser distinguíveis
+    "ema_9": "#5ec8ff",
+    "ema_21": "#a78bfa",
+    "ema_200": "#ff8a3d",
+}
+
 DIRECTION_COLOR = {
-    Direction.BUY: "#2ed3a3",
-    Direction.SELL: "#ff5470",
-    Direction.NEUTRAL: "#8291a1",
+    Direction.BUY: PALETA["compra"],
+    Direction.SELL: PALETA["venda"],
+    Direction.NEUTRAL: PALETA["neutro"],
 }
 
 SOURCE_LABELS = {
     "Homelab (API)": "Homelab (API, quase em tempo real)",
     "Yahoo Finance": "Yahoo Finance (atraso ~15-20min)",
 }
+
+
+def _chips(fatos: list[tuple[str, str]]) -> None:
+    """Os fatos da tela como etiquetas, num bloco só.
+
+    Existe porque cada view abria com uma `st.caption` de seis a oito fatos
+    concatenados por "·" — uma frase longa em fonte pequena, que é o formato
+    em que ninguém lê o quarto item. Como rótulo curto + valor em negrito,
+    o olho acha o que procura sem ler o resto."""
+    marcacao = "".join(
+        f'<span style="display:inline-block; margin:0 6px 8px 0; padding:2px 9px; '
+        f'border-radius:10px; background:{PALETA["neutro"]}22; font-size:12px; '
+        f'white-space:nowrap;"><span style="opacity:.65">{rotulo}</span> '
+        f"<b>{valor}</b></span>"
+        for rotulo, valor in fatos if valor not in (None, "")
+    )
+    st.markdown(marcacao, unsafe_allow_html=True)
 
 # Folga entre ativos no Scanner, cobrada SÓ do Yahoo — é a única fonte com
 # rate limit. A API do homelab é uma chamada de rede local; pagar essa pausa
@@ -274,12 +309,13 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
     fig.add_trace(
         go.Candlestick(
             x=x, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-            name=symbol, increasing_line_color="#2ed3a3", decreasing_line_color="#ff5470",
-            increasing_fillcolor="#2ed3a3", decreasing_fillcolor="#ff5470",
+            name=symbol, increasing_line_color=PALETA["compra"], decreasing_line_color=PALETA["venda"],
+            increasing_fillcolor=PALETA["compra"], decreasing_fillcolor=PALETA["venda"],
         )
     )
 
-    ema_colors = {"ema_9": "#5ec8ff", "ema_21": "#a78bfa", "ema_50": "#f0b429", "ema_200": "#ff8a3d"}
+    ema_colors = {"ema_9": PALETA["ema_9"], "ema_21": PALETA["ema_21"],
+                  "ema_50": PALETA["alerta"], "ema_200": PALETA["ema_200"]}
     for col, color in ema_colors.items():
         fig.add_trace(
             go.Scatter(x=x, y=context.emas[col], mode="lines", name=col.upper().replace("_", " "),
@@ -288,7 +324,7 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
 
     fig.add_trace(
         go.Scatter(x=x, y=context.vwap_series, mode="lines", name="VWAP",
-                   line=dict(color="#2ed3a3", width=1.6, dash="dot"))
+                   line=dict(color=PALETA["compra"], width=1.6, dash="dot"))
     )
 
     swing_highs = [(x[s.index], s.price) for s in context.swings if s.kind == "HIGH"]
@@ -296,15 +332,15 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
     if swing_highs:
         fig.add_trace(go.Scatter(
             x=[p[0] for p in swing_highs], y=[p[1] for p in swing_highs], mode="markers",
-            name="Swing High", marker=dict(symbol="triangle-down", size=7, color="#ff5470"),
+            name="Swing High", marker=dict(symbol="triangle-down", size=7, color=PALETA["venda"]),
         ))
     if swing_lows:
         fig.add_trace(go.Scatter(
             x=[p[0] for p in swing_lows], y=[p[1] for p in swing_lows], mode="markers",
-            name="Swing Low", marker=dict(symbol="triangle-up", size=7, color="#2ed3a3"),
+            name="Swing Low", marker=dict(symbol="triangle-up", size=7, color=PALETA["compra"]),
         ))
 
-    for kind, symb, color in [("BOS", "diamond", "#f0b429"), ("CHOCH", "star", "#ffffff")]:
+    for kind, symb, color in [("BOS", "diamond", PALETA["alerta"]), ("CHOCH", "star", "#ffffff")]:
         pts = [e for e in context.events if e.kind == kind]
         if not pts:
             continue
@@ -312,7 +348,7 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
             x=[x[e.index] for e in pts],
             y=[df["high"].iloc[e.index] * 1.003 if e.direction == Direction.BUY else df["low"].iloc[e.index] * 0.997 for e in pts],
             mode="markers+text", name=kind,
-            marker=dict(symbol=symb, size=11, color=color, line=dict(width=1, color="#0a0e13")),
+            marker=dict(symbol=symb, size=11, color=color, line=dict(width=1, color=PALETA["fundo"])),
             text=[kind] * len(pts), textposition="top center", textfont=dict(size=9, color=color),
         ))
 
@@ -320,7 +356,7 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
     # pra DESENHAR — senão o gráfico mostra uma zona que o score não enxerga.
     fvg = find_fvg_zone(df, context.params.fvg_max_idade)
     if fvg is not None:
-        color = "#2ed3a3" if fvg["kind"] == "ALTA" else "#ff5470"
+        color = PALETA["compra"] if fvg["kind"] == "ALTA" else PALETA["venda"]
         fig.add_shape(
             type="rect", xref="x", yref="y",
             x0=x[fvg["start_idx"]], x1=x[-1],
@@ -334,8 +370,8 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
 
     if active_signal is not None and active_signal.risk.entry is not None:
         r = active_signal.risk
-        levels = [("Entrada", r.entry, "#e7ecf1"), ("Stop", r.stop, "#ff5470"),
-                  ("Alvo 1", r.target_1, "#2ed3a3"), ("Alvo 2", r.target_2, "#2ed3a3")]
+        levels = [("Entrada", r.entry, PALETA["texto"]), ("Stop", r.stop, PALETA["venda"]),
+                  ("Alvo 1", r.target_1, PALETA["compra"]), ("Alvo 2", r.target_2, PALETA["compra"])]
         for label, price, color in levels:
             if price is None:
                 continue
@@ -345,11 +381,11 @@ def build_chart(context, active_signal: Signal | None, symbol: str) -> go.Figure
 
     fig.update_layout(
         template="plotly_dark",
-        paper_bgcolor="#0a0e13", plot_bgcolor="#0a0e13",
+        paper_bgcolor=PALETA["fundo"], plot_bgcolor=PALETA["fundo"],
         height=560, margin=dict(l=10, r=10, t=30, b=10),
         xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
-        font=dict(family="IBM Plex Mono, monospace", size=11, color="#8291a1"),
+        font=dict(family="IBM Plex Mono, monospace", size=11, color=PALETA["neutro"]),
     )
     return fig
 
@@ -394,15 +430,14 @@ def _salvar_sinal(signal: Signal, symbol: str, timeframe: str, context, mtf, par
 
 
 def render_signal_panel(signal: Signal, symbol: str, risk_budget: float | None, timeframe: str = "", context=None, mtf=None, params: AnalysisParams = DEFAULT_PARAMS, perfil: str = DEFAULT_PROFILE_NAME) -> None:
-    color = DIRECTION_COLOR[signal.direction]
     q = quality(signal.score, params)
 
     if q == "OPORTUNIDADE EXCEPCIONAL" and signal.direction != Direction.NEUTRAL:
         action = "COMPRA" if signal.direction == Direction.BUY else "VENDA"
         st.markdown(
-            f'<div style="border:2px solid #f0b429; border-radius:8px; padding:10px 16px; '
-            f'background:#f0b42922; margin-bottom:12px; text-align:center;">'
-            f'<span style="font-size:18px;">🌟 <b style="color:#f0b429;">OPORTUNIDADE EXCEPCIONAL</b> · '
+            f'<div style="border:2px solid {PALETA["alerta"]}; border-radius:8px; padding:10px 16px; '
+            f'background:{PALETA["alerta"]}22; margin-bottom:12px; text-align:center;">'
+            f'<span style="font-size:18px;">🌟 <b style="color:{PALETA["alerta"]};">OPORTUNIDADE EXCEPCIONAL</b> · '
             f'{action} · score {signal.score:.1f}/100</span>'
             f'</div>',
             unsafe_allow_html=True,
@@ -560,9 +595,9 @@ def render_veredito(mtf, confirmation: tuple[str, str], symbol: str, risk_budget
     # ---- caminho 1: sem leitura operável no timeframe de entrada ----
     if plano is None or risk is None or risk.entry is None:
         st.markdown(
-            f'<div style="border-left:4px solid #8291a1; border-radius:4px; padding:14px 18px; '
-            f'background:#8291a114; margin-bottom:16px;">'
-            f'<div style="font-size:20px; font-weight:600; color:#8291a1;">SEM OPERAÇÃO EM {symbol}</div>'
+            f'<div style="border-left:4px solid {PALETA["neutro"]}; border-radius:4px; padding:14px 18px; '
+            f'background:{PALETA["neutro"]}14; margin-bottom:16px;">'
+            f'<div style="font-size:20px; font-weight:600; color:{PALETA["neutro"]};">SEM OPERAÇÃO EM {symbol}</div>'
             f'<div style="margin-top:6px; opacity:.85;">Sem sinal operável em {mtf.modality} '
             f"em {TIMEFRAME_LABELS[tf_a]} — entrada, stop e alvo foram bloqueados.</div>"
             f"</div>",
@@ -611,35 +646,38 @@ def render_veredito(mtf, confirmation: tuple[str, str], symbol: str, risk_budget
 
 
 OUTCOME_LABELS = {
-    "ALVO_1": ("✅ Bateu o Alvo 1", "#2ed3a3"),
-    "ALVO_2": ("✅ Bateu o Alvo 2", "#2ed3a3"),
-    "STOP": ("❌ Bateu o Stop", "#ff5470"),
-    "EM_ABERTO": ("⏳ Ainda em aberto", "#f0b429"),
-    "SEM_SINAL": ("— Sem sinal operável nesta data", "#8291a1"),
+    "ALVO_1": ("✅ Bateu o Alvo 1", PALETA["compra"]),
+    "ALVO_2": ("✅ Bateu o Alvo 2", PALETA["compra"]),
+    "STOP": ("❌ Bateu o Stop", PALETA["venda"]),
+    "EM_ABERTO": ("⏳ Ainda em aberto", PALETA["alerta"]),
+    "SEM_SINAL": ("— Sem sinal operável nesta data", PALETA["neutro"]),
     # Não é acerto nem erro: a vela seguinte abriu além do stop, então a
     # operação não chegou a existir. Contar isso como stop seria inventar uma
     # perda que ninguém teve; contar como acerto, o oposto. Fica fora da conta.
-    "SEM_ENTRADA": ("— Gap abriu além do stop; sem operação", "#8291a1"),
-    "SEM_DADO_FUTURO": ("⏳ Sem candles seguintes disponíveis ainda", "#8291a1"),
+    "SEM_ENTRADA": ("— Gap abriu além do stop; sem operação", PALETA["neutro"]),
+    "SEM_DADO_FUTURO": ("⏳ Sem candles seguintes disponíveis ainda", PALETA["neutro"]),
 }
 
 
 def render_retro_check(symbol: str, style: str, modality: str, source: str, count: int, params: AnalysisParams = DEFAULT_PARAMS) -> None:
-    st.caption(
-        "Roda a análise usando SÓ os dados que existiam até a data escolhida (sem espiar o "
-        "futuro), depois confere o que aconteceu de verdade nos candles seguintes — se bateu "
-        "entrada, alvo ou stop."
-    )
-
+    # A explicação de como funciona virou `help=` do botão: era uma caption
+    # de três linhas no topo, relida a cada visita por quem já sabia.
     all_tfs = list(dict.fromkeys([*estilo(style)["confirmation"], *estilo(style)["context"]]))
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns([2, 2, 1], vertical_alignment="bottom")
     with col1:
         check_tf = st.selectbox("Timeframe a verificar", all_tfs, format_func=lambda tf: TIMEFRAME_LABELS[tf])
     with col2:
         default_date = pd.Timestamp.now(tz="America/Sao_Paulo").date() - pd.Timedelta(days=1)
         as_of_date = st.date_input("Data (fechamento até esse dia)", value=default_date)
+    with col3:
+        verificar = st.button(
+            "🔍 Verificar", type="primary", use_container_width=True,
+            help="Roda a análise usando SÓ os dados que existiam até a data escolhida "
+                 "(sem espiar o futuro), depois confere o que aconteceu de verdade nos "
+                 "candles seguintes — se bateu entrada, alvo ou stop.",
+        )
 
-    if st.button("🔍 Verificar", type="primary"):
+    if verificar:
         as_of_ts = pd.Timestamp(as_of_date).tz_localize("America/Sao_Paulo") + pd.Timedelta(hours=23, minutes=59)
         try:
             check = check_signal_as_of(symbol, check_tf, as_of_ts, count=count, modality=modality, source=source, params=params)
@@ -654,7 +692,6 @@ def render_retro_check(symbol: str, style: str, modality: str, source: str, coun
             st.info(f"Não havia sinal operável nesta data ({modality} estava NEUTRO).")
             return
 
-        color = DIRECTION_COLOR[check.direction]
         action = "COMPRAR" if check.direction == Direction.BUY else "VENDER"
         # Sem selo de "oportunidade excepcional" aqui — a faixa de score 80+
         # mediu como a SEGUNDA PIOR em expectativa nos 81 mil sinais
@@ -741,22 +778,26 @@ def render_assertividade(perfis: list[str]) -> None:
         )
         return
 
-    col1, col2, col3, col4 = st.columns(4)
+    # Perfil e Ativo ficam à vista — são os dois recortes que se troca o
+    # tempo todo. Origem e Período foram pro popover: mexe-se neles uma vez
+    # por sessão, e ocupavam metade de uma barra de filtros de quatro
+    # colunas acima de tudo o que importa nesta tela.
+    col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
         f_perfil = st.selectbox("Perfil", ["Todos"] + perfis, key="assert_perfil")
     with col2:
-        # 'backfill' segue como opção de filtro (a reconstrução em massa não
-        # é mais a fonte principal desde 2026-08-06, mas o comando ainda
-        # existe pra casos pontuais — ex: bootstrapar histórico de um ativo
-        # novo). 'manual' é o caminho principal agora: o botão "💾 Salvar
-        # este sinal" no veredito de cada análise.
-        f_origem = st.selectbox("Origem", ["Todas", "worker", "manual", "backfill"],
-                                key="assert_origem")
-    with col3:
         f_symbol = st.selectbox("Ativo", ["Todos"] + st.session_state.watchlist, key="assert_symbol")
-    with col4:
-        f_dias = st.select_slider("Período", options=[7, 30, 90, 180, 365, 1095], value=90,
-                                  format_func=lambda d: f"{d} dias", key="assert_dias")
+    with col3:
+        with st.popover("⚙️ Mais filtros", use_container_width=True):
+            # 'backfill' segue como opção de filtro (a reconstrução em massa
+            # não é mais a fonte principal desde 2026-08-06, mas o comando
+            # ainda existe pra casos pontuais — ex: bootstrapar histórico de
+            # um ativo novo). 'manual' é o caminho principal agora: o botão
+            # "💾 Salvar este sinal" no veredito de cada análise.
+            f_origem = st.selectbox("Origem", ["Todas", "worker", "manual", "backfill"],
+                                    key="assert_origem")
+            f_dias = st.select_slider("Período", options=[7, 30, 90, 180, 365, 1095], value=90,
+                                      format_func=lambda d: f"{d} dias", key="assert_dias")
 
     filtros = {
         "perfil": None if f_perfil == "Todos" else f_perfil,
@@ -819,15 +860,29 @@ def render_assertividade(perfis: list[str]) -> None:
             "`analyzer.py --reavaliar-tudo` pra recalcular tudo com o modelo atual."
         )
 
-    st.markdown("### Por tipo de análise")
-    st.dataframe(_tabela_assertividade(stats["geral"], None), hide_index=True, use_container_width=True)
+    # Um recorte por vez, escolhido num seletor. Eram cinco expanders
+    # empilhados abaixo da tabela geral, todos fechados: sete tabelas na
+    # mesma página, e a comparação entre dois recortes exigia abrir os dois
+    # e rolar. Sendo todas a mesma tabela com outro agrupamento, o seletor
+    # troca o conteúdo no lugar.
+    disponiveis = {rotulo: chave for chave, rotulo in RECORTE_LABELS.items()
+                   if stats.get(chave)}
+    st.markdown("### Assertividade por recorte")
+    recorte = st.segmented_control(
+        "Recorte", ["Tipo de análise"] + list(disponiveis), key="assert_recorte",
+        default="Tipo de análise", required=True, label_visibility="collapsed",
+    ) or "Tipo de análise"
 
-    for chave, rotulo in RECORTE_LABELS.items():
-        linhas = stats.get(chave) or []
-        if not linhas:
-            continue
-        with st.expander(f"Por {rotulo.lower()}"):
-            st.dataframe(_tabela_assertividade(linhas, rotulo), hide_index=True, use_container_width=True)
+    if recorte == "Tipo de análise":
+        st.dataframe(_tabela_assertividade(stats["geral"], None),
+                     hide_index=True, use_container_width=True)
+    else:
+        st.dataframe(_tabela_assertividade(stats[disponiveis[recorte]], recorte),
+                     hide_index=True, use_container_width=True)
+    st.caption(
+        "**Resolvidos** é o denominador da taxa de acerto e da expectativa — sinal em "
+        "aberto não conta como acerto nem como erro."
+    )
 
     st.markdown("### Últimos sinais gravados")
     try:
@@ -841,24 +896,29 @@ def render_assertividade(perfis: list[str]) -> None:
         return
 
     st.caption(f"{historico['total']} sinal(is) no recorte · mostrando os {len(historico['signals'])} mais recentes")
-    st.dataframe(
-        [{
-            "Vela": pd.Timestamp(s["candle_time"]).tz_convert("America/Sao_Paulo").strftime("%d/%m %H:%M"),
-            "Ativo": s["symbol"],
-            "TF": s["timeframe"],
-            "Leitura": s["modalidade"],
-            "Direção": s["direcao"],
-            "Score": round(s["score"], 1),
-            "MTF": "Sim" if s["mtf_confirmado"] else "Não",
-            "Entrada": s["entrada"],
-            "Stop": s["stop"],
-            "Alvo 1": s["alvo_1"],
-            "Desfecho": OUTCOME_LABELS.get(s["resultado"], ("Aguardando", ""))[0] if s["resultado"] else "Aguardando",
-            "Perfil": s["perfil"],
-            "Origem": s["origem"],
-        } for s in historico["signals"]],
-        hide_index=True, use_container_width=True,
-    )
+    linhas_hist = [{
+        "Vela": pd.Timestamp(s["candle_time"]).tz_convert("America/Sao_Paulo").strftime("%d/%m %H:%M"),
+        "Ativo": s["symbol"],
+        "TF": s["timeframe"],
+        "Leitura": s["modalidade"],
+        "Direção": s["direcao"],
+        "Score": round(s["score"], 1),
+        "Desfecho": OUTCOME_LABELS.get(s["resultado"], ("Aguardando", ""))[0] if s["resultado"] else "Aguardando",
+        "MTF": "Sim" if s["mtf_confirmado"] else "Não",
+        "Entrada": s["entrada"],
+        "Stop": s["stop"],
+        "Alvo 1": s["alvo_1"],
+        "Perfil": s["perfil"],
+        "Origem": s["origem"],
+    } for s in historico["signals"]]
+
+    # Treze colunas não cabem sem rolagem horizontal, e as sete primeiras já
+    # respondem "o que era e no que deu". O resto fica atrás do toggle.
+    _ESSENCIAIS = ["Vela", "Ativo", "TF", "Leitura", "Direção", "Score", "Desfecho"]
+    tudo = st.toggle("Ver todas as colunas", key="assert_hist_colunas")
+    tabela_hist = pd.DataFrame(linhas_hist)
+    st.dataframe(tabela_hist if tudo else tabela_hist[_ESSENCIAIS],
+                 hide_index=True, use_container_width=True)
 
 
 def _linha_leitura(s: Signal) -> dict:
@@ -899,7 +959,7 @@ def render_rsi_multi_tf(mtf, params: AnalysisParams) -> None:
         titulo = f'<b style="color:{cor}">Exaustão em 1 timeframe — {direcao}</b>'
     else:
         cor = DIRECTION_COLOR[Direction.NEUTRAL]
-        titulo = '<span style="color:#8291a1">Nenhum timeframe em exaustão</span>'
+        titulo = f'<span style="color:{PALETA["neutro"]}">Nenhum timeframe em exaustão</span>'
 
     partes = []
     for tf, (valor, zona) in por_tf.items():
@@ -941,9 +1001,9 @@ def render_rsi_badge(context, params: AnalysisParams) -> None:
         f'<div style="border:1px solid {cor}; border-radius:8px; padding:10px 14px; '
         f'background:{cor}18; margin:6px 0 14px 0;">'
         f'<b>IFR ({params.rsi_periodo}):</b> <b style="color:{cor}">{rsi:.1f} — {zona}</b>{diario}'
-        f'<div style="background:#8291a133; height:8px; border-radius:4px; margin-top:8px; position:relative;">'
-        f'<div style="position:absolute; left:{sobrevenda:.0f}%; top:0; bottom:0; width:1px; background:#8291a1;"></div>'
-        f'<div style="position:absolute; left:{sobrecompra:.0f}%; top:0; bottom:0; width:1px; background:#8291a1;"></div>'
+        f'<div style="background:{PALETA["neutro"]}33; height:8px; border-radius:4px; margin-top:8px; position:relative;">'
+        f'<div style="position:absolute; left:{sobrevenda:.0f}%; top:0; bottom:0; width:1px; background:{PALETA["neutro"]};"></div>'
+        f'<div style="position:absolute; left:{sobrecompra:.0f}%; top:0; bottom:0; width:1px; background:{PALETA["neutro"]};"></div>'
         f'<div style="position:absolute; left:calc({min(max(rsi, 0), 100):.0f}% - 4px); top:-2px; '
         f'width:8px; height:12px; border-radius:2px; background:{cor};"></div>'
         f'</div></div>',
@@ -991,62 +1051,73 @@ def render_individual_analysis(symbol: str, style: str, modality: str, source: s
     contexto = resultado_entrada.context
     sinais = resultado_entrada.signals
 
-    st.caption(
-        f"{symbol} ({yahoo_symbol(symbol)}) · gráfico em {TIMEFRAME_LABELS[tf_entrada]} · "
-        f"último candle {contexto.df.index[-1].tz_convert('America/Sao_Paulo'):%d/%m %H:%M} · "
-        f"ATR {contexto.atr:.2f} ({contexto.atr_pct:.2f}%) · RVOL {contexto.rvol:.2f}x · "
-        f"volatilidade {contexto.volatility} · atualizado {pd.Timestamp.now(tz='America/Sao_Paulo'):%H:%M:%S}"
-    )
+    # Os fatos do candle viram chips, não uma frase de seis itens separados
+    # por "·" — ninguém lia aquilo até o fim.
+    _chips([
+        ("Gráfico", TIMEFRAME_LABELS[tf_entrada]),
+        ("Último candle", f"{contexto.df.index[-1].tz_convert('America/Sao_Paulo'):%d/%m %H:%M}"),
+        ("ATR", f"{contexto.atr:.2f} ({contexto.atr_pct:.2f}%)"),
+        ("RVOL", f"{contexto.rvol:.2f}x"),
+        ("Volatilidade", contexto.volatility),
+        ("Atualizado", f"{pd.Timestamp.now(tz='America/Sao_Paulo'):%H:%M:%S}"),
+    ])
     render_rsi_badge(contexto, params)
     st.plotly_chart(
         build_chart(contexto, plano, symbol),
         use_container_width=True, key=f"chart_{symbol}_{tf_entrada}",
     )
 
-    # ---- a prova: as seis leituras nos dois timeframes que decidem ----
+    # ---- a prova: UMA tabela, com o timeframe virando coluna ----
+    # Eram três tabelas empilhadas (uma por timeframe de confirmação, mais
+    # uma de contexto), cada uma com o seu próprio cabeçalho e legenda. Como
+    # todas têm as mesmas colunas, comparar M15 com H1 obrigava a saltar
+    # entre blocos; numa tabela só, as linhas ficam lado a lado.
     st.markdown("#### O que sustenta (ou derruba) o veredito")
+    linhas = []
     for tf in confirmation:
         resultado = mtf.results[tf]
         if resultado.error:
             st.warning(f"{TIMEFRAME_LABELS[tf]}: {resultado.error}")
             continue
-        st.caption(f"**{TIMEFRAME_LABELS[tf]}**")
-        st.dataframe(
-            pd.DataFrame([_linha_leitura(s) for s in resultado.signals]),
-            hide_index=True, use_container_width=True,
-        )
+        for s in resultado.signals:
+            linhas.append({"Timeframe": TIMEFRAME_LABELS[tf], "Papel": "Confirma",
+                           **_linha_leitura(s)})
 
-    # ---- contexto: uma linha por timeframe, não uma aba ----
-    linhas_contexto = []
     for tf in context_tfs:
         resultado = mtf.results.get(tf)
         if resultado is None or resultado.error:
             continue
         s = leitura_ativa(resultado.signals, modality)
-        direcao = s.direction if s else overall_direction(resultado.signals)
-        score = s.score if s else overall_score(resultado.signals)
-        linhas_contexto.append({
+        linhas.append({
             "Timeframe": TIMEFRAME_LABELS[tf],
-            "Direção": direcao.value,
-            "Score": round(score, 1),
+            "Papel": "Contexto",
+            "Leitura": s.name if s else modality,
+            "Direção": (s.direction if s else overall_direction(resultado.signals)).value,
+            "Score": round(s.score if s else overall_score(resultado.signals), 1),
         })
-    if linhas_contexto:
-        st.caption("**Contexto** — tendência mais ampla. Não confirma nem bloqueia a recomendação.")
-        st.dataframe(pd.DataFrame(linhas_contexto), hide_index=True, use_container_width=True)
 
-    # ---- detalhe: só a pedido, e só da leitura que decide ----
-    nome_detalhe = plano.name if plano else "Confluência"
-    with st.expander(f"Detalhe da leitura {nome_detalhe} em {TIMEFRAME_LABELS[tf_entrada]}"):
-        alvo = next((s for s in sinais if s.name == nome_detalhe), None)
+    if linhas:
+        st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
+        st.caption(
+            "**Confirma** são os timeframes que decidem a recomendação. "
+            "**Contexto** é tendência mais ampla — não confirma nem bloqueia."
+        )
+
+    # ---- detalhe: uma leitura por vez, escolhida num seletor ----
+    # O que existia aqui era `expander → st.tabs → painel`, com um segundo
+    # expander dentro do painel. Fora a profundidade, `st.tabs` executa o
+    # corpo de TODAS as abas: abrir o expander renderizava os cinco painéis
+    # inteiros a cada rerun pra mostrar um.
+    nomes = [s.name for s in sinais]
+    padrao = plano.name if plano and plano.name in nomes else (nomes[0] if nomes else None)
+    if padrao is not None:
+        escolhida = st.selectbox(
+            f"Detalhe da leitura em {TIMEFRAME_LABELS[tf_entrada]}", nomes,
+            index=nomes.index(padrao), key=f"detalhe_leitura_{symbol}_{tf_entrada}",
+        )
+        alvo = next((s for s in sinais if s.name == escolhida), None)
         if alvo is not None:
             render_signal_panel(alvo, symbol, risk_budget, tf_entrada, contexto, mtf, params, perfil)
-
-    with st.expander("Ver todas as leituras em detalhe"):
-        outras = [s for s in sinais if s.name != nome_detalhe]
-        abas = st.tabs([s.name for s in outras])
-        for aba, s in zip(abas, outras):
-            with aba:
-                render_signal_panel(s, symbol, risk_budget, tf_entrada, contexto, mtf, params, perfil)
 
 
 # ========================================================================
@@ -1223,16 +1294,13 @@ if "source_select" not in st.session_state:
 if "symbol_select" not in st.session_state:
     st.session_state.symbol_select = st.session_state.watchlist[0]
 
-# Se o Scanner pediu pra "pular" pra um ativo, aplica ANTES do selectbox nascer
+# Se alguma tela pediu pra "pular" pra um ativo, aplica ANTES do selectbox
+# nascer. A troca de TELA não acontece mais aqui: quem chama `_ir_para` já
+# fez `st.switch_page`, então esta chave carrega só o símbolo.
 if st.session_state.get("jump_to_symbol"):
     target = st.session_state.pop("jump_to_symbol")
     if target in st.session_state.watchlist:
         st.session_state.symbol_select = target
-    st.session_state.mode_select = "Análise individual"
-    # limpa o estado do seletor "Ativo" do Scanner — ele não vai mais ser
-    # renderizado nesta tela, e deixar a chave órfã pode confundir o
-    # controle de estado de widgets em alguns cenários
-    st.session_state.pop("scanner_pick_select", None)
 
 
 # Perfis de análise. A troca de perfil precisa acontecer AQUI, antes da
@@ -1395,114 +1463,160 @@ def _persist_watchlist() -> None:
 
 
 # ========================================================================
-# Modo — no corpo, não na sidebar (2026-08-06: a navegação entre os 4 modos
-# sentia fragmentada com o seletor escondido lá embaixo, entre outras
-# configurações). Calculado ANTES do bloco da sidebar porque os widgets lá
-# dentro (ex: qual seletor de ativo aparece) dependem de `mode` já estar
-# definido — a ordem de EXECUÇÃO no script decide a ordem dentro de cada
-# container, não a posição visual entre corpo e sidebar, então isto roda
-# aqui e mesmo assim aparece no topo do corpo, acima do título.
-#
-# `st.segmented_control`, não `st.tabs`: tabs executam o corpo de TODAS as
-# abas a cada rerun — é só disposição visual, não controle de fluxo. Trocar
-# o if/elif atual (mais abaixo) por tabs faria Scanner/Análise
-# individual/Retroativa rodarem seus fetches (alguns custosos — o Yahoo tem
-# rate limit documentado) toda vez que qualquer widget mudasse, mesmo com
-# outra aba visível. segmented_control preserva o if/elif: só o modo
-# escolhido executa, exatamente como o st.radio que ele substitui.
-# Deep linking — aplica ANTES do mode widget nascer pra não conflitar.
-
-def _render_breadcrumb(current: str) -> None:
-    """Navegação tipo breadcrumb — mostra onde o usuário está."""
-    breadcrumbs = {
-        "Dashboard": "📊 Dashboard",
-        "Scanner": "🔍 Scanner",
-        "Análise individual": "📈 Análise",
-        "Verificação retroativa": "🕵️ Retroativa",
-        "Acompanhamento": "📋 Acompanhamento",
-        "Assertividade": "📉 Assertividade",
-    }
-    items = ["Dashboard"] if current == "Dashboard" else ["Dashboard", current]
-    st.caption(" > ".join(breadcrumbs.get(i, i) for i in items))
-
-
-def _render_share_button() -> None:
-    """Botão de compartilhar — gera URL da view atual (NÃO modifica query params)."""
-    params_dict = {}
-    if "mode_select" in st.session_state:
-        params_dict["mode"] = st.session_state.mode_select
-    if "symbol_select" in st.session_state:
-        params_dict["symbol"] = st.session_state.symbol_select
-    if "perfil_select" in st.session_state:
-        params_dict["perfil"] = st.session_state.perfil_select
-    if "modality_select" in st.session_state:
-        params_dict["modality"] = st.session_state.modality_select
-
-    url = f"https://acoes.dondon.services/?{'&'.join(f'{k}={v}' for k, v in params_dict.items())}" if params_dict else "https://acoes.dondon.services/"
-
-    if st.button("🔗 Copiar link", key="share_btn", help="Copia link para esta view"):
-        st.code(url, language=None)
-        st.success("Link copiado! Cole onde quiser compartilhar.")
-        st.balloons()
-
-
-def _apply_deep_link() -> None:
-    """Aplica deep linking dos query params pro session_state.
-    Roda ANTES dos widgets nascerem pra não dar conflito."""
-    qp = st.query_params
-
-    # Modo
-    if qp.get("mode") and qp["mode"] in [
-        "Dashboard", "Scanner", "Acompanhamento", "Análise individual", "Verificação retroativa", "Assertividade",
-    ]:
-        st.session_state.mode_select = qp["mode"]
-
-    # Símbolo
-    if qp.get("symbol") and qp["symbol"] in st.session_state.get("watchlist", []):
-        st.session_state.symbol_select = qp["symbol"]
-
-    # Perfil
-    if qp.get("perfil") and qp["perfil"] in st.session_state.get("perfis", {}):
-        st.session_state.perfil_select = qp["perfil"]
-
-    # Modalidade
-    if qp.get("modality") and qp["modality"] in [
-        "Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR",
-    ]:
-        st.session_state.modality_select = qp["modality"]
-
-
-
-# Deep linking: soh aplica uma vez (carga inicial), nao em todo rerun
-if not st.session_state.get("_deep_link_applied"):
-    _apply_deep_link()
-    st.session_state["_deep_link_applied"] = True
-
+# Rotas
 # ========================================================================
-mode = st.segmented_control(
-    "Modo",
-    ["Dashboard", "Scanner", "Acompanhamento", "Análise individual", "Verificação retroativa", "Assertividade",
-     "Mini Índice (WINFUT)"],
-    key="mode_select", default="Dashboard", required=True,
-    # `required=True` é obrigatório aqui, não estético: sem ele,
-    # segmented_control deixa clicar no pill já selecionado pra DESMARCAR e
-    # devolver None — e o if/elif abaixo termina num `else` que assume
-    # Assertividade. Sem o required, um duplo-clique acidental trocaria de
-    # modo em silêncio pro usuário achar que ainda está na tela anterior.
-)
+# A tela é escolhida por CAMINHO de URL (`st.navigation` + `st.Page`), não
+# por um valor de `session_state` nem por `?mode=`. Isso não é preferência
+# estética, é o que faz o botão voltar do navegador funcionar:
+#
+#   - voltar/avançar ENTRE PÁGINAS funciona: era o bug streamlit#5293, e foi
+#     corrigido pelo PR streamlit#6271 — a URL volta e o conteúdo re-renderiza;
+#   - voltar/avançar por QUERY PARAM não funciona: streamlit#13963 segue
+#     aberto e é específico de apps com `st.navigation` — a URL muda, o rerun
+#     acontece, e `st.query_params` ainda devolve o valor velho.
+#
+# Daí a divisão que o resto deste bloco implementa: **a rota mora no caminho
+# e é a única coisa no histórico**; símbolo/perfil/modalidade viajam em query
+# param só para links compartilháveis, são LIDOS mas nunca ESCRITOS. Escrever
+# a cada mudança encheria o histórico de entradas que o #13963 não consegue
+# restaurar — o usuário apertaria voltar e nada mudaria na tela.
+#
+# As páginas são callables (`st.Page` aceita função), então o app segue num
+# arquivo só e o `COPY` do Dockerfile.streamlit não muda.
 
-def render_acompanhamento(params: AnalysisParams) -> None:
-    """Acompanhamento de sinais — cardapio de acoes sobre sinais recentes.
-    
-    Mostra sinais sem feedback, agrupados por status: pendentes, acompanhando,
-    operados, ignorados. Botoes de acao em cada linha."""
-    _render_breadcrumb("Acompanhamento")
-    _render_share_button()
-    
-    st.markdown("### 📋 Acompanhamento de sinais")
-    
+ROTA_PADRAO = "oportunidades"
+
+# Rótulo e ícone de cada rota. A ordem aqui é a ordem das pills.
+ROTAS = {
+    "oportunidades": ("🎯", "Oportunidades", "Melhores sinais operáveis agora"),
+    "scanner":       ("🔍", "Scanner", "A watchlist inteira, ranqueada"),
+    "ativo":         ("📈", "Agora", "Gráfico e as 6 leituras de um ativo"),
+    "retroativa":    ("🕵️", "Retroativa", "Como o sinal teria se saído numa data passada"),
+    "acompanhar":    ("📋", "Acompanhar", "Triagem dos sinais recentes"),
+    "assertividade": ("📉", "Assertividade", "Taxa de acerto medida do histórico"),
+}
+
+# Os quatro grupos do topo. Grupo com mais de uma rota ganha sub-nav.
+NAV_GRUPOS = {
+    "🎯 Oportunidades": ["oportunidades"],
+    "🔍 Scanner": ["scanner"],
+    "📈 Ativo": ["ativo", "retroativa"],
+    "📋 Sinais": ["acompanhar", "assertividade"],
+}
+
+# Links já compartilhados usam os nomes de modo antigos (o card de
+# oportunidade emitia `?mode=Análise+individual`). Sem esta tradução eles
+# cairiam na landing sem aviso, que é pior que um erro.
+_ALIAS_MODOS = {
+    "Dashboard": ("oportunidades", None),
+    "Scanner": ("scanner", None),
+    "Análise individual": ("ativo", None),
+    "Verificação retroativa": ("retroativa", None),
+    "Acompanhamento": ("acompanhar", None),
+    "Assertividade": ("assertividade", None),
+    "Mini Índice (WINFUT)": ("ativo", WINFUT_SYMBOL),
+}
+
+# Preenchida logo antes da sidebar, quando `st.navigation` já resolveu a rota.
+ROTA_ATUAL = ROTA_PADRAO
+
+
+def _url_publica() -> str:
+    """Base dos links de compartilhamento. Vem do ambiente porque o domínio
+    estava cravado no código, o que fazia o botão gerar link de produção
+    mesmo rodando `streamlit run` na máquina de quem estava mexendo."""
+    return (os.environ.get("ACOES_PUBLIC_URL") or "https://acoes.dondon.services").rstrip("/")
+
+
+def _link_da_view(rota: str) -> str:
+    """URL desta tela, com o estado que vale a pena carregar junto."""
+    extras = {
+        chave: st.session_state[skey]
+        for chave, skey in (("symbol", "symbol_select"), ("perfil", "perfil_select"),
+                            ("modality", "modality_select"))
+        if skey in st.session_state
+    }
+    # A rota padrão é servida na raiz; as outras têm caminho próprio.
+    caminho = "/" if rota == ROTA_PADRAO else f"/{rota}"
+    query = ("?" + "&".join(f"{k}={v}" for k, v in extras.items())) if extras else ""
+    return f"{_url_publica()}{caminho}{query}"
+
+
+def _aplicar_deep_link() -> None:
+    """Copia os query params para o `session_state`, sempre que a URL mudar.
+
+    Roda ANTES de qualquer widget nascer — o Streamlit não deixa mexer numa
+    chave depois que o widget dela existe. O guarda é a comparação com o que
+    já foi consumido, não um "só na primeira vez": assim colar uma URL nova
+    ou voltar para um link compartilhado também é aplicado, e ao mesmo tempo
+    os widgets não são forçados de volta ao valor do link a cada rerun."""
+    bruto = dict(st.query_params)
+    if bruto == st.session_state.get("_deep_link_consumido"):
+        return
+    st.session_state["_deep_link_consumido"] = bruto
+
+    symbol = bruto.get("symbol")
+    if symbol and symbol in st.session_state.get("watchlist", []):
+        st.session_state.symbol_select = symbol
+
+    perfil = bruto.get("perfil")
+    if perfil and perfil in st.session_state.get("perfis", {}):
+        st.session_state.perfil_select = perfil
+
+    modalidade = bruto.get("modality")
+    if modalidade and modalidade in MODALITY_CHOICES:
+        st.session_state.modality_select = modalidade
+
+
+def _ir_para(rota: str, symbol: str | None = None) -> None:
+    """Pulo entre telas. Usa `st.switch_page`, que a doc descreve como
+    equivalente a clicar no menu — ou seja, gera a mesma entrada de
+    histórico, e o voltar do navegador desfaz o pulo.
+
+    `symbol` reusa o handshake `jump_to_symbol` já existente: o selectbox
+    do ativo mora na sidebar e não pode ser reatribuído depois de criado."""
+    if symbol:
+        st.session_state.jump_to_symbol = symbol
+    st.switch_page(PAGINAS[rota])
+
+
+def _page_header(titulo: str, fatos: list[tuple[str, str]] | None = None,
+                 rota: str | None = None) -> None:
+    """Cabeçalho padrão de toda tela: título, os fatos da configuração atual
+    como chips, e o compartilhar num popover.
+
+    Substitui quatro coisas que estavam espalhadas: o breadcrumb (repetia a
+    pill que o usuário acabou de clicar e nem era clicável), o botão de
+    compartilhar de cada view, o if/elif de `st.title` por modo, e as
+    captions corridas que concatenavam seis fatos numa frase só."""
+    rota = rota or ROTA_ATUAL
+    esq, dir_ = st.columns([6, 1])
+    with esq:
+        st.title(titulo)
+    with dir_:
+        with st.popover("🔗", use_container_width=True, help="Link para esta tela"):
+            st.caption("Copie o link desta tela:")
+            st.code(_link_da_view(rota), language=None)
+
+    if fatos:
+        _chips(fatos)
+
+def render_acompanhamento() -> None:
+    """Triagem dos sinais recentes: o que o worker gravou, e o que você
+    decidiu sobre cada um.
+
+    É uma TABELA com barra de ação, não uma pilha de cards. A versão
+    anterior desenhava uma linha por sinal com oito widgets cada — cinco
+    colunas, três métricas e quatro botões aninhados numa sub-coluna — até
+    vinte linhas, o que dava ~160 widgets numa tela só. Ler qual sinal tinha
+    o maior score exigia rolar comparando métricas soltas; aqui a tabela
+    ordena e a decisão acontece numa barra única sobre a linha escolhida."""
     if not daytrade_smc.ACOES_API_URL:
-        st.info("Modo Acompanhamento requer a API do homelab configurada.")
+        st.info(
+            "O acompanhamento lê os sinais gravados, e eles moram na API do homelab — "
+            "configure `ACOES_API_URL` para usar esta tela. Sem ela não há fallback em "
+            "arquivo local de propósito: meia lista de sinais é pior que nenhuma."
+        )
         return
     
     # Fetch recent signals (last 24h, operaveis apenas)
@@ -1553,81 +1667,79 @@ def render_acompanhamento(params: AnalysisParams) -> None:
         else:
             pendentes.append(s)
     
-    # Summary metrics
+    baldes = {
+        "⏳ Pendentes": pendentes,
+        "👀 Acompanhando": acompanhando,
+        "💰 Operados": operados,
+        "🚫 Ignorados": ignorados,
+    }
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Pendentes", len(pendentes))
-    c2.metric("Acompanhando", len(acompanhando))
-    c3.metric("Operados", len(operados))
-    c4.metric("Ignorados", len(ignorados))
-    
-    # ---- PENDENTES (principal) ----
-    st.markdown("#### ⏳ Pendentes de decisao")
-    if not pendentes:
-        st.info("Nenhum sinal pendente!")
-    else:
-        for s in pendentes[:20]:
-            _render_feedback_row(s)
-    
-    # ---- ACOMPANHANDO ----
-    if acompanhando:
-        with st.expander(f"👀 Acompanhando ({len(acompanhando)})", expanded=False):
-            for s in acompanhando:
-                _render_feedback_row(s, show_actions=False)
-    
-    # ---- OPERADOS ----
-    if operados:
-        with st.expander(f"✅ Operados ({len(operados)})", expanded=False):
-            for s in operados:
-                _render_feedback_row(s, show_actions=False)
-    
-    # ---- IGNORADOS ----
-    if ignorados:
-        with st.expander(f"🚫 Ignorados ({len(ignorados)})", expanded=False):
-            for s in ignorados:
-                _render_feedback_row(s, show_actions=False)
+    for coluna, (rotulo, lista) in zip((c1, c2, c3, c4), baldes.items()):
+        coluna.metric(rotulo, len(lista))
+
+    # `segmented_control` e não quatro expanders: um balde de cada vez, e o
+    # que está em foco fica com a tabela inteira em vez de espremido dentro
+    # de um expander fechado.
+    escolha = st.segmented_control(
+        "Situação", list(baldes), key="acomp_balde", default="⏳ Pendentes", required=True,
+        format_func=lambda r: f"{r} ({len(baldes[r])})",
+        label_visibility="collapsed",
+    ) or "⏳ Pendentes"
+
+    lista = baldes[escolha]
+    if not lista:
+        st.info(f"Nada em **{escolha}** nas últimas 24h.")
+        return
+
+    tabela = pd.DataFrame([_linha_feedback(s) for s in lista])
+    selecao = st.dataframe(
+        tabela, hide_index=True, use_container_width=True,
+        height=min(520, 45 + 35 * len(tabela)),
+        on_select="rerun", selection_mode="single-row", key=f"acomp_tabela_{escolha}",
+    )
+
+    linhas = selecao.get("selection", {}).get("rows") or []
+    if not linhas:
+        st.caption("Selecione uma linha para decidir o que fazer com o sinal.")
+        return
+
+    alvo = lista[linhas[0]]
+    sid = alvo.get("id")
+    st.markdown(f"**{alvo.get('symbol')}** · {alvo.get('timeframe')} · {alvo.get('modalidade', '')}")
+    a1, a2, a3, a4 = st.columns(4)
+    if a1.button("👀 Acompanhar", key=f"fb_acomp_{sid}", use_container_width=True):
+        _do_feedback(sid, "ACOMPANHAR")
+    if a2.button("💰 Operei", key=f"fb_oper_{sid}", use_container_width=True):
+        _do_feedback(sid, "OPEREI")
+    if a3.button("🚫 Ignorar", key=f"fb_ign_{sid}", use_container_width=True):
+        _do_feedback(sid, "IGNORAR")
+    if a4.button("📊 Ver análise", key=f"fb_ver_{sid}", use_container_width=True,
+                 type="primary"):
+        _ir_para("ativo", symbol=alvo.get("symbol"))
 
 
-def _render_feedback_row(s: dict, show_actions: bool = True) -> None:
-    """Uma linha de sinal com botoes de acao."""
-    direcao = s.get("direcao", "NEUTRO")
-    cor = "#2ed3a3" if direcao == "COMPRA" else "#ff5470" if direcao == "VENDA" else "#8291a1"
-    
-    c1, c2, c3, c4, c5 = st.columns([1.5, 1, 1, 1, 2.5])
-    with c1:
-        st.markdown(
-            f'<span style="color:{cor}; font-weight:600">{direcao}</span> '
-            f'<b>{s.get("symbol")}</b> · {s.get("timeframe")} · '
-            f'<span style="opacity:.6">{s.get("modalidade","")}</span>',
-            unsafe_allow_html=True,
-        )
-        st.caption(f"{s.get('setup','')[:40]} · score {s.get('score',0):.0f}")
-    with c2:
-        if s.get("entrada"):
-            st.metric("Entrada", f"R$ {s['entrada']:.2f}")
-    with c3:
-        if s.get("stop"):
-            st.metric("Stop", f"R$ {s['stop']:.2f}")
-    with c4:
-        if s.get("alvo_1"):
-            st.metric("Alvo", f"R$ {s['alvo_1']:.2f}")
-    
-    if show_actions and daytrade_smc.ACOES_API_URL:
-        with c5:
-            ac1, ac2, ac3, ac4 = st.columns(4)
-            sid = s.get("id")
-            with ac1:
-                if st.button("👀", key=f"fb_acomp_{sid}", help="Acompanhar"):
-                    _do_feedback(sid, "ACOMPANHAR")
-            with ac2:
-                if st.button("💰", key=f"fb_oper_{sid}", help="Operei"):
-                    _do_feedback(sid, "OPEREI")
-            with ac3:
-                if st.button("🚫", key=f"fb_ign_{sid}", help="Ignorar"):
-                    _do_feedback(sid, "IGNORAR")
-            with ac4:
-                if st.button("📊", key=f"fb_ver_{sid}", help="Ver analise"):
-                    st.session_state.jump_to_symbol = s.get("symbol")
-                    st.rerun()
+def _linha_feedback(s: dict) -> dict:
+    """Um sinal virado linha de tabela. Construtor PURO — nenhum `st.*` aqui
+    dentro, no mesmo molde do `_linha_leitura`. Era o antigo
+    `_render_feedback_row`, que misturava a formatação com oito widgets."""
+    candle = s.get("candle_time")
+    try:
+        quando = pd.Timestamp(candle).tz_convert("America/Sao_Paulo").strftime("%d/%m %H:%M")
+    except (TypeError, ValueError):
+        quando = str(candle or "—")
+    return {
+        "Ativo": s.get("symbol", ""),
+        "Direção": s.get("direcao", "NEUTRO"),
+        "TF": s.get("timeframe", ""),
+        "Leitura": s.get("modalidade", ""),
+        "Score": round(s.get("score") or 0, 1),
+        "Entrada": s.get("entrada"),
+        "Stop": s.get("stop"),
+        "Alvo": s.get("alvo_1"),
+        "Candle": quando,
+        "Setup": (s.get("setup") or "")[:60],
+    }
 
 
 def _do_feedback(signal_id: int, acao: str) -> None:
@@ -1646,189 +1758,421 @@ def render_dashboard(source: str, count: int, risk_budget: float | None, params:
     Cada card é uma decisão — entrada, stop, alvo, score, perfil. Sem
     parameter tweaking: isso aqui é pra operar, não pra calibrar. Quem quer
     calibrar desce pro Scanner ou pra Análise individual."""
-    confirmation = estilo(style)["confirmation"]
-    context_tfs = estilo(style)["context"]
-    tf_entrada = confirmation[0]
+    # `st.segmented_control`, NÃO `st.tabs`. Aqui não é preferência visual:
+    # tabs executam o corpo de TODAS as abas a cada rerun, e o corpo de cada
+    # aba é uma varredura completa da watchlist. Com quatro perfis isso eram
+    # cinco varreduras a cada clique em qualquer widget da página, cinco
+    # vezes o custo pra mostrar uma. Com o seletor, roda uma só.
+    perfil_filtro = None
+    if perfis:
+        escolha = st.segmented_control(
+            "Perfil", ["Todos"] + perfis, key="dash_perfil", default="Todos", required=True,
+            help="Compara a calibragem de cada perfil sobre os mesmos candles.",
+        )
+        perfil_filtro = None if escolha in (None, "Todos") else escolha
 
-    # Breadcrumb + Share
-    _render_breadcrumb("Dashboard")
-    _render_share_button()
+    with st.spinner("Analisando oportunidades..."):
+        df = run_scanner(
+            st.session_state.watchlist, style, "Confluência",
+            source, count, risk_budget,
+            params if perfil_filtro is None else st.session_state.perfis.get(perfil_filtro, params),
+        )
 
-    st.markdown("### 🎯 Melhores oportunidades agora")
-    st.caption(f"Scanner sobre {len(st.session_state.watchlist)} ativos · {style} · "
-               f"perfil ativo: **{st.session_state.perfil_select}** · "
-               f"fonte: {SOURCE_LABELS.get(source, source)}")
+    # Só o que dá pra operar: sem entrada válida não há decisão a tomar.
+    operáveis = df[df["Entrada"].notna()].copy() if "Entrada" in df.columns else df.head(0)
+    if operáveis.empty:
+        st.info(
+            "Nenhum sinal operável neste momento — o motor achou leitura em todos os "
+            "ativos, mas nenhuma com entrada, stop e alvo válidos. Tente outro perfil, "
+            "ou veja a watchlist inteira no **Scanner**."
+        )
+        return
 
-    # Perfis que o worker está rodando — mostra aba de cada um
-    if len(perfis) > 1:
-        perfil_tabs = st.tabs(["Todos"] + perfis)
-    else:
-        perfil_tabs = [st.container()]
-
-    for idx, tab in enumerate(perfil_tabs):
-        with tab:
-            perfil_filtro = None if idx == 0 else perfis[idx - 1]
-
-            # Rodar o scanner (cacheado)
-            with st.spinner("Analisando oportunidades..."):
-                df = run_scanner(
-                    st.session_state.watchlist, style, "Confluência",
-                    source, count, risk_budget,
-                    params if perfil_filtro is None else st.session_state.perfis.get(perfil_filtro, params),
-                )
-
-            # Filtrar só operáveis (entrada válida)
-            operáveis = df[df["Entrada"].notna()].copy() if "Entrada" in df.columns else df.head(0)
-
-            if operáveis.empty:
-                st.info("Nenhum sinal operável neste momento. Tente outro perfil ou aguarde o próximo ciclo.")
-                continue
-
-            # Top 5 por score
-            top = operáveis.head(5)
-
-            for _, row in top.iterrows():
-                _render_oportunidade_card(row, symbol=row["Ativo"], style=style,
-                                          source=source, count=count, risk_budget=risk_budget,
-                                          params=params, perfil=perfil_filtro or st.session_state.perfil_select)
+    for _, row in operáveis.head(5).iterrows():
+        _render_oportunidade_card(row, symbol=row["Ativo"], risk_budget=risk_budget,
+                                  perfil=perfil_filtro or st.session_state.perfil_select)
 
 
-def _render_oportunidade_card(row: pd.Series, symbol: str, style: str, source: str,
-                               count: int, risk_budget: float | None, params: AnalysisParams,
-                               perfil: str) -> None:
-    """Um card de oportunidade — tudo que pra decidir está na cara.
+def _render_oportunidade_card(row: pd.Series, symbol: str, risk_budget: float | None,
+                              perfil: str) -> None:
+    """Um card de oportunidade — o que decide está na cara.
 
-    Layout: badge de direção + ativo à esquerda, níveis de preço no centro,
-    ações à direita. Visual limpo, decisão em 3 segundos."""
+    O card é um `st.container(border=True)`, não HTML. O que existia antes
+    era um `<div>` aberto num `st.markdown` e fechado noutro, com os widgets
+    no meio: o Streamlit renderiza cada elemento no seu próprio bloco, então
+    aquela borda nunca chegou a envolver as métricas — desenhava uma linha
+    solta acima e outra abaixo."""
     direcao = row.get("Direção", "NEUTRO")
-    if direcao == "COMPRA":
-        cor = "#2ed3a3"
-        icone = "🟢"
-        acao = "COMPRAR"
-        seta = "▲"
-    else:
-        cor = "#ff5470"
-        icone = "🔴"
-        acao = "VENDER"
-        seta = "▼"
+    comprar = direcao == "COMPRA"
+    cor = PALETA["compra"] if comprar else PALETA["venda"]
+    acao = "🟢 COMPRAR" if comprar else "🔴 VENDER"
 
     score = row.get("Score Geral", 0) or 0
-    entrada = row.get("Entrada")
-    stop = row.get("Stop")
-    alvo = row.get("Alvo 1")
+    entrada, stop, alvo = row.get("Entrada"), row.get("Stop"), row.get("Alvo 1")
     qty = row.get("Quantidade")
-    total = row.get("Total (R$)")
-    rr = (alvo - entrada) / (entrada - stop) if entrada and stop and alvo and (entrada - stop) != 0 else 0
+    rr = (alvo - entrada) / (entrada - stop) if entrada and stop and alvo and (entrada - stop) else 0
 
-    # Qualidade visual do score
     if score >= 80:
         qualidade = "🌟 Excepcional"
-        q_cor = "#f0b429"
     elif score >= 60:
         qualidade = "✅ Boa"
-        q_cor = "#2ed3a3"
     else:
         qualidade = "⚡ Regular"
-        q_cor = "#8291a1"
 
-    # Card container
-    st.markdown(
-        f'<div style="border:1px solid {cor}33; border-left:4px solid {cor}; '
-        f'border-radius:8px; padding:12px 16px; background:{cor}08; margin-bottom:8px;">',
-        unsafe_allow_html=True,
+    with st.container(border=True):
+        cab, sc, agir = st.columns([3, 1.2, 1.4], vertical_alignment="center")
+        with cab:
+            st.markdown(
+                f'<span style="color:{cor}; font-weight:700; font-size:13px;">{acao}</span>'
+                f'<span style="font-size:22px; font-weight:700; margin-left:8px;">{symbol}</span>',
+                unsafe_allow_html=True,
+            )
+            detalhe = row.get("Setup", "") or ""
+            if rr:
+                detalhe += f" · R/R 1:{rr:.1f}"
+            st.caption(f"{detalhe} · perfil `{perfil}`")
+        with sc:
+            st.metric("Score", f"{score:.0f}", qualidade)
+        with agir:
+            if st.button("📊 Ver análise", key=f"dash_ver_{symbol}_{perfil}",
+                         use_container_width=True, type="primary"):
+                _ir_para("ativo", symbol=symbol)
+            with st.popover("🔗 Link", use_container_width=True):
+                st.code(f"{_url_publica()}/ativo?symbol={symbol}&perfil={perfil}", language=None)
+
+        if entrada and stop and alvo:
+            # "Total (R$)" saiu: era entrada × quantidade, derivável das duas
+            # colunas ao lado, e ocupava a quinta coluna do card inteiro.
+            cols = st.columns(4)
+            cols[0].metric("Entrada", f"R$ {entrada:.2f}")
+            cols[1].metric("Stop", f"R$ {stop:.2f}", f"{(stop - entrada) / entrada * 100:+.2f}%",
+                           delta_color="inverse")
+            cols[2].metric("Alvo", f"R$ {alvo:.2f}", f"{(alvo - entrada) / entrada * 100:+.2f}%")
+            if qty and qty > 0:
+                cols[3].metric("Qtd", f"{int(qty)}")
+            elif risk_budget and abs(entrada - stop) > 0:
+                cols[3].metric("Qtd", f"{int(risk_budget // abs(entrada - stop))}")
+            else:
+                cols[3].metric("Qtd", "—", help="Defina o risco máximo na barra lateral")
+
+
+# ========================================================================
+# Scanner
+# ========================================================================
+def render_scanner(style: str, modality: str, source: str, count: int,
+                   risk_budget: float | None, params: AnalysisParams, perfil: str) -> None:
+    """A watchlist inteira, ranqueada.
+
+    O botão de rodar mora AQUI, não na barra lateral: a ação e o resultado
+    dela são a mesma tela, e o botão escondido entre as configurações fazia
+    o estado vazio ("clique em Rodar scanner") apontar pra fora da vista."""
+    barra_esq, barra_dir = st.columns([1, 2])
+    with barra_esq:
+        rodar = st.button("🔍 Rodar scanner", type="primary", use_container_width=True,
+                          key="scanner_rodar")
+
+    if rodar:
+        st.session_state.scanner_result = run_scanner(
+            st.session_state.watchlist, style, modality, source, count, risk_budget, params,
+        )
+        st.session_state.scanner_risk_budget = risk_budget
+
+    if "scanner_result" not in st.session_state:
+        st.info(
+            "Clique em **🔍 Rodar scanner** para analisar os "
+            f"{len(st.session_state.watchlist)} ativos da watchlist e ranqueá-los pelo score."
+        )
+        return
+
+    result_df = st.session_state.scanner_result
+
+    if not st.session_state.get("scanner_risk_budget"):
+        st.caption(
+            "Defina o **Risco máximo (R$)** na barra lateral e rode de novo pra ver a "
+            "quantidade sugerida de ações em cada ativo."
+        )
+
+    def _color_direction(val):
+        if val == "COMPRA":
+            return f"color: {PALETA['compra']}; font-weight: 600"
+        if val == "VENDA":
+            return f"color: {PALETA['venda']}; font-weight: 600"
+        return f"color: {PALETA['neutro']}"
+
+    def _color_exaustao(val):
+        if not val:
+            return f"color: {PALETA['neutro']}"
+        cor = PALETA["compra"] if "↑" in str(val) else PALETA["venda"]
+        return f"color: {cor}; font-weight: 600"
+
+    vista = result_df
+    if "Exaustão" in result_df.columns:
+        n_exaustao = int((result_df["Exaustão"] != "").sum())
+        if n_exaustao:
+            with barra_dir:
+                so_exaustao = st.checkbox(
+                    f"🎯 Só os {n_exaustao} com exaustão de IFR", value=False,
+                    key="scan_f_exaustao",
+                    help="Exaustão simultânea em 2+ timeframes é rara e vale mais "
+                         "que score alto isolado.",
+                )
+            if so_exaustao:
+                vista = result_df[result_df["Exaustão"] != ""]
+
+    # `on_select`: clicar na linha abre o ativo. Antes eram dois widgets
+    # (um selectbox e um botão) abaixo da tabela pra fazer a mesma coisa,
+    # com o nome do ativo tendo que ser reencontrado numa lista.
+    selecao = st.dataframe(
+        vista.style.map(_color_direction, subset=["Direção"])
+                   .map(_color_exaustao, subset=["Exaustão"]),
+        hide_index=True, use_container_width=True,
+        height=min(520, 45 + 35 * len(vista)),
+        on_select="rerun", selection_mode="single-row", key="scanner_tabela",
+        column_config={
+            "Exaustão": st.column_config.TextColumn(
+                "Exaustão IFR", width="small",
+                help="Timeframes em exaustão simultânea na mesma direção",
+            ),
+        },
+    )
+    st.caption("Clique numa linha para abrir o gráfico e as 6 leituras do ativo.")
+
+    linhas = selecao.get("selection", {}).get("rows") or []
+    if linhas:
+        _ir_para("ativo", symbol=vista.iloc[linhas[0]]["Ativo"])
+
+
+# ========================================================================
+# Páginas
+# ========================================================================
+# `st.Page` só aceita callable SEM argumentos ("The callable can't accept
+# arguments"), então o que a sidebar apura (fonte, estilo, modalidade,
+# perfil, params...) chega aqui por este dicionário em vez de por parâmetro.
+# As funções `render_*` mantêm as assinaturas antigas — estas páginas são
+# casquinhas que montam o cabeçalho e chamam elas.
+CTX: dict = {}
+
+
+def _rotulo_fonte(source: str) -> str:
+    return "Homelab · tempo real" if source == "Homelab (API)" else "Yahoo · ~20min"
+
+
+def _estilo_do_ativo(symbol: str) -> str:
+    """O Mini Índice deixou de ser um modo à parte e virou um símbolo como
+    outro qualquer — mas ele opera em M5+M15 com contexto M2/H1, não no
+    estilo escolhido na sidebar. Resolver por aqui é o que permite a
+    unificação: `estilo()` já conhece os dois conjuntos (`_ESTILOS_TODOS`)."""
+    return WINFUT_STYLE if symbol == WINFUT_SYMBOL else CTX["style"]
+
+
+def _ativo_disponivel(symbol: str) -> bool:
+    """Guardas do WINFUT. Ele NÃO existe no Yahoo: o nome atravessa
+    `yahoo_symbol` intacto e volta "símbolo não encontrado", o que pareceria
+    bug da ferramenta. Avisa antes de tentar, dizendo o que fazer."""
+    if symbol != WINFUT_SYMBOL:
+        return True
+    if CTX["source"] != "Homelab (API)":
+        st.warning(
+            "O Mini Índice só existe pela **Homelab (API)** — ele vem do MetaTrader 5 "
+            "pelo scraper, e o Yahoo Finance não tem esse contrato. Troque a fonte em "
+            "*Configuração › Dados*, na barra lateral.",
+            icon="🏠",
+        )
+        return False
+    if symbol not in st.session_state.watchlist:
+        st.warning(
+            f"**{symbol}** não está na watchlist, então o scraper não está coletando as "
+            "velas dele. Adicione em *Configuração › Watchlist* e confira na VM se "
+            "`SCRAPER_SYMBOL_MT5` aponta pro nome do contrato no seu MT5 (contínuo "
+            "`WIN$` ou o vencimento vigente).",
+            icon="📋",
+        )
+        return False
+    st.info(
+        "**Contrato futuro, não é ação.** Alavancagem e horário de negociação são "
+        "diferentes, e o contrato vira de vencimento periodicamente — o histórico é "
+        "contínuo aqui porque o scraper traduz o nome, não porque o papel é o mesmo.",
+        icon="⚠️",
+    )
+    return True
+
+
+def _pagina_oportunidades() -> None:
+    _page_header(
+        "Oportunidades agora",
+        [("Estilo", CTX["style"]), ("Perfil", CTX["perfil"]),
+         ("Watchlist", f"{len(st.session_state.watchlist)} ativos"),
+         ("Fonte", _rotulo_fonte(CTX["source"]))],
+    )
+    render_dashboard(
+        CTX["source"], CTX["count"], CTX["risk_budget"], CTX["params"],
+        # top 4 perfis customizados — o "padrão" já é a opção "Todos"
+        perfis=[p for p in sorted(st.session_state.perfis) if p != DEFAULT_PROFILE_NAME][:4],
+        style=CTX["style"],
     )
 
-    # Linha 1: direção + ativo + score + setup
-    c1, c2, c3, c4 = st.columns([1.2, 2, 1.5, 1.5])
-    with c1:
-        st.markdown(f'<span style="font-size:20px">{icone}</span> **{acao}**', unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"### {symbol}")
-        st.caption(f"{row.get('Setup', '')[:50]}")
-    with c3:
-        st.metric("Score", f"{score:.0f}", qualidade, label_visibility="visible")
-    with c4:
-        st.caption(f"RR: **1:{rr:.1f}**" if rr else "")
-        st.caption(f"perfil: `{perfil}`")
 
-    # Linha 2: níveis de preço
-    if entrada and stop and alvo:
-        cols = st.columns(5)
-        cols[0].metric("Entrada", f"R$ {entrada:.2f}")
-        cols[1].metric("Stop", f"R$ {stop:.2f}", f"{(stop-entrada)/entrada*100:+.2f}%",
-                       delta_color="inverse")
-        cols[2].metric("Alvo", f"R$ {alvo:.2f}", f"{(alvo-entrada)/entrada*100:+.2f}%")
-        if qty and qty > 0:
-            cols[3].metric("Qtd", f"{int(qty)}")
-            cols[4].metric("Total", f"R$ {total:.0f}" if total else "—")
-        elif risk_budget:
-            risk_per_share = abs(entrada - stop)
-            if risk_per_share > 0:
-                qtd_calc = int(risk_budget // risk_per_share)
-                cols[3].metric("Qtd", f"{qtd_calc}")
-                cols[4].metric("Risco", f"R$ {qtd_calc * risk_per_share:.0f}")
+def _pagina_scanner() -> None:
+    _page_header(
+        "Scanner de mercado",
+        [("Watchlist", f"{len(st.session_state.watchlist)} ativos"),
+         ("Estilo", CTX["style"]), ("Leitura", CTX["modality"]),
+         ("Perfil", CTX["perfil"]), ("Fonte", _rotulo_fonte(CTX["source"]))],
+    )
+    render_scanner(CTX["style"], CTX["modality"], CTX["source"], CTX["count"],
+                   CTX["risk_budget"], CTX["params"], CTX["perfil"])
 
-    # Linha 3: ações
-    c_esq, c_dir = st.columns([1, 4])
-    with c_esq:
-        if st.button("📊 Ver análise", key=f"dash_ver_{symbol}_{perfil}_{row.name}",
-                     use_container_width=True):
-            st.session_state.jump_to_symbol = symbol
-            st.rerun()
-    with c_dir:
-        # Link compartilhável direto pro ativo
-        link = f"https://acoes.dondon.services/?mode=Análise+individual&symbol={symbol}&perfil={perfil}"
-        if st.button(f"🔗 Copiar link de {symbol}", key=f"dash_share_{symbol}_{perfil}_{row.name}",
-                     use_container_width=True):
-            st.code(link, language=None)
-            st.caption("Link para esta oportunidade — cole onde quiser.")
 
-    st.markdown('</div>', unsafe_allow_html=True)
+def _pagina_ativo() -> None:
+    symbol = st.session_state.symbol_select
+    style = _estilo_do_ativo(symbol)
+    _page_header(
+        symbol,
+        [("Estilo", style), ("Leitura", CTX["modality"]), ("Perfil", CTX["perfil"]),
+         ("Fonte", _rotulo_fonte(CTX["source"]))],
+    )
+
+    # Auto-atualização mora aqui, não na sidebar: é uma ação SOBRE esta tela.
+    with st.popover("🔄 Atualização"):
+        auto_refresh = st.checkbox("Atualizar automaticamente", key="auto_refresh_on")
+        intervalo = st.select_slider(
+            "Intervalo", options=[30, 60, 120, 300], value=60,
+            format_func=lambda s: f"{s}s", disabled=not auto_refresh,
+            key="auto_refresh_intervalo",
+        )
+
+    if not _ativo_disponivel(symbol):
+        return
+
+    args = (symbol, style, CTX["modality"], CTX["source"], CTX["count"],
+            CTX["risk_budget"], params_para_estilo(CTX["params"], style), CTX["perfil"])
+    if auto_refresh:
+        st.caption(f"🔄 Atualizando sozinho a cada {intervalo}s")
+        _AUTO_REFRESH_FRAGMENTS[intervalo](*args)
+    else:
+        render_individual_analysis(*args)
+
+
+def _pagina_retroativa() -> None:
+    symbol = st.session_state.symbol_select
+    style = _estilo_do_ativo(symbol)
+    _page_header(
+        "Verificação retroativa",
+        [("Ativo", symbol), ("Estilo", style), ("Leitura", CTX["modality"]),
+         ("Perfil", CTX["perfil"])],
+    )
+    if not _ativo_disponivel(symbol):
+        return
+    render_retro_check(symbol, style, CTX["modality"], CTX["source"],
+                       CTX["count"], params_para_estilo(CTX["params"], style))
+
+
+def _pagina_acompanhar() -> None:
+    _page_header(
+        "Acompanhamento de sinais",
+        [("Perfil", CTX["perfil"]), ("Janela", "últimas 24h")],
+    )
+    render_acompanhamento()
+
+
+def _pagina_assertividade() -> None:
+    _page_header("Assertividade medida")
+    render_assertividade(sorted(st.session_state.perfis))
+
+
+_FUNCOES_DE_PAGINA = {
+    "oportunidades": _pagina_oportunidades,
+    "scanner": _pagina_scanner,
+    "ativo": _pagina_ativo,
+    "retroativa": _pagina_retroativa,
+    "acompanhar": _pagina_acompanhar,
+    "assertividade": _pagina_assertividade,
+}
+
+# `default=True` faz a rota ser servida na raiz e IGNORA `url_path` (doc do
+# st.Page), por isso a landing não declara caminho.
+PAGINAS = {
+    rota: st.Page(
+        funcao, title=ROTAS[rota][1], icon=ROTAS[rota][0],
+        **({"default": True} if rota == ROTA_PADRAO else {"url_path": rota}),
+    )
+    for rota, funcao in _FUNCOES_DE_PAGINA.items()
+}
+
+# `position="hidden"`: as pills de dois níveis lá embaixo são a navegação. O
+# menu nativo mostraria as seis rotas achatadas numa lista, que é exatamente
+# a falta de hierarquia que este redesenho existe pra resolver.
+_pg = st.navigation(list(PAGINAS.values()), position="hidden")
+ROTA_ATUAL = _pg.url_path or ROTA_PADRAO
+
+
+def _redirecionar_link_antigo() -> None:
+    """Links já compartilhados apontam para `?mode=<nome do modo antigo>`.
+    Traduz para a rota nova e redireciona; sem isto eles cairiam na landing
+    sem nenhum aviso, que é pior que um erro."""
+    antigo = st.query_params.get("mode")
+    if not antigo:
+        return
+    destino, symbol = _ALIAS_MODOS.get(antigo, (None, None))
+    # Some com o `mode` primeiro, senão o redirect se repete a cada rerun.
+    del st.query_params["mode"]
+    if destino is None:
+        return
+    if symbol:
+        st.session_state.symbol_select = symbol
+    st.switch_page(PAGINAS[destino])
+
+
+_redirecionar_link_antigo()
+_aplicar_deep_link()
 
 
 # ========================================================================
 # Sidebar
 # ========================================================================
+# Dividida em duas metades por um `st.divider()`: em cima o que se mexe todo
+# dia (estilo, leitura, risco, ativo, perfil); embaixo, no bloco
+# "Configuração", o que se ajusta uma vez e não se olha mais (fonte da
+# informação, watchlist, os 39 parâmetros do motor). Antes disso eram dez
+# seções na mesma pilha, e as três decisões que importam ficavam soterradas.
+#
+# Os expanders de configuração são IRMÃOS, não aninhados: o Streamlit não
+# permite expander dentro de expander.
 with st.sidebar:
     st.markdown("## 📊 Day Trade SMC")
-    st.caption("SMC · Price Action · Médias Móveis · VWAP · IFR")
 
-    st.markdown("### Fonte de dados")
-    source = st.radio(
-        "Fonte", DATA_SOURCES, key="source_select", horizontal=True,
-        help="\"Homelab (API)\" lê candles pela API do homelab, alimentada por um scraper "
-             "MT5 que roda continuamente numa VM — dado real, poucos segundos de atraso. "
-             "É o caminho recomendado. \"Yahoo Finance\" funciona em qualquer lugar, sem "
-             "depender de nada seu estar no ar, mas o dado nasce ~15-20min atrasado.",
-    )
-    if source == "Homelab (API)":
-        if not daytrade_smc.ACOES_API_URL:
-            st.caption(
-                "⚠️ ACOES_API_URL não está configurada (st.secrets ou variável de "
-                "ambiente) — esta fonte vai dar erro. Use Yahoo Finance enquanto isso."
-            )
+    # O frescor do dado sobe pro topo: é o único fato da fonte que muda de
+    # minuto a minuto, e é o que decide se dá pra confiar na tela agora.
+    # `last_candle_time`, não `last_ingested_at` — este último congela com o
+    # mercado fechado e pareceria que a coleta caiu.
+    if st.session_state.source_select != "Homelab (API)":
+        st.caption("⏱️ Yahoo Finance · atraso de ~15-20min")
+    elif not daytrade_smc.ACOES_API_URL:
+        st.caption("⚠️ `ACOES_API_URL` não configurada — use o Yahoo por enquanto")
+    else:
+        _ultima = _ultima_vela()
+        if _ultima is None:
+            st.caption("🏠 Homelab · não consegui ler o `/status` agora")
         else:
-            ultima = _ultima_vela()
-            if ultima is None:
-                st.caption("🏠 API do homelab · não consegui ler o `/status` agora.")
-            else:
-                st.caption(
-                    "🏠 Última vela: "
-                    f"{ultima.tz_convert('America/Sao_Paulo').strftime('%d/%m/%Y %H:%M')} · "
-                    "congela com o mercado fechado, isso é o esperado."
-                )
+            st.caption(
+                "🏠 Última vela "
+                f"{_ultima.tz_convert('America/Sao_Paulo').strftime('%d/%m %H:%M')}"
+                " · congela com o mercado fechado"
+            )
 
-    st.markdown("### Estilo de operação")
-    style = st.radio(
-        "Estilo", list(STYLES.keys()), key="style_select", horizontal=True,
+    st.divider()
+
+    style = st.segmented_control(
+        "Estilo", list(STYLES.keys()), key="style_select", default="Day Trade",
+        required=True,
         help="Day Trade confirma em M15+H1 (posições no mesmo dia). "
-             "Swing Trade confirma em Diário+Semanal (posições de dias a semanas), com H4 como contexto de timing de entrada.",
+             "Swing Trade confirma em Diário+Semanal (posições de dias a semanas), "
+             "com H4 como contexto de timing de entrada.",
     )
     conf_a, conf_b = estilo(style)["confirmation"]
 
-    st.markdown("### Modalidade")
     modality = st.selectbox(
-        "Qual leitura usar como base da recomendação", MODALITY_CHOICES, key="modality_select",
+        "Leitura", MODALITY_CHOICES, key="modality_select",
         help="Confluência combina as 4 categorias estruturais (SMC, Price Action, Médias Móveis, "
              "VWAP). SMC/Price Action/Médias Móveis/VWAP/IFR usam só a leitura isolada daquela "
              "categoria. O IFR é leitura de EXAUSTÃO, contrária por natureza: só aponta direção "
@@ -1838,40 +2182,24 @@ with st.sidebar:
              "a confirmação e ordenar o Scanner.",
     )
 
-    # "Ativo para análise" fica SEMPRE visível — é o que se mexe todo dia.
-    # Gerenciar a watchlist é configuração de uma vez só, então desce pro
-    # expander. Separação sugerida pela auditoria do projeto original.
-    if mode in ("Análise individual", "Verificação retroativa", "Dashboard"):
-        st.markdown("### Ativo")
-        st.selectbox("Ativo para análise", st.session_state.watchlist, key="symbol_select")
+    # Risco subiu da antiga seção "Parâmetros": é ele que transforma um sinal
+    # em quantidade de ações, então aparece em todo card do Oportunidades.
+    risk_budget = st.number_input(
+        "Risco máximo (R$)", min_value=0.0, value=0.0, step=50.0, key="risk_budget_input",
+        help="Quanto você aceita perder se o stop for acionado. Zero = não calcular quantidade.",
+    )
+    risk_budget = risk_budget if risk_budget > 0 else None
 
-    with st.expander("Gerenciar watchlist", expanded=False):
-        st.caption(f"{len(st.session_state.watchlist)} ativo(s) monitorado(s)")
-        new_symbol = st.text_input("Adicionar ativo (ex: VALE3)", key="new_symbol_input")
-        if st.button("Adicionar", use_container_width=True) and new_symbol.strip():
-            value = new_symbol.strip().upper().replace(" ", "")
-            if value not in st.session_state.watchlist:
-                st.session_state.watchlist.append(value)
-                _persist_watchlist()
-            st.rerun()
+    # O seletor de ativo só existe nas rotas que leem `symbol_select`. Antes
+    # ele aparecia também no Dashboard, que nunca olhou pra essa chave.
+    if ROTA_ATUAL in ("ativo", "retroativa"):
+        st.selectbox("Ativo", st.session_state.watchlist, key="symbol_select")
 
-        remove_symbol = st.selectbox("Remover ativo", ["—"] + st.session_state.watchlist, key="remove_symbol_select")
-        if st.button("Remover", use_container_width=True) and remove_symbol != "—":
-            st.session_state.watchlist = [s for s in st.session_state.watchlist if s != remove_symbol]
-            _persist_watchlist()
-            st.rerun()
-
-        if st.button("Restaurar lista padrão", use_container_width=True):
-            st.session_state.watchlist = DEFAULT_SYMBOLS.copy()
-            _persist_watchlist()
-            st.rerun()
-
-    st.markdown("### Perfil de análise")
     perfil = st.selectbox(
-        "Calibragem do motor", sorted(st.session_state.perfis), key="perfil_select",
+        "Perfil", sorted(st.session_state.perfis), key="perfil_select",
         help="Um perfil é um conjunto nomeado de parâmetros do motor. Cada sinal salvo "
              "guarda o perfil que o gerou, então dá pra comparar a assertividade de uma "
-             "calibragem contra a outra no modo Assertividade.",
+             "calibragem contra a outra na tela Assertividade.",
     )
     # O estilo pode trocar os limiares do IFR (Swing opera 20/80, Day
     # Trade 10/90) quando o perfil não escolheu os seus. A comparação
@@ -1881,15 +2209,8 @@ with st.sidebar:
     params = params_para_estilo(_params_da_sessao(), style)
     _salvo = st.session_state.perfis.get(perfil)
     _alterado = _salvo is None or params != params_para_estilo(_salvo, style)
-    st.caption(f"hash `{params.params_hash()[:8]}`" + (" · **alterado, não salvo**" if _alterado else ""))
-    if (params.rsi_sobrevenda, params.rsi_sobrecompra) != (
-        _params_da_sessao().rsi_sobrevenda, _params_da_sessao().rsi_sobrecompra
-    ):
-        st.caption(
-            f"IFR ajustado pro estilo: exaustão em "
-            f"{params.rsi_sobrevenda:.0f}/{params.rsi_sobrecompra:.0f}. "
-            "Salve o perfil com outro par pra fixar."
-        )
+    st.caption(f"hash `{params.params_hash()[:8]}`"
+               + (" · **alterado, não salvo**" if _alterado else ""))
 
     if params.normalizacao_score != params.filtro_isolada_score_max:
         st.warning(
@@ -1899,7 +2220,58 @@ with st.sidebar:
             "normalizar em 1.0. Separados, a escala da confluência sai do lugar."
         )
 
-    with st.expander("Ajustar parâmetros", expanded=False):
+    st.divider()
+    st.caption("**Configuração** — ajusta uma vez e esquece")
+
+    with st.expander("⚙️ Dados", expanded=False):
+        source = st.radio(
+            "Fonte", DATA_SOURCES, key="source_select",
+            help="\"Homelab (API)\" lê candles pela API do homelab, alimentada por um scraper "
+                 "MT5 que roda continuamente numa VM — dado real, poucos segundos de atraso. "
+                 "É o caminho recomendado. \"Yahoo Finance\" funciona em qualquer lugar, sem "
+                 "depender de nada seu estar no ar, mas o dado nasce ~15-20min atrasado.",
+        )
+        count = st.slider(estilo(style)["count_label"], min_value=50, max_value=400,
+                          value=250, step=10, key="count_slider")
+        st.caption(
+            f"A recomendação exige **{TIMEFRAME_LABELS[conf_a]}** e "
+            f"**{TIMEFRAME_LABELS[conf_b]}** concordando. "
+            f"{', '.join(TIMEFRAME_LABELS[tf] for tf in estilo(style)['context'])} "
+            "entra como contexto."
+        )
+
+    with st.expander("📋 Watchlist", expanded=False):
+        st.caption(f"{len(st.session_state.watchlist)} ativo(s) monitorado(s)")
+        new_symbol = st.text_input("Adicionar ativo (ex: VALE3)", key="new_symbol_input")
+        if st.button("Adicionar", use_container_width=True) and new_symbol.strip():
+            value = new_symbol.strip().upper().replace(" ", "")
+            if value not in st.session_state.watchlist:
+                st.session_state.watchlist.append(value)
+                _persist_watchlist()
+            st.rerun()
+
+        remove_symbol = st.selectbox("Remover ativo", ["—"] + st.session_state.watchlist,
+                                     key="remove_symbol_select")
+        if st.button("Remover", use_container_width=True) and remove_symbol != "—":
+            st.session_state.watchlist = [s for s in st.session_state.watchlist
+                                          if s != remove_symbol]
+            _persist_watchlist()
+            st.rerun()
+
+        if st.button("Restaurar lista padrão", use_container_width=True):
+            st.session_state.watchlist = DEFAULT_SYMBOLS.copy()
+            _persist_watchlist()
+            st.rerun()
+
+    with st.expander("🎛️ Parâmetros do motor", expanded=False):
+        if (params.rsi_sobrevenda, params.rsi_sobrecompra) != (
+            _params_da_sessao().rsi_sobrevenda, _params_da_sessao().rsi_sobrecompra
+        ):
+            st.caption(
+                "IFR ajustado pro estilo: exaustão em "
+                f"{params.rsi_sobrevenda:.0f}/{params.rsi_sobrecompra:.0f}. "
+                "Salve o perfil com outro par pra fixar."
+            )
         for grupo, campos in PARAM_UI.items():
             st.markdown(f"**{grupo}**")
             for campo, rotulo, minimo, maximo, passo in campos:
@@ -1912,7 +2284,8 @@ with st.sidebar:
                 colunas = st.columns(len(rotulos))
                 for i, (coluna, rotulo) in enumerate(zip(colunas, rotulos)):
                     with coluna:
-                        st.number_input(rotulo, step=passo, key=f"param_{campo}_{i}", format=formato)
+                        st.number_input(rotulo, step=passo, key=f"param_{campo}_{i}",
+                                        format=formato)
 
         st.divider()
         novo_perfil = st.text_input("Salvar como perfil", value=perfil, key="novo_perfil_input")
@@ -1930,7 +2303,8 @@ with st.sidebar:
                     st.session_state.perfil_pendente = novo_perfil.strip()
                     st.rerun()
         with col_remover:
-            if st.button("Remover perfil", use_container_width=True, disabled=perfil == DEFAULT_PROFILE_NAME):
+            if st.button("Remover perfil", use_container_width=True,
+                         disabled=perfil == DEFAULT_PROFILE_NAME):
                 try:
                     delete_profile(perfil)
                 except Exception as exc:
@@ -1943,210 +2317,55 @@ with st.sidebar:
             st.session_state.perfil_aplicado = None
             st.rerun()
 
-    st.markdown("### Parâmetros")
-    st.caption(f"A recomendação exige **{TIMEFRAME_LABELS[conf_a]}** e **{TIMEFRAME_LABELS[conf_b]}** concordando "
-              f"(ver \"Filtro multi-timeframe\" no rodapé). "
-              f"{', '.join(TIMEFRAME_LABELS[tf] for tf in estilo(style)['context'])} aparece como contexto adicional.")
-    count = st.slider(estilo(style)["count_label"], min_value=50, max_value=400, value=250, step=10)
-    risk_budget = st.number_input("Risco máximo (R$) — opcional", min_value=0.0, value=0.0, step=50.0)
-    risk_budget = risk_budget if risk_budget > 0 else None
 
-    # Inicializados INCONDICIONALMENTE, antes da cadeia de modos: eles são
-    # lidos lá embaixo no corpo principal sem guarda nenhuma, e até aqui só
-    # funcionava porque o if/elif do corpo espelhava exatamente o daqui. Com
-    # mais um modo, esse acoplamento vira NameError na primeira divergência.
-    auto_refresh = False
-    refresh_interval = 60
-    run_scanner_clicked = False
-
-    if mode == "Análise individual":
-        st.markdown("### Atualização")
-        auto_refresh = st.checkbox("Atualizar automaticamente")
-        refresh_interval = st.select_slider(
-            "Intervalo", options=[30, 60, 120, 300], value=60, format_func=lambda s: f"{s}s",
-            disabled=not auto_refresh,
-        )
-    elif mode == "Scanner":
-        run_scanner_clicked = st.button("🔍 Rodar scanner", type="primary", use_container_width=True)
-    # Dashboard não precisa de controles extra — roda automático
-
-    # Footer da sidebar — ajuda rápida
-    with st.expander("ℹ️ Como usar", expanded=False):
-        st.markdown("""
-        **Dashboard**: melhores oportunidades agora, organizadas por perfil.
-        **Scanner**: tabela com todos os ativos da watchlist.
-        **Acompanhamento**: marque sinais como ignorado, acompanhar ou operar.
-        **Análise individual**: gráfico + 6 leituras de um ativo.
-        **Retroativa**: veja como um sinal teria se saído no passado.
-        **Assertividade**: taxa de acerto medida dos sinais gravados.
-
-        💡 **Dica**: use 'Copiar link' pra compartilhar qualquer view.
-        """)
+CTX.update(
+    source=source, style=style, modality=modality, count=count,
+    risk_budget=risk_budget, params=params, perfil=perfil,
+)
 
 
 # ========================================================================
 # Corpo principal
 # ========================================================================
-# Título contextual por modo (mais limpo que título fixo)
-if mode == "Dashboard":
-    st.title("📊 Oportunidades agora")
-elif mode == "Scanner":
-    st.title("🔍 Scanner de mercado")
-elif mode == "Acompanhamento":
-    st.title("📋 Acompanhamento de sinais")
-elif mode == "Análise individual":
-    st.title("📈 Análise técnica")
-elif mode == "Verificação retroativa":
-    st.title("🕵️ Verificação retroativa")
-elif mode == "Assertividade":
-    st.title("📉 Assertividade medida")
-else:
-    st.title("📊 Day Trade SMC")
+def _render_nav(rota: str) -> None:
+    """As pills de dois níveis. Elas REFLETEM a URL — quem manda é a rota,
+    não o session_state.
 
-# O aviso ACOMPANHA a fonte. Fixo no texto do Yahoo, ele mentia toda vez que
-# a fonte era o homelab: anunciava 20 minutos de atraso num dado de poucos
-# segundos, e um aviso que mente é pior que nenhum — o usuário aprende a
-# ignorar a faixa amarela inteira.
-if source == "Homelab (API)":
-    st.warning(
-        "⚠️ **Dado real do MT5, com poucos segundos de atraso** — mas é **candle "
-        "fechado, não book.** Use para **viés e estrutura** (tendência, níveis, força "
-        "relativa entre ativos). Antes de entrar numa operação, confirme o preço e a "
-        "liquidez na tela da sua corretora.",
-        icon="🏠",
+    A ressincronização só acontece quando a URL mudou por fora (voltar,
+    avançar, F5, link colado). Reatribuir a chave em todo rerun apagaria o
+    clique do usuário antes de conseguirmos lê-lo: no rerun do clique a URL
+    ainda é a antiga, e é o `st.switch_page` que vai trocá-la."""
+    grupo_atual = next(g for g, rotas in NAV_GRUPOS.items() if rota in rotas)
+
+    if st.session_state.get("_nav_url_vista") != rota:
+        st.session_state["_nav_url_vista"] = rota
+        st.session_state["nav_grupo"] = grupo_atual
+        st.session_state["nav_sub"] = rota
+
+    # Sem `default=`: o bloco acima garante que a chave já existe no
+    # session_state antes do widget nascer, e passar os dois faz o Streamlit
+    # avisar "created with a default value but also had its value set via the
+    # Session State API" em todo rerun.
+    #
+    # `required=True` não é estético: sem ele dá pra clicar no pill já
+    # selecionado pra DESMARCAR, e a navegação devolveria None.
+    escolha = st.segmented_control(
+        "Navegação", list(NAV_GRUPOS), key="nav_grupo",
+        required=True, label_visibility="collapsed",
     )
-else:
-    st.warning(
-        "⚠️ **Dados do Yahoo Finance com atraso de ~15-20 minutos.** Use esta ferramenta para "
-        "**viés e estrutura** (tendência, níveis, força relativa entre ativos) — **nunca para o "
-        "preço/timing exato de execução.** Antes de entrar numa operação, confirme o preço real "
-        "no ProfitChart ou na tela da sua corretora.",
-        icon="⏱️",
-    )
+    if escolha and escolha != grupo_atual:
+        _ir_para(NAV_GRUPOS[escolha][0])
 
-if mode == "Dashboard":
-    render_dashboard(source, count, risk_budget, params,
-                     perfis=[p for p in sorted(st.session_state.perfis)
-                             if p != DEFAULT_PROFILE_NAME][:4],  # top 4 perfis custom
-                     style=style)
-
-elif mode == "Acompanhamento":
-    render_acompanhamento(params)
-
-elif mode == "Scanner":
-    _render_breadcrumb("Scanner")
-    _render_share_button()
-    st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · leitura: {modality} · "
-               f"perfil: {perfil} · {count} candles · recomendação exige {conf_a}+{conf_b} concordando")
-
-    if run_scanner_clicked:
-        st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, modality, source, count, risk_budget, params)
-        st.session_state.scanner_risk_budget = risk_budget
-
-    if "scanner_result" in st.session_state:
-        result_df = st.session_state.scanner_result
-
-        if not st.session_state.get("scanner_risk_budget"):
-            st.info("Defina o **Risco máximo (R$)** na barra lateral e rode o scanner de novo pra ver a "
-                    "quantidade sugerida de ações em cada ativo.")
-
-        def _color_direction(val):
-            if val == "COMPRA":
-                return "color: #2ed3a3; font-weight: 600"
-            if val == "VENDA":
-                return "color: #ff5470; font-weight: 600"
-            return "color: #8291a1"
-
-        def _color_exaustao(val):
-            if not val:
-                return "color: #8291a1"
-            cor = "#2ed3a3" if "↑" in str(val) else "#ff5470"
-            return f"color: {cor}; font-weight: 600"
-
-        vista = result_df
-        if "Exaustão" in result_df.columns:
-            n_exaustao = int((result_df["Exaustão"] != "").sum())
-            if n_exaustao:
-                st.caption(
-                    f"🎯 {n_exaustao} ativo(s) com exaustão de IFR. Exaustão simultânea em "
-                    "2+ timeframes é rara e vale mais que score alto isolado."
-                )
-                if st.checkbox("Só com exaustão de IFR", value=False, key="scan_f_exaustao"):
-                    vista = result_df[result_df["Exaustão"] != ""]
-
-        st.dataframe(
-            vista.style.map(_color_direction, subset=["Direção"])
-                       .map(_color_exaustao, subset=["Exaustão"]),
-            hide_index=True, use_container_width=True, height=min(450, 45 + 35 * len(vista)),
-            column_config={
-                "Exaustão": st.column_config.TextColumn(
-                    "Exaustão IFR", width="small",
-                    help="Timeframes em exaustão simultânea na mesma direção",
-                ),
-            },
+    irmas = NAV_GRUPOS[grupo_atual]
+    if len(irmas) > 1:
+        sub = st.segmented_control(
+            "Seção", irmas, key="nav_sub", required=True,
+            label_visibility="collapsed",
+            format_func=lambda r: f"{ROTAS[r][0]} {ROTAS[r][1]}",
         )
+        if sub and sub != rota:
+            _ir_para(sub)
 
-        st.markdown("#### Abrir análise completa de um ativo")
-        pick = st.selectbox("Ativo", result_df["Ativo"].tolist(), key="scanner_pick_select")
-        if st.button("Ver gráfico e as 6 leituras completas"):
-            st.session_state.jump_to_symbol = pick
-            st.rerun()
-    else:
-        st.info("Clique em **Rodar scanner** na barra lateral para analisar todos os ativos da watchlist.")
 
-elif mode == "Análise individual":
-    symbol = st.session_state.symbol_select
-
-    if auto_refresh:
-        st.caption(f"🔄 Atualizando automaticamente a cada {refresh_interval}s")
-        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, source, count, risk_budget, params, perfil)
-    else:
-        _render_breadcrumb("Análise individual")
-        _render_share_button()
-        render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
-
-elif mode == "Verificação retroativa":
-    _render_breadcrumb("Verificação retroativa")
-    symbol = st.session_state.symbol_select
-    render_retro_check(symbol, style, modality, source, count, params)
-
-elif mode == "Assertividade":
-    _render_breadcrumb("Assertividade")
-    render_assertividade(sorted(st.session_state.perfis))
-
-else:  # Mini Índice (WINFUT)
-    # O mini índice NÃO existe no Yahoo: "WINFUT" atravessa `yahoo_symbol`
-    # intacto e o Yahoo devolve "símbolo não encontrado", que pareceria bug
-    # da ferramenta. Bloqueia antes de tentar, dizendo o que fazer.
-    if source != "Homelab (API)":
-        st.warning(
-            "O Mini Índice só existe pela **Homelab (API)** — ele vem do MetaTrader 5 "
-            "pelo scraper, e o Yahoo Finance não tem esse contrato. Troque a fonte na "
-            "barra lateral.",
-            icon="🏠",
-        )
-    elif WINFUT_SYMBOL not in st.session_state.watchlist:
-        st.warning(
-            f"**{WINFUT_SYMBOL}** ainda não está na watchlist, então o scraper não está "
-            "coletando as velas dele. Adicione em *Gerenciar watchlist* na barra lateral "
-            "e confira no scraper da VM se `SCRAPER_SYMBOL_MT5` aponta pro nome do "
-            "contrato no seu MT5 (contínuo `WIN$` ou o vencimento vigente).",
-            icon="📋",
-        )
-    else:
-        conf_win = ", ".join(TIMEFRAME_LABELS[tf] for tf in WINFUT_CONFIRMATION_TIMEFRAMES)
-        ctx_win = ", ".join(TIMEFRAME_LABELS[tf] for tf in WINFUT_CONTEXT_TIMEFRAMES)
-        st.caption(
-            f"📈 Contrato futuro do mini índice · leitura: {modality} · perfil: {perfil} · "
-            f"{count} candles · recomendação exige {conf_win} concordando · contexto: {ctx_win}"
-        )
-        st.info(
-            "**Contrato futuro, não é ação.** Alavancagem e horário de negociação são "
-            "diferentes, e o contrato vira de vencimento periodicamente — o histórico é "
-            "contínuo aqui porque o scraper traduz o nome, não porque o papel é o mesmo.",
-            icon="⚠️",
-        )
-        render_individual_analysis(
-            WINFUT_SYMBOL, WINFUT_STYLE, modality, source, count, risk_budget,
-            params_para_estilo(params, WINFUT_STYLE), perfil,
-        )
+_render_nav(ROTA_ATUAL)
+_pg.run()

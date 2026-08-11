@@ -31,7 +31,7 @@ python daytrade_smc.py VALE3 --timeframe M15 --count 250 --risco 500
 
 ## As duas fontes de dados
 
-Seletor **Fonte de dados** na barra lateral.
+Seletor **Fonte**, na barra lateral, em *Configuração › ⚙️ Dados*.
 
 | Fonte | Atraso | Precisa de quê |
 |---|---|---|
@@ -50,25 +50,50 @@ no ar, e é o fallback quando a API não está configurada. O atraso de 15-20
 minutos é do próprio Yahoo. Candles de H4 não existem lá: são sintetizados
 agregando H1, ancorados na meia-noite de Brasília.
 
-O aviso no topo da tela acompanha a fonte selecionada — ele diz qual atraso
-você está realmente olhando.
+O topo da barra lateral acompanha a fonte selecionada: com o homelab, mostra
+o horário da **última vela** recebida; com o Yahoo, o atraso que você está
+realmente olhando. Cada tela repete a fonte numa etiqueta do cabeçalho.
 
-## Os cinco modos
+## Navegação
 
-### Análise individual
+Quatro grupos no topo, e cada tela tem a **sua própria URL** — dá pra
+recarregar, favoritar, compartilhar, e o **voltar/avançar do navegador
+funciona** entre as telas:
+
+| Grupo | Tela | URL |
+|---|---|---|
+| 🎯 Oportunidades | melhores sinais operáveis agora | `/` |
+| 🔍 Scanner | a watchlist inteira, ranqueada | `/scanner` |
+| 📈 Ativo | gráfico + as 6 leituras · **Agora** | `/ativo` |
+| | como o sinal teria se saído · **Retroativa** | `/retroativa` |
+| 📋 Sinais | triagem do que o worker gravou · **Acompanhar** | `/acompanhar` |
+| | taxa de acerto medida · **Assertividade** | `/assertividade` |
+
+Os grupos com duas telas mostram uma segunda linha de botões pra alternar
+entre elas. O Mini Índice deixou de ser uma tela à parte: **`WINFUT` é só
+mais um ativo do seletor** e a ferramenta troca sozinha pros timeframes dele
+(ver abaixo).
+
+A barra lateral é dividida em duas: em cima o que se mexe todo dia (estilo,
+leitura, risco, ativo, perfil); embaixo, em **Configuração**, o que se ajusta
+uma vez — fonte de dados, watchlist e os parâmetros do motor.
+
+## As telas
+
+### Ativo → Agora
 
 Gráfico de candles (Plotly) com EMAs, VWAP, swings, marcações de BOS/CHoCH e
-a zona de FVG ainda não preenchida, mais os painéis das seis leituras. Pode
-auto-atualizar a cada 30s–5min, recarregando só o painel em vez da página
-inteira.
+a zona de FVG ainda não preenchida, mais o detalhe da leitura que você
+escolher. Pode auto-atualizar a cada 30s–5min (no botão 🔄 do topo),
+recarregando só o painel em vez da página inteira.
 
 ### Scanner
 
 Roda a análise em todos os ativos da watchlist de uma vez e ranqueia por
 **Score Geral**, confirmados primeiro. Uma coluna **Posição** numera o
-ranking, e dá pra abrir a análise completa de qualquer ativo direto dali.
+ranking, e **clicar numa linha abre a análise completa** daquele ativo.
 
-### Verificação retroativa
+### Ativo → Retroativa
 
 "Esse sinal teria dado certo?" — escolhe um ativo, um timeframe e uma data
 passada; a análise roda usando **só os dados que existiam até aquele
@@ -80,7 +105,13 @@ aberto.
 Yahoo (M15/H1/H4) cobre só ~60 dias; pra datas mais antigas, use Diário ou
 Semanal.
 
-### Assertividade
+### Sinais → Acompanhar
+
+Triagem do que o worker gravou nas últimas 24h, numa tabela ordenável. Marque
+cada sinal como **acompanhar**, **operei** ou **ignorar**, ou pule direto pra
+análise dele. O que já foi decidido continua acessível pelos outros baldes.
+
+### Sinais → Assertividade
 
 Taxa de acerto **por tipo de análise**, recortada por timeframe, ativo,
 direção, faixa de score e se o sinal estava confirmado no multi-timeframe.
@@ -102,19 +133,21 @@ sinais **já resolvidos**. Os em aberto aparecem no contador mas ficam fora da
 conta até bater alvo ou stop — por isso a tabela sempre mostra "sinais" e
 "resolvidos" em colunas separadas.
 
-Este modo depende de `ACOES_API_URL`: é onde o histórico mora. Sem ela, o
-modo explica isso em vez de mostrar número errado.
+Esta tela depende de `ACOES_API_URL`: é onde o histórico mora. Sem ela, ela
+explica isso em vez de mostrar número errado.
 
 ### Mini Índice (WINFUT)
 
-Modo dedicado ao contrato futuro do mini índice, separado da watchlist de
-ações e com timeframes próprios: confirmação em **5 + 15 minutos**, com 2
-minutos pra afinar o timing e 60 minutos de contexto da sessão.
+O contrato futuro do mini índice **não tem tela própria** — selecione
+`WINFUT` no seletor de ativo e a ferramenta troca sozinha para os timeframes
+dele: confirmação em **5 + 15 minutos**, com 2 minutos pra afinar o timing e
+60 minutos de contexto da sessão. O seletor de estilo da barra lateral fica
+sem efeito enquanto ele estiver escolhido.
 
 **Só funciona pela Homelab (API).** O mini índice não existe no Yahoo — ele
 vem do MetaTrader 5, pelo scraper. Pra habilitar:
 
-1. Adicione `WINFUT` à watchlist (em *Gerenciar watchlist*).
+1. Adicione `WINFUT` à watchlist (em *Configuração › Watchlist*).
 2. Na VM do scraper, confira `SCRAPER_SYMBOL_MT5` — o padrão é
    `WINFUT=WIN$`, mas o nome do contrato depende da corretora (pode ser o
    contínuo `WIN$`/`WIN$N` ou o vencimento vigente, tipo `WINZ25`). É o que

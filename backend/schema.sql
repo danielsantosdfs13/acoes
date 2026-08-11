@@ -213,8 +213,24 @@ CREATE TABLE IF NOT EXISTS signal_feedback (
     CONSTRAINT signal_feedback_acao_chk
         CHECK (acao IN ('ACOMPANHAR', 'OPERAR', 'IGNORAR', 'OPEREI', 'CANCELEI')),
     CONSTRAINT signal_feedback_origem_chk
-        CHECK (origem IN ('web', 'whatsapp', 'telegram'))
+        CHECK (origem IN ('web', 'whatsapp', 'telegram', 'auto'))
 );
+
+-- `auto` chegou depois, com o worker aplicando as regras de
+-- `auto_acompanhamento`. O CREATE TABLE acima só vale pra banco novo — em
+-- banco existente a constraint antiga continua lá e rejeitaria a escrita do
+-- worker, então ela é recriada explicitamente. Mesma razão dos ALTER de
+-- `signals` mais acima.
+--
+-- A distinção importa e não é burocracia: um ACOMPANHAR que o worker gerou
+-- por regra NÃO é alguém tendo escolhido acompanhar aquele sinal. Misturar
+-- os dois na mesma origem destruiria justamente a medição que o feedback
+-- existe pra permitir ("acertei mais no que EU escolhi seguir?"), do mesmo
+-- jeito que `origem='consulta'` existe em `signals` pra não deixar uma
+-- consulta passar por medição.
+ALTER TABLE signal_feedback DROP CONSTRAINT IF EXISTS signal_feedback_origem_chk;
+ALTER TABLE signal_feedback ADD CONSTRAINT signal_feedback_origem_chk
+    CHECK (origem IN ('web', 'whatsapp', 'telegram', 'auto'));
 
 CREATE INDEX IF NOT EXISTS signal_feedback_signal_id_idx ON signal_feedback(signal_id);
 CREATE INDEX IF NOT EXISTS signal_feedback_acao_idx ON signal_feedback(acao);

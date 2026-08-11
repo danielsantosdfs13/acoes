@@ -148,6 +148,17 @@ class SignalOut(SignalIn):
     resultado_detalhe: str | None = None
     candles_ate_resultado: int | None = None
     avaliado_em: datetime | None = None
+    # A decisão MAIS RECENTE do operador sobre este sinal (ACOMPANHAR,
+    # OPERAR, IGNORAR, OPEREI, CANCELEI), ou None quando ninguém decidiu
+    # nada ainda. Vem de `signal_feedback`, que guarda o histórico completo
+    # — aqui só a última, porque é ela que descreve o estado atual.
+    #
+    # Nasceu porque a tela de acompanhamento buscava sinais e feedbacks em
+    # duas chamadas e cruzava as duas listas no navegador: além de não dar
+    # pra FILTRAR por decisão no servidor, o cruzamento só enxergava o que
+    # coubesse nos dois limites de paginação ao mesmo tempo.
+    feedback: str | None = None
+    feedback_origem: str | None = None
 
 
 class SignalSaveResult(BaseModel):
@@ -239,6 +250,11 @@ class StatsResponse(BaseModel):
     por_direcao: list[StatsRow]
     por_faixa_score: list[StatsRow]
     por_mtf: list[StatsRow]
+    # Recorte pela decisão do operador. É o que responde "acertei mais no
+    # que eu escolhi operar do que na média?" — a única pergunta que
+    # justifica coletar o feedback. `recorte='PENDENTE'` agrupa os sinais
+    # sobre os quais ninguém decidiu nada.
+    por_feedback: list[StatsRow]
 
 class FeedbackIn(BaseModel):
     """Feedback do usuário sobre um sinal."""

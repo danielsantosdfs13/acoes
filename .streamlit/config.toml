@@ -1,0 +1,24 @@
+# Tema do app. Isto NÃO é enfeite: `build_chart` em `streamlit_app.py` fixa
+# `template="plotly_dark"` e fundo `#0a0e13` no Plotly desde sempre, mas o
+# repo nunca declarou tema nenhum — então a página em volta subia no tema
+# claro padrão do Streamlit e o gráfico escuro ficava cravado no meio dela.
+# Os valores abaixo são os mesmos hexes já usados no código (ver `PALETA`),
+# para a página e o gráfico serem a mesma superfície.
+#
+# `Dockerfile.streamlit` precisa do `COPY .streamlit/` — ele copia arquivo a
+# arquivo, então um diretório novo não sobe sozinho para o k3s.
+[theme]
+base = "dark"
+primaryColor = "#2ed3a3"
+backgroundColor = "#0a0e13"
+secondaryBackgroundColor = "#141b24"
+textColor = "#e7ecf1"
+
+[client]
+# A navegação é desenhada à mão (`st.navigation(..., position="hidden")` e as
+# pills de dois níveis no topo do corpo), então o menu nativo na barra
+# lateral seria um segundo seletor mostrando a mesma coisa.
+showSidebarNavigation = false
+
+[browser]
+gatherUsageStats = false

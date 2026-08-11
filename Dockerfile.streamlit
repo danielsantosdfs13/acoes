@@ -13,6 +13,10 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY daytrade_smc.py streamlit_app.py ./
+# O tema tem que vir junto: `build_chart` desenha o Plotly em escuro, e sem
+# este config.toml a página em volta sobe clara. Como o COPY acima é arquivo
+# a arquivo, um diretório novo não embarca sozinho.
+COPY .streamlit/ ./.streamlit/
 
 EXPOSE 8501
 

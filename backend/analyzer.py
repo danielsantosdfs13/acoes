@@ -274,6 +274,10 @@ def varrer(conn) -> tuple[int, int]:
     respondível pelo LOG (`sem_sinal` abaixo), sem precisar de uma linha de
     banco por não-evento. Ver docs/homelab-pipeline.md.
     """
+    # Marca d'água do início da varredura, usada só pelo auto-acompanhamento
+    # no fim: ele precisa saber o que ESTA passada gravou, pra não carimbar
+    # histórico antigo quando alguém cadastra uma regra nova.
+    desde = datetime.now(UTC)
     symbols = _watchlist(conn)
     perfis = _perfis(conn)
     gravados = 0
@@ -334,7 +338,57 @@ def varrer(conn) -> tuple[int, int]:
             conn.commit()
 
     log.info("varredura: %d leitura(s) sem sinal, não gravada(s)", sem_sinal)
+    automaticos = aplicar_auto_acompanhamento(conn, desde)
+    if automaticos:
+        log.info("auto-acompanhamento: %d sinal(is) marcado(s) por regra", automaticos)
     return gravados, tentados
+
+
+_AUTO_ACOMPANHAMENTO_SQL = """
+INSERT INTO signal_feedback (signal_id, acao, origem, nota)
+SELECT s.id, 'ACOMPANHAR', 'auto',
+       'regra auto_acompanhamento: ' || a.perfil || ' / ' || a.modalidade
+FROM signals s
+JOIN auto_acompanhamento a
+  ON a.perfil = s.perfil AND a.modalidade = s.modalidade AND a.ativo
+WHERE s.origem = %(origem)s
+  AND s.criado_em >= %(desde)s
+  AND NOT EXISTS (
+      SELECT 1 FROM signal_feedback f WHERE f.signal_id = s.id
+  )
+"""
+
+
+def aplicar_auto_acompanhamento(conn, desde: datetime) -> int:
+    """Marca como ACOMPANHAR os sinais desta varredura que batem com uma
+    regra ativa de `auto_acompanhamento`. Devolve quantos marcou.
+
+    Esta função é o consumidor que faltava. A tabela, os dois endpoints e o
+    texto que promete "o worker-acoes aplica essas regras" entraram em
+    2026-08-11 sem que nada aqui fosse alterado: dava pra cadastrar regra e
+    ela nunca produzia efeito nenhum — a tela de acompanhamento mostrava
+    tudo pendente para sempre.
+
+    Três decisões que o SQL carrega:
+
+    - `origem='auto'`, nunca 'web'. Um ACOMPANHAR gerado por regra não é
+      alguém tendo escolhido acompanhar aquele sinal, e o recorte por
+      feedback em `/signals/stats` existe pra responder "acertei mais no que
+      EU escolhi seguir?". Confundir os dois responderia outra pergunta.
+    - `criado_em >= desde`, o começo DESTA varredura. Sem esse recorte, criar
+      uma regra hoje carimbaria retroativamente todo o histórico que ela
+      casasse — inventando decisões que ninguém tomou, em cima de sinais já
+      resolvidos.
+    - `NOT EXISTS`, e não `ON CONFLICT`: a tabela guarda o HISTÓRICO de
+      decisões e por isso não tem chave única por sinal. A regra só fala
+      sobre sinal virgem; se o operador já decidiu algo, a decisão dele
+      manda e a automática não entra por cima.
+    """
+    with conn.cursor() as cur:
+        cur.execute(_AUTO_ACOMPANHAMENTO_SQL, {"origem": ORIGEM, "desde": desde})
+        marcados = cur.rowcount
+    conn.commit()
+    return marcados
 
 
 # ---------------------------------------------------------------------------

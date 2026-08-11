@@ -8,7 +8,7 @@ A Brazilian stock/day-trade technical analysis tool ("Day Trade SMC"). It combin
 
 ## Two things to know before editing anything
 
-**1. The Streamlit app is frozen (2026-08-10).** It stays up and keeps working — Plotly charts, the Scanner and retro-check have no equivalent anywhere else — but it gets no new features. New capability goes to the agents platform (`../../agents-runtime` + `homelab/applications/agents/`), which consumes this repo through the API. Bug fixes here are fine; new UI is not.
+**1. The Streamlit app is in maintenance, not frozen (revised 2026-08-11).** The 2026-08-10 rule said "no new UI"; it was overtaken the next day by the signal-tracking screens and then by a full navigation/layout redesign, so it no longer described the repo. The rule that actually holds: **new analytical capability goes to the agents platform** (`../../agents-runtime` + `homelab/applications/agents/`), which consumes this repo through the API — the app is not where new engine features land. Fixing, restructuring and de-densifying the existing screens is in scope; growing a seventh screen that duplicates something an agent should do is not.
 
 **2. `backend/api.py` is now an agent interface, not just an HTTP API.** Its `/openapi.json` is snapshotted into `homelab/applications/agents/configmap-agentgateway-openapi-acoes.yaml` and converted to MCP tools by the agentgateway. Concretely: `operation_id` is a **tool name** and `description` is the text a model reads to decide whether to call it — renaming either is a breaking interface change, not a cosmetic edit. `include_in_schema=False` on a route means "not a tool", never "not a route": those routes are still served and supported (see the reason next to each). Full contract in the comment block at the top of `api.py`.
 
@@ -17,7 +17,8 @@ See `docs/homelab-pipeline.md` for the full design and implementation status of 
 ## Repository layout
 
 - `daytrade_smc.py` — the entire analysis engine (~2,530 lines), plus a small CLI that prints a one-symbol report. No UI code lives here: the Tkinter GUI was removed in the 2026-08-06 cleanup, since the Streamlit app had superseded it. `streamlit_app.py` intentionally only imports from this file rather than duplicating logic.
-- `streamlit_app.py` — the web UI layer. Imports functions/constants from `daytrade_smc` and renders charts (Plotly), signal panels, the Scanner, and the retro-check mode. Contains no analysis logic of its own.
+- `streamlit_app.py` — the web UI layer. Imports functions/constants from `daytrade_smc` and renders charts (Plotly), signal panels, the Scanner, and the retro-check screen. Contains no analysis logic of its own. Six routes under four nav groups since the 2026-08-11 redesign (`/`, `/scanner`, `/ativo`, `/retroativa`, `/acompanhar`, `/assertividade`) — see "Streamlit-specific gotchas" for why the route lives in the URL path.
+- `.streamlit/config.toml` — the theme. Not cosmetic: it declares the dark palette `build_chart` had always assumed, and `Dockerfile.streamlit` needs its own `COPY` line for it to reach k3s.
 - `requirements.txt` — cloud-safe dependencies (Streamlit Cloud runs on Linux).
 - `requirements-local.txt` — Windows-only extra (`MetaTrader5`, a DLL binding). Never merge this into `requirements.txt` — installing it on the Linux cloud deploy breaks the build.
 - `daytrade_symbols.json` (generated at runtime next to `daytrade_smc.py`, not committed) — persisted watchlist, written by `save_symbols`/`load_symbols`, used only when `ACOES_API_URL` isn't configured. On Streamlit Cloud this resets on every redeploy since the filesystem isn't durable.
@@ -85,19 +86,19 @@ If the two required timeframes disagree, the final recommendation is forced to N
 
 ## Mini Índice (WINFUT)
 
-A fifth Streamlit mode, outside the stocks watchlist, on its own timeframes: confirmation M5+M15, context M2+H1 (`WINFUT_*` in `daytrade_smc.py`). M2/M5 were added to `TIMEFRAMES`, `DEFAULT_TF_COUNTS`, `_MT5_TIMEFRAME_MAP_NAMES` and `_ANALISE_COUNTS` for it, and are used by nothing else.
+Not a screen of its own since 2026-08-11: **`WINFUT` is just an entry in the asset selector**, and `/ativo` swaps to its timeframes via `_estilo_do_ativo`. Its own timeframes are confirmation M5+M15, context M2+H1 (`WINFUT_*` in `daytrade_smc.py`). M2/M5 were added to `TIMEFRAMES`, `DEFAULT_TF_COUNTS`, `_MT5_TIMEFRAME_MAP_NAMES` and `_ANALISE_COUNTS` for it, and are used by nothing else.
 
 **`"WINFUT"` is a logical name, not a ticker.** `yahoo_symbol` passes it through untouched and Yahoo has no such symbol, so the mode is **Homelab-only** and the UI blocks it on any other source rather than surfacing a confusing "symbol not found". The MT5 contract name is broker-specific and rolls quarterly (`WIN$` continuous vs `WINZ25`); the scraper translates it via `SCRAPER_SYMBOL_MT5`, so the stored series stays continuous across the roll while only the mapping changes.
 
 `SCRAPER_TIMEFRAMES_POR_SYMBOL` exists because the scraper loop is a `symbol × timeframe` cross product — putting M2/M5 in the global `SCRAPER_TIMEFRAMES` would collect them for all eleven stocks too, two extra MT5 calls per symbol per loop for data no stock screen reads.
 
-The sidebar's "Estilo" radio is built from `STYLES.keys()`, so the WINFUT style deliberately lives in `_ESTILOS_TODOS` instead; resolve styles through `estilo(nome)`, never `STYLES[...]`, or the mode raises `KeyError`.
+The sidebar's "Estilo" control is built from `STYLES.keys()`, so the WINFUT style deliberately lives in `_ESTILOS_TODOS` instead; resolve styles through `estilo(nome)`, never `STYLES[...]`, or selecting WINFUT raises `KeyError`.
 
 **Known limit:** the `analyzer` worker does *not* record WINFUT signals on WINFUT's timeframes. Its `CONFIRMACAO` and `TIMEFRAMES_VARRIDOS` are global and Day Trade only, so adding WINFUT to the watchlist gets it swept at M15/H1/H4/D1 with M15+H1 confirmation. Live analysis in the UI is correct; the hit-rate history for the mini index would need per-symbol confirmation in the worker.
 
 ## Modality filter
 
-The sidebar "Modalidade" selector picks which signal drives the recommendation: one specific reading (Confluência/SMC/Price Action/Médias Móveis/VWAP/IFR), or `ALL_MODALITIES_OPTION` ("Todas as modalidades"), which averages the score across the **aggregable** readings (`overall_score`) and takes a majority vote on direction (`overall_direction`, tie → NEUTRO). The Scanner always ranks by this overall score.
+The sidebar "Leitura" selector (named "Modalidade" before the 2026-08-11 redesign; the session key is still `modality_select`) picks which signal drives the recommendation: one specific reading (Confluência/SMC/Price Action/Médias Móveis/VWAP/IFR), or `ALL_MODALITIES_OPTION` ("Todas as modalidades"), which averages the score across the **aggregable** readings (`overall_score`) and takes a majority vote on direction (`overall_direction`, tie → NEUTRO). The Scanner always ranks by this overall score.
 
 ## The IFR is a sixth reading, but it aggregates into nothing
 
@@ -119,6 +120,12 @@ Upstream (`kleverson01/acoes`) reached the same conclusion for the confluence an
 - Auto-refresh on the individual-analysis view uses `st.fragment` (`_auto_refresh_30/60/120/300` in `streamlit_app.py`) so only that panel reruns, not the whole page.
 - Analysis parameters cross `@st.cache_data` as a **tuple of pairs** (`AnalysisParams.to_items()`), never as the dataclass and never via a module global. Streamlit's hasher guarantees tuples of primitives; a dataclass either raises `UnhashableParamError` or — worse — gets hashed by identity, which fails silently: switching profiles would keep serving the previous profile's scores for the whole TTL, and the Scanner would rank on them.
 - Anything that changes which profile is selected (the save/remove buttons) writes a **pending key** (`perfil_pendente`) and reruns, rather than assigning `perfil_select` directly — the selectbox already exists by then, and Streamlit forbids mutating a widget's key after instantiation. Same shape as the existing `jump_to_symbol`. The profile selectbox also needs its session-state default set explicitly, or it silently selects the alphabetically-first profile instead of `padrão`.
+- **The route lives in the URL path, never in a query param** (`st.navigation` + `st.Page` with callables, `position="hidden"`). This is what makes the browser's back button work: page-level back/forward was fixed (streamlit#5293 → PR #6271), while query-param back/forward is still broken (streamlit#13963, open, and specific to apps using `st.navigation` — the URL changes, the rerun happens, and `st.query_params` still returns the stale value). Consequence: `symbol`/`perfil`/`modality` ride in query params for shareable links and are **read but never written** — writing them on change would fill the history with entries that #13963 cannot restore, so back would appear to do nothing. `_ALIAS_MODOS` + `_redirecionar_link_antigo` translate the pre-2026-08-11 `?mode=` links; deleting that map silently sends old shared links to the landing page.
+- **Everything runs in one file.** `Dockerfile.streamlit` copies exactly `daytrade_smc.py` + `streamlit_app.py` (plus `.streamlit/`), and `st.Page` accepts callables, so there is no `pages/` directory. `st.Page` callables take **no arguments** — what the sidebar computes reaches them through the module-level `CTX` dict, which is why `st.navigation()` runs *before* the sidebar and `pg.run()` *after* it.
+- The nav pills reflect the URL, not session state: `_render_nav` re-seeds `nav_grupo`/`nav_sub` **only when `_nav_url_vista` differs from the current route**. Re-seeding every rerun would erase the user's click before it could be read — on the click's rerun the URL is still the old one, and `st.switch_page` is what changes it. Those two widgets deliberately pass no `default=`, since the key always exists by then and passing both makes Streamlit warn on every rerun.
+- **Never `st.tabs` to choose between expensive bodies** — tabs execute every tab's body on every rerun. The Dashboard used to put one profile per tab, so a four-profile setup ran five full watchlist sweeps per widget click; the individual-analysis view nested `expander → tabs → panel` and rendered all five reading panels to show one. Both are now `st.segmented_control`, which preserves the if/else.
+- Cards are `st.container(border=True)`, never an HTML `<div>` opened in one `st.markdown` and closed in another: Streamlit renders each element in its own DOM block, so that pattern draws a stray line above and below instead of a border around the widgets.
+- `.streamlit/config.toml` declares the dark theme that `build_chart` already assumed (`plotly_dark` on `#0a0e13`). Without it the chart is dark inside a light page. Its colors and the `PALETA` dict at the top of `streamlit_app.py` are the same values — change one, change the other.
 
 ## Analysis parameters and signal history
 

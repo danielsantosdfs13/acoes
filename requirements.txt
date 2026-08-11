@@ -1,6 +1,10 @@
 pandas>=2.2
 numpy>=1.26
 yfinance>=0.2.40
-streamlit>=1.38
+# 1.40 é o piso REAL, não uma preferência: `st.segmented_control` (nav e
+# filtros), `st.navigation`/`st.Page` (as rotas), `st.dataframe(on_select=)`
+# (abrir ativo clicando na linha) e `st.container(border=True)` (os cards)
+# são todos usados. O `>=1.38` anterior já não descrevia o código.
+streamlit>=1.40
 plotly>=5.22
 requests>=2.31

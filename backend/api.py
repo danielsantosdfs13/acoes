@@ -476,15 +476,49 @@ def set_profile_ativo(nome: str, body: ProfileAtivoIn,
 # Sinais
 # ---------------------------------------------------------------------------
 
-_SIGNAL_COLUMNS = (
-    "id, symbol, timeframe, modalidade, candle_time, perfil, params_hash, origem, "
-    "direcao, score, confianca, setup, mtf_confirmado, mtf_direcao, "
-    "entrada, stop, alvo_1, alvo_2, r_alvo_1, r_alvo_2, stop_basis, detalhes, criado_em, "
-    "resultado, resultado_detalhe, candles_ate_resultado, avaliado_em"
+_SIGNAL_FIELDS = (
+    "id", "symbol", "timeframe", "modalidade", "candle_time", "perfil", "params_hash",
+    "origem", "direcao", "score", "confianca", "setup", "mtf_confirmado", "mtf_direcao",
+    "entrada", "stop", "alvo_1", "alvo_2", "r_alvo_1", "r_alvo_2", "stop_basis",
+    "detalhes", "criado_em", "resultado", "resultado_detalhe", "candles_ate_resultado",
+    "avaliado_em",
 )
+_SIGNAL_COLUMNS = ", ".join(_SIGNAL_FIELDS)
+# Mesma lista qualificada, pra quando `signals` entra numa consulta com JOIN
+# e `id`/`origem` viram ambíguos. O RETURNING do POST /signals continua usando
+# a versão sem prefixo — lá não há junção, e `feedback` (que vem de outra
+# tabela) não pode aparecer num RETURNING.
+_SIGNAL_COLUMNS_S = ", ".join(f"s.{campo}" for campo in _SIGNAL_FIELDS)
+
+# A decisão mais recente de cada sinal. LATERAL e não um GROUP BY porque a
+# `signal_feedback` guarda o histórico: um sinal pode ter sido marcado
+# ACOMPANHAR e depois OPEREI, e o que descreve o estado atual é a última.
+_FEEDBACK_LATERAL = """
+LEFT JOIN LATERAL (
+    SELECT f.acao, f.origem
+    FROM signal_feedback f
+    WHERE f.signal_id = s.id
+    ORDER BY f.criado_em DESC, f.id DESC
+    LIMIT 1
+) fb ON true
+"""
+
+# Valor de consulta, NÃO de armazenamento: nenhuma linha de `signal_feedback`
+# tem acao='PENDENTE'. É como se pergunta por "sinal sobre o qual ninguém
+# decidiu nada" sem inventar um segundo parâmetro booleano.
+_ACAO_PENDENTE = "PENDENTE"
+
+_FEEDBACK_WHERE = f"""
+  AND (%(acao)s::text IS NULL
+       OR (%(acao)s = '{_ACAO_PENDENTE}' AND fb.acao IS NULL)
+       OR fb.acao = %(acao)s)
+"""
 
 
 def _signal_from_row(row: tuple) -> SignalOut:
+    """Constrói o SignalOut. As duas últimas posições só existem quando a
+    consulta trouxe o LATERAL de feedback junto — o RETURNING do POST não
+    traz, e aí os campos ficam None."""
     return SignalOut(
         id=row[0], symbol=row[1], timeframe=row[2], modalidade=row[3], candle_time=row[4],
         perfil=row[5], params_hash=row[6], origem=row[7], direcao=row[8], score=row[9],
@@ -493,6 +527,8 @@ def _signal_from_row(row: tuple) -> SignalOut:
         r_alvo_2=row[19], stop_basis=row[20], detalhes=row[21], criado_em=row[22],
         resultado=row[23], resultado_detalhe=row[24], candles_ate_resultado=row[25],
         avaliado_em=row[26],
+        feedback=row[27] if len(row) > 27 else None,
+        feedback_origem=row[28] if len(row) > 28 else None,
     )
 
 
@@ -585,6 +621,15 @@ def get_signals(
     perfil: str | None = Query(None),
     origem: str | None = Query(None),
     resultado: str | None = Query(None),
+    acao: str | None = Query(
+        None,
+        description=(
+            "Decisão mais recente do operador sobre o sinal: ACOMPANHAR, OPERAR, "
+            "IGNORAR, OPEREI, CANCELEI — ou PENDENTE para os que ainda não têm "
+            "decisão nenhuma. Não confundir com `resultado`, que é o desfecho do "
+            "PREÇO (bateu alvo ou stop); este é o que a pessoa decidiu fazer."
+        ),
+    ),
     dias: int = Query(90, ge=1, le=3650),
     limite: int = Query(200, ge=1, le=2000),
     conn: Connection = Depends(get_conn),
@@ -594,7 +639,8 @@ def get_signals(
         "symbol": symbol.strip().upper() if symbol else None,
         "timeframe": timeframe.strip().upper() if timeframe else None,
         "modalidade": modalidade, "perfil": perfil, "origem": origem,
-        "resultado": resultado, "dias": dias, "limite": limite,
+        "resultado": resultado, "acao": acao.strip().upper() if acao else None,
+        "dias": dias, "limite": limite,
     }
     # Os ::text não são decoração: num `$1 IS NULL OR col = $1`, o Postgres
     # olha o IS NULL primeiro e desiste de inferir o tipo do parâmetro
@@ -604,20 +650,23 @@ def get_signals(
     # nesse período. Enquanto só o worker escrevia, em tempo real, os dois
     # davam no mesmo; com o backfill (`analyzer.py --backfill`) deixam de
     # dar — um sinal de D1 de 2022 gravado hoje cairia no recorte de 7 dias.
-    where = """
-        WHERE candle_time > now() - make_interval(days => %(dias)s)
-          AND (%(symbol)s::text     IS NULL OR symbol     = %(symbol)s)
-          AND (%(timeframe)s::text  IS NULL OR timeframe  = %(timeframe)s)
-          AND (%(modalidade)s::text IS NULL OR modalidade = %(modalidade)s)
-          AND (%(perfil)s::text     IS NULL OR perfil     = %(perfil)s)
-          AND (%(origem)s::text     IS NULL OR origem     = %(origem)s)
-          AND (%(resultado)s::text  IS NULL OR resultado  = %(resultado)s)
+    where = f"""
+        WHERE s.candle_time > now() - make_interval(days => %(dias)s)
+          AND (%(symbol)s::text     IS NULL OR s.symbol     = %(symbol)s)
+          AND (%(timeframe)s::text  IS NULL OR s.timeframe  = %(timeframe)s)
+          AND (%(modalidade)s::text IS NULL OR s.modalidade = %(modalidade)s)
+          AND (%(perfil)s::text     IS NULL OR s.perfil     = %(perfil)s)
+          AND (%(origem)s::text     IS NULL OR s.origem     = %(origem)s)
+          AND (%(resultado)s::text  IS NULL OR s.resultado  = %(resultado)s)
+          {_FEEDBACK_WHERE}
     """
+    de = f"FROM signals s {_FEEDBACK_LATERAL} {where}"
     with conn.cursor() as cur:
-        cur.execute(f"SELECT count(*) FROM signals {where}", filtros)
+        cur.execute(f"SELECT count(*) {de}", filtros)
         total = cur.fetchone()[0]
         cur.execute(
-            f"SELECT {_SIGNAL_COLUMNS} FROM signals {where} ORDER BY candle_time DESC, id DESC LIMIT %(limite)s",
+            f"SELECT {_SIGNAL_COLUMNS_S}, fb.acao, fb.origem {de} "
+            "ORDER BY s.candle_time DESC, s.id DESC LIMIT %(limite)s",
             filtros,
         )
         rows = cur.fetchall()
@@ -637,9 +686,13 @@ def get_signals(
 # `analyzer.py --reavaliar-tudo`, e é por isso que a resposta devolve
 # `modelo_atual` por grupo: uma taxa montada em cima de dois modelos de
 # execução não descreve nenhum dos dois, e isso tem que ficar visível.
-_STATS_BASE = """
+_STATS_BASE = f"""
 WITH base AS (
-    SELECT modalidade, timeframe, symbol, direcao, mtf_confirmado, resultado,
+    SELECT s.modalidade, s.timeframe, s.symbol, s.direcao, s.mtf_confirmado, s.resultado,
+           -- 'PENDENTE' e não NULL: como recorte, "ninguém decidiu" é um
+           -- grupo tão legítimo quanto os outros, e um rótulo nulo apareceria
+           -- como linha em branco na tabela.
+           COALESCE(fb.acao, '{_ACAO_PENDENTE}') AS feedback,
            COALESCE(
                r_realizado,
                CASE resultado
@@ -658,16 +711,22 @@ WITH base AS (
                 WHEN score >= 40 THEN '40-60'
                 ELSE '<40'
            END AS faixa_score
-    FROM signals
-    WHERE resultado IS NOT NULL
-      AND resultado NOT IN ('SEM_SINAL', 'SEM_ENTRADA')
+    FROM signals s
+    {_FEEDBACK_LATERAL}
+    WHERE s.resultado IS NOT NULL
+      AND s.resultado NOT IN ('SEM_SINAL', 'SEM_ENTRADA')
       -- por `candle_time`, e não `criado_em` — mesma razão do comentário em
       -- get_signals: o backfill grava sinais antigos com criado_em de hoje
-      AND candle_time > now() - make_interval(days => %(dias)s)
-      AND (%(perfil)s::text    IS NULL OR perfil    = %(perfil)s)
-      AND (%(origem)s::text    IS NULL OR origem    = %(origem)s)
-      AND (%(symbol)s::text    IS NULL OR symbol    = %(symbol)s)
-      AND (%(timeframe)s::text IS NULL OR timeframe = %(timeframe)s)
+      AND s.candle_time > now() - make_interval(days => %(dias)s)
+      AND (%(perfil)s::text    IS NULL OR s.perfil    = %(perfil)s)
+      -- `s.origem` qualificado não é estilo: o LATERAL expõe `fb.origem`
+      -- (web/whatsapp/telegram/auto) e sem o prefixo o Postgres recusaria a
+      -- consulta por ambiguidade. São dois "origem" que falam de coisas
+      -- diferentes — quem gerou o SINAL, e por onde veio a DECISÃO.
+      AND (%(origem)s::text    IS NULL OR s.origem    = %(origem)s)
+      AND (%(symbol)s::text    IS NULL OR s.symbol    = %(symbol)s)
+      AND (%(timeframe)s::text IS NULL OR s.timeframe = %(timeframe)s)
+      {_FEEDBACK_WHERE}
 )
 """
 
@@ -713,8 +772,15 @@ def _stats_rows(cur, recorte: str, filtros: dict) -> list[StatsRow]:
     summary="Taxa de acerto histórica do motor",
     description=(
         "Quanto o motor acertou de verdade, quebrado por modalidade e ainda por "
-        "timeframe, ação, direção, faixa de score e confirmação multi-timeframe. "
-        "É a tool pra 'vale a pena confiar neste sinal?'.\n\n"
+        "timeframe, ação, direção, faixa de score, confirmação multi-timeframe e "
+        "decisão do operador. É a tool pra 'vale a pena confiar neste sinal?'.\n\n"
+        "`por_feedback` recorta pelo que a PESSOA decidiu (ACOMPANHAR, OPERAR, "
+        "IGNORAR, OPEREI, CANCELEI, ou PENDENTE quando não decidiu nada), e o filtro "
+        "`acao` restringe a conta a um desses grupos — é assim que se responde "
+        "'acertei mais no que eu escolhi operar do que na média?'. Cuidado ao ler: "
+        "feedback com `feedback_origem='auto'` foi gerado por regra do worker, não "
+        "escolhido por ninguém; se a pergunta é sobre a escolha humana, esses não "
+        "contam.\n\n"
         "Como ler sem mentir:\n"
         "- `taxa_acerto` e `expectativa_r` têm como denominador `resolvidos`, NUNCA `n` "
         "— os EM_ABERTO ainda não têm desfecho. Cite sempre os dois: '61% em 47 "
@@ -733,6 +799,13 @@ def get_signal_stats(
     origem: str | None = Query(None),
     symbol: str | None = Query(None),
     timeframe: str | None = Query(None),
+    acao: str | None = Query(
+        None,
+        description=(
+            "Restringe a conta aos sinais com esta decisão do operador: ACOMPANHAR, "
+            "OPERAR, IGNORAR, OPEREI, CANCELEI, ou PENDENTE para os sem decisão."
+        ),
+    ),
     dias: int = Query(90, ge=1, le=3650),
     conn: Connection = Depends(get_conn),
 ) -> StatsResponse:
