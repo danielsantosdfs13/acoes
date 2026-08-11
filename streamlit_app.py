@@ -1423,8 +1423,7 @@ def _render_breadcrumb(current: str) -> None:
 
 
 def _render_share_button() -> None:
-    """Botão de compartilhar — copia URL com params da view atual."""
-    # Monta URL com params do estado atual
+    """Botão de compartilhar — gera URL da view atual (NÃO modifica query params)."""
     params_dict = {}
     if "mode_select" in st.session_state:
         params_dict["mode"] = st.session_state.mode_select
@@ -1435,14 +1434,8 @@ def _render_share_button() -> None:
     if "modality_select" in st.session_state:
         params_dict["modality"] = st.session_state.modality_select
 
-    # Atualiza query params na URL
-    if params_dict:
-        st.query_params.update(params_dict)
-        url = f"https://acoes.dondon.services/?{'&'.join(f'{k}={v}' for k, v in params_dict.items())}"
-    else:
-        url = "https://acoes.dondon.services/"
+    url = f"https://acoes.dondon.services/?{'&'.join(f'{k}={v}' for k, v in params_dict.items())}" if params_dict else "https://acoes.dondon.services/"
 
-    # Botão de compartilhar (copia URL)
     if st.button("🔗 Copiar link", key="share_btn", help="Copia link para esta view"):
         st.code(url, language=None)
         st.success("Link copiado! Cole onde quiser compartilhar.")
@@ -1476,7 +1469,10 @@ def _apply_deep_link() -> None:
 
 
 
-_apply_deep_link()
+# Deep linking: soh aplica uma vez (carga inicial), nao em todo rerun
+if not st.session_state.get("_deep_link_applied"):
+    _apply_deep_link()
+    st.session_state["_deep_link_applied"] = True
 
 # ========================================================================
 mode = st.segmented_control(
