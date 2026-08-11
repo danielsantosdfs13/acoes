@@ -16,6 +16,8 @@ para outros consumidores.
   - GET    /profiles/{nome}                  um perfil
   - PUT    /profiles/{nome}                  cria ou substitui um perfil
   - DELETE /profiles/{nome}                  desativa um perfil (soft-delete)
+  - PUT    /profiles/{nome}/ativo            liga/desliga a geração de alertas
+                                            de um perfil no analyzer (tool)
 
   - POST   /signals                          grava um sinal (dedup por vela)
   - GET    /signals                          histórico com filtros
@@ -54,6 +56,7 @@ from models import (
     AnaliseResponse,
     CandleOut,
     CandlesResponse,
+    ProfileAtivoIn,
     ProfileOut,
     ProfileIn,
     ProfilesResponse,
@@ -404,6 +407,60 @@ def delete_profile(nome: str, conn: Connection = Depends(get_conn)) -> ProfilesR
         cur.execute(f"SELECT {_PROFILE_COLUMNS} FROM analysis_profiles WHERE ativo ORDER BY nome")
         rows = cur.fetchall()
     return ProfilesResponse(profiles=[_profile_from_row(row) for row in rows])
+
+
+# Este é o único caminho de ESCRITA de perfil que vira tool, e de propósito:
+# as três rotas de calibragem acima ficam fora da spec porque reescrever a
+# calibragem é decisão de bancada. Desligar/religar a GERAÇÃO de alertas não
+# reescreve nada — é só a flag `ativo`, o analyzer já a respeita na varredura,
+# e é exatamente o tipo de ação que um agente pode ser incumbido de tomar.
+@app.put(
+    "/profiles/{nome}/ativo",
+    response_model=ProfileOut,
+    dependencies=[Depends(require_api_key)],
+    operation_id="alterar_perfil_ativo",
+    summary="Liga ou desliga a geração de alertas de um perfil",
+    description=(
+        "Ativa ou desativa um perfil de calibragem na geração automática de "
+        "alertas do analyzer. Com `ativo=false` o analyzer pula esse perfil na "
+        "próxima varredura e nenhum sinal novo dele é gravado; com `ativo=true` "
+        "ele volta na varredura seguinte. Só mexe na flag `ativo`: não altera "
+        "`params`, não apaga histórico — sinais antigos continuam na base para "
+        "a assertividade. O perfil 'padrão' não pode ser desativado. Para ver os "
+        "perfis existentes use `listar_perfis_analise`; um perfil desativado "
+        "deixa de aparecer nessa lista."
+    ),
+)
+def set_profile_ativo(nome: str, body: ProfileAtivoIn,
+                      conn: Connection = Depends(get_conn)) -> ProfileOut:
+    """Liga/desliga a flag `ativo` de um perfil.
+
+    Desativar e depois reativar devolve o perfil exatamente como estava —
+    params, descricao e histórico não mudam, e a FK em `signals.perfil`
+    continua apontando pra ele sem quebrar.
+    """
+    nome = nome.strip()
+    if not nome:
+        raise HTTPException(status_code=400, detail="Nome de perfil vazio.")
+    if not body.ativo and nome == PERFIL_PADRAO:
+        raise HTTPException(
+            status_code=400,
+            detail=f"O perfil '{PERFIL_PADRAO}' não pode ser desativado.",
+        )
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE analysis_profiles
+               SET ativo = %s, alterado_em = now()
+             WHERE nome = %s
+            RETURNING {_PROFILE_COLUMNS}
+            """,
+            (body.ativo, nome),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Perfil '{nome}' não existe.")
+    return _profile_from_row(row)
 
 
 # ---------------------------------------------------------------------------

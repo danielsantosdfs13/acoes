@@ -85,6 +85,17 @@ class ProfileIn(BaseModel):
     descricao: str = ""
 
 
+class ProfileAtivoIn(BaseModel):
+    """Corpo do PUT /profiles/{nome}/ativo.
+
+    `ativo: false` faz o analyzer pular esse perfil na próxima varredura
+    (nenhum sinal novo dele é gravado); `true` o reativa na varredura
+    seguinte. Só a flag muda — `params`, `descricao` e o histórico de sinais
+    ficam intactos."""
+
+    ativo: bool
+
+
 class ProfileOut(BaseModel):
     nome: str
     params: dict
