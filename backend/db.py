@@ -18,7 +18,7 @@ def _configure_conn(conn):
     """Configura uma conexão nova antes de entrar no pool."""
     try:
         with conn.cursor() as cur:
-            cur.execute("SET timezone TO %(tz)s", {"tz": TIMEZONE})
+            cur.execute("SET timezone TO 'America/Sao_Paulo'")
     except Exception:
         log.warning("Não foi possível definir timezone para %s", TIMEZONE, exc_info=True)
 
