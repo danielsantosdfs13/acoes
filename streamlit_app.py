@@ -1407,6 +1407,9 @@ def _persist_watchlist() -> None:
 # rate limit documentado) toda vez que qualquer widget mudasse, mesmo com
 # outra aba visível. segmented_control preserva o if/elif: só o modo
 # escolhido executa, exatamente como o st.radio que ele substitui.
+# Deep linking — aplica ANTES do mode widget nascer pra não conflitar.
+_apply_deep_link()
+
 # ========================================================================
 mode = st.segmented_control(
     "Modo",
@@ -1420,6 +1423,72 @@ mode = st.segmented_control(
     # modo em silêncio pro usuário achar que ainda está na tela anterior.
 )
 
+def _render_breadcrumb(current: str) -> None:
+    """Navegação tipo breadcrumb — mostra onde o usuário está."""
+    breadcrumbs = {
+        "Dashboard": "📊 Dashboard",
+        "Scanner": "🔍 Scanner",
+        "Análise individual": "📈 Análise",
+        "Verificação retroativa": "🕵️ Retroativa",
+        "Assertividade": "📉 Assertividade",
+    }
+    items = ["Dashboard"] if current == "Dashboard" else ["Dashboard", current]
+    st.caption(" > ".join(breadcrumbs.get(i, i) for i in items))
+
+
+def _render_share_button() -> None:
+    """Botão de compartilhar — copia URL com params da view atual."""
+    # Monta URL com params do estado atual
+    params_dict = {}
+    if "mode_select" in st.session_state:
+        params_dict["mode"] = st.session_state.mode_select
+    if "symbol_select" in st.session_state:
+        params_dict["symbol"] = st.session_state.symbol_select
+    if "perfil_select" in st.session_state:
+        params_dict["perfil"] = st.session_state.perfil_select
+    if "modality_select" in st.session_state:
+        params_dict["modality"] = st.session_state.modality_select
+
+    # Atualiza query params na URL
+    if params_dict:
+        st.query_params.update(params_dict)
+        url = f"https://acoes.dondon.services/?{'&'.join(f'{k}={v}' for k, v in params_dict.items())}"
+    else:
+        url = "https://acoes.dondon.services/"
+
+    # Botão de compartilhar (copia URL)
+    if st.button("🔗 Copiar link", key="share_btn", help="Copia link para esta view"):
+        st.code(url, language=None)
+        st.success("Link copiado! Cole onde quiser compartilhar.")
+        st.balloons()
+
+
+def _apply_deep_link() -> None:
+    """Aplica deep linking dos query params pro session_state.
+    Roda ANTES dos widgets nascerem pra não dar conflito."""
+    qp = st.query_params
+
+    # Modo
+    if qp.get("mode") and qp["mode"] in [
+        "Dashboard", "Scanner", "Análise individual", "Verificação retroativa", "Assertividade",
+    ]:
+        st.session_state.mode_select = qp["mode"]
+
+    # Símbolo
+    if qp.get("symbol") and qp["symbol"] in st.session_state.get("watchlist", []):
+        st.session_state.symbol_select = qp["symbol"]
+
+    # Perfil
+    if qp.get("perfil") and qp["perfil"] in st.session_state.get("perfis", {}):
+        st.session_state.perfil_select = qp["perfil"]
+
+    # Modalidade
+    if qp.get("modality") and qp["modality"] in [
+        "Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR",
+    ]:
+        st.session_state.modality_select = qp["modality"]
+
+
 def render_dashboard(source: str, count: int, risk_budget: float | None, params: AnalysisParams,
                       perfis: list[str], style: str) -> None:
     """Tela principal: top oportunidades de relance, organizadas por perfil.
@@ -1430,6 +1499,10 @@ def render_dashboard(source: str, count: int, risk_budget: float | None, params:
     confirmation = estilo(style)["confirmation"]
     context_tfs = estilo(style)["context"]
     tf_entrada = confirmation[0]
+
+    # Breadcrumb + Share
+    _render_breadcrumb("Dashboard")
+    _render_share_button()
 
     st.markdown("### 🎯 Melhores oportunidades agora")
     st.caption(f"Scanner sobre {len(st.session_state.watchlist)} ativos · {style} · "
@@ -1473,16 +1546,21 @@ def render_dashboard(source: str, count: int, risk_budget: float | None, params:
 def _render_oportunidade_card(row: pd.Series, symbol: str, style: str, source: str,
                                count: int, risk_budget: float | None, params: AnalysisParams,
                                perfil: str) -> None:
-    """Um card de oportunidade — tudo que pra decidir está na cara."""
+    """Um card de oportunidade — tudo que pra decidir está na cara.
+
+    Layout: badge de direção + ativo à esquerda, níveis de preço no centro,
+    ações à direita. Visual limpo, decisão em 3 segundos."""
     direcao = row.get("Direção", "NEUTRO")
     if direcao == "COMPRA":
         cor = "#2ed3a3"
         icone = "🟢"
         acao = "COMPRAR"
+        seta = "▲"
     else:
         cor = "#ff5470"
         icone = "🔴"
         acao = "VENDER"
+        seta = "▼"
 
     score = row.get("Score Geral", 0) or 0
     entrada = row.get("Entrada")
@@ -1490,45 +1568,72 @@ def _render_oportunidade_card(row: pd.Series, symbol: str, style: str, source: s
     alvo = row.get("Alvo 1")
     qty = row.get("Quantidade")
     total = row.get("Total (R$)")
+    rr = (alvo - entrada) / (entrada - stop) if entrada and stop and alvo and (entrada - stop) != 0 else 0
 
-    # Layout: info principal à esquerda, níveis à direita
-    c1, c2 = st.columns([2, 3])
+    # Qualidade visual do score
+    if score >= 80:
+        qualidade = "🌟 Excepcional"
+        q_cor = "#f0b429"
+    elif score >= 60:
+        qualidade = "✅ Boa"
+        q_cor = "#2ed3a3"
+    else:
+        qualidade = "⚡ Regular"
+        q_cor = "#8291a1"
+
+    # Card container
+    st.markdown(
+        f'<div style="border:1px solid {cor}33; border-left:4px solid {cor}; '
+        f'border-radius:8px; padding:12px 16px; background:{cor}08; margin-bottom:8px;">',
+        unsafe_allow_html=True,
+    )
+
+    # Linha 1: direção + ativo + score + setup
+    c1, c2, c3, c4 = st.columns([1.2, 2, 1.5, 1.5])
     with c1:
-        st.markdown(
-            f'<div style="border-left:4px solid {cor}; padding:8px 12px; background:{cor}10; border-radius:4px;">'
-            f'<span style="font-size:16px; font-weight:600; color:{cor}">{icone} {acao} {symbol}</span>'
-            f'<br><span style="font-size:13px; opacity:.8">score {score:.0f}/100 · {row.get("Setup", "")}</span>'
-            f'<br><span style="font-size:11px; opacity:.6">perfil: {perfil}</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
+        st.markdown(f'<span style="font-size:20px">{icone}</span> **{acao}**', unsafe_allow_html=True)
     with c2:
-        if entrada and stop and alvo:
-            cols = st.columns(4)
-            cols[0].metric("Entrada", f"R$ {entrada:.2f}")
-            cols[1].metric("Stop", f"R$ {stop:.2f}", f"{(stop-entrada)/entrada*100:+.2f}%")
-            cols[2].metric("Alvo", f"R$ {alvo:.2f}", f"{(alvo-entrada)/entrada*100:+.2f}%")
-            if qty and qty > 0:
-                cols[3].metric("Qtd", f"{int(qty)}", f"R$ {total:.0f}" if total else "")
-            if risk_budget:
-                st.caption(f"Risco: R$ {abs(entrada-stop):.2f}/ação · "
-                           f"R/R 1:{(alvo-entrada)/(entrada-stop):.2f}")
+        st.markdown(f"### {symbol}")
+        st.caption(f"{row.get('Setup', '')[:50]}")
+    with c3:
+        st.metric("Score", f"{score:.0f}", qualidade, label_visibility="visible")
+    with c4:
+        st.caption(f"RR: **1:{rr:.1f}**" if rr else "")
+        st.caption(f"perfil: `{perfil}`")
 
-    # Botão de ação — NÃO dá pra tocar em mode_select depois do widget
-    # criado: usa jump_to_symbol que o código no topo do script aplica ANTES
-    # do mode widget nascer (e já troca pro modo Análise individual).
+    # Linha 2: níveis de preço
+    if entrada and stop and alvo:
+        cols = st.columns(5)
+        cols[0].metric("Entrada", f"R$ {entrada:.2f}")
+        cols[1].metric("Stop", f"R$ {stop:.2f}", f"{(stop-entrada)/entrada*100:+.2f}%",
+                       delta_color="inverse")
+        cols[2].metric("Alvo", f"R$ {alvo:.2f}", f"{(alvo-entrada)/entrada*100:+.2f}%")
+        if qty and qty > 0:
+            cols[3].metric("Qtd", f"{int(qty)}")
+            cols[4].metric("Total", f"R$ {total:.0f}" if total else "—")
+        elif risk_budget:
+            risk_per_share = abs(entrada - stop)
+            if risk_per_share > 0:
+                qtd_calc = int(risk_budget // risk_per_share)
+                cols[3].metric("Qtd", f"{qtd_calc}")
+                cols[4].metric("Risco", f"R$ {qtd_calc * risk_per_share:.0f}")
+
+    # Linha 3: ações
     c_esq, c_dir = st.columns([1, 4])
     with c_esq:
-        if st.button("📊 Ver", key=f"dash_ver_{symbol}_{perfil}_{row.name}"):
+        if st.button("📊 Ver análise", key=f"dash_ver_{symbol}_{perfil}_{row.name}",
+                     use_container_width=True):
             st.session_state.jump_to_symbol = symbol
             st.rerun()
     with c_dir:
-        if daytrade_smc.ACOES_API_URL and st.button("💾 Salvar", key=f"dash_salvar_{symbol}_{perfil}_{row.name}"):
-            # Salvar o sinal via API (simplificado)
-            st.info("Use 'Ver' para salvar com confirmação MTF.")
+        # Link compartilhável direto pro ativo
+        link = f"https://acoes.dondon.services/?mode=Análise+individual&symbol={symbol}&perfil={perfil}"
+        if st.button(f"🔗 Copiar link de {symbol}", key=f"dash_share_{symbol}_{perfil}_{row.name}",
+                     use_container_width=True):
+            st.code(link, language=None)
+            st.caption("Link para esta oportunidade — cole onde quiser.")
 
-    st.divider()
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ========================================================================
@@ -1715,11 +1820,35 @@ with st.sidebar:
         run_scanner_clicked = st.button("🔍 Rodar scanner", type="primary", use_container_width=True)
     # Dashboard não precisa de controles extra — roda automático
 
+    # Footer da sidebar — ajuda rápida
+    with st.expander("ℹ️ Como usar", expanded=False):
+        st.markdown("""
+        **Dashboard**: melhores oportunidades agora, organizadas por perfil.
+        **Scanner**: tabela com todos os ativos da watchlist.
+        **Análise individual**: gráfico + 6 leituras de um ativo.
+        **Retroativa**: veja como um sinal teria se saído no passado.
+        **Assertividade**: taxa de acerto medida dos sinais gravados.
+
+        💡 **Dica**: use 'Copiar link' pra compartilhar qualquer view.
+        """)
+
 
 # ========================================================================
 # Corpo principal
 # ========================================================================
-st.title("📊 Day Trade SMC — Análise Técnica")
+# Título contextual por modo (mais limpo que título fixo)
+if mode == "Dashboard":
+    st.title("📊 Oportunidades agora")
+elif mode == "Scanner":
+    st.title("🔍 Scanner de mercado")
+elif mode == "Análise individual":
+    st.title("📈 Análise técnica")
+elif mode == "Verificação retroativa":
+    st.title("🕵️ Verificação retroativa")
+elif mode == "Assertividade":
+    st.title("📉 Assertividade medida")
+else:
+    st.title("📊 Day Trade SMC")
 
 # O aviso ACOMPANHA a fonte. Fixo no texto do Yahoo, ele mentia toda vez que
 # a fonte era o homelab: anunciava 20 minutos de atraso num dado de poucos
@@ -1749,6 +1878,8 @@ if mode == "Dashboard":
                      style=style)
 
 elif mode == "Scanner":
+    _render_breadcrumb("Scanner")
+    _render_share_button()
     st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · leitura: {modality} · "
                f"perfil: {perfil} · {count} candles · recomendação exige {conf_a}+{conf_b} concordando")
 
@@ -1814,13 +1945,17 @@ elif mode == "Análise individual":
         st.caption(f"🔄 Atualizando automaticamente a cada {refresh_interval}s")
         _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, source, count, risk_budget, params, perfil)
     else:
+        _render_breadcrumb("Análise individual")
+        _render_share_button()
         render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
 
 elif mode == "Verificação retroativa":
+    _render_breadcrumb("Verificação retroativa")
     symbol = st.session_state.symbol_select
     render_retro_check(symbol, style, modality, source, count, params)
 
 elif mode == "Assertividade":
+    _render_breadcrumb("Assertividade")
     render_assertividade(sorted(st.session_state.perfis))
 
 else:  # Mini Índice (WINFUT)
