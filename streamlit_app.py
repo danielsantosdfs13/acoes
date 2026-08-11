@@ -1408,20 +1408,6 @@ def _persist_watchlist() -> None:
 # outra aba visível. segmented_control preserva o if/elif: só o modo
 # escolhido executa, exatamente como o st.radio que ele substitui.
 # Deep linking — aplica ANTES do mode widget nascer pra não conflitar.
-_apply_deep_link()
-
-# ========================================================================
-mode = st.segmented_control(
-    "Modo",
-    ["Dashboard", "Scanner", "Análise individual", "Verificação retroativa", "Assertividade",
-     "Mini Índice (WINFUT)"],
-    key="mode_select", default="Dashboard", required=True,
-    # `required=True` é obrigatório aqui, não estético: sem ele,
-    # segmented_control deixa clicar no pill já selecionado pra DESMARCAR e
-    # devolver None — e o if/elif abaixo termina num `else` que assume
-    # Assertividade. Sem o required, um duplo-clique acidental trocaria de
-    # modo em silêncio pro usuário achar que ainda está na tela anterior.
-)
 
 def _render_breadcrumb(current: str) -> None:
     """Navegação tipo breadcrumb — mostra onde o usuário está."""
@@ -1488,6 +1474,22 @@ def _apply_deep_link() -> None:
     ]:
         st.session_state.modality_select = qp["modality"]
 
+
+
+_apply_deep_link()
+
+# ========================================================================
+mode = st.segmented_control(
+    "Modo",
+    ["Dashboard", "Scanner", "Análise individual", "Verificação retroativa", "Assertividade",
+     "Mini Índice (WINFUT)"],
+    key="mode_select", default="Dashboard", required=True,
+    # `required=True` é obrigatório aqui, não estético: sem ele,
+    # segmented_control deixa clicar no pill já selecionado pra DESMARCAR e
+    # devolver None — e o if/elif abaixo termina num `else` que assume
+    # Assertividade. Sem o required, um duplo-clique acidental trocaria de
+    # modo em silêncio pro usuário achar que ainda está na tela anterior.
+)
 
 def render_dashboard(source: str, count: int, risk_budget: float | None, params: AnalysisParams,
                       perfis: list[str], style: str) -> None:
