@@ -17,10 +17,13 @@ TIMEZONE = "America/Sao_Paulo"
 def _configure_conn(conn):
     """Configura uma conexão nova antes de entrar no pool."""
     try:
+        conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("SET timezone TO 'America/Sao_Paulo'")
     except Exception:
         log.warning("Não foi possível definir timezone para %s", TIMEZONE, exc_info=True)
+    finally:
+        conn.autocommit = False
 
 
 pool = ConnectionPool(
