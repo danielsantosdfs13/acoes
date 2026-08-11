@@ -430,9 +430,11 @@ def delete_profile(nome: str, conn: Connection = Depends(get_conn)) -> ProfilesR
         "próxima varredura e nenhum sinal novo dele é gravado; com `ativo=true` "
         "ele volta na varredura seguinte. Só mexe na flag `ativo`: não altera "
         "`params`, não apaga histórico — sinais antigos continuam na base para "
-        "a assertividade. O perfil 'padrão' não pode ser desativado. Para ver os "
-        "perfis existentes use `listar_perfis_analise`; um perfil desativado "
-        "deixa de aparecer nessa lista."
+        "a assertividade. Para ver os perfis existentes use "
+        "`listar_perfis_analise`; um perfil desativado deixa de "
+        "aparecer nessa lista. ATENÇÃO: desativar o último perfil ativo "
+        "reintroduz o fallback do motor (padrão), porque o analyzer precisa "
+        "de pelo menos um perfil para funcionar."
     ),
 )
 def set_profile_ativo(nome: str, body: ProfileAtivoIn,
@@ -446,11 +448,6 @@ def set_profile_ativo(nome: str, body: ProfileAtivoIn,
     nome = nome.strip()
     if not nome:
         raise HTTPException(status_code=400, detail="Nome de perfil vazio.")
-    if not body.ativo and nome == PERFIL_PADRAO:
-        raise HTTPException(
-            status_code=400,
-            detail=f"O perfil '{PERFIL_PADRAO}' não pode ser desativado.",
-        )
     with conn.cursor() as cur:
         cur.execute(
             f"""
