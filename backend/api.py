@@ -919,6 +919,123 @@ def analisar(body: AnaliseIn, conn: Connection = Depends(get_conn)) -> AnaliseRe
                 _ORIGEM_CONSULTA, confirmado, direcao_mtf,
             )))
 
+# ========================================================================
+# Feedback e webhooks
+# ========================================================================
+
+@app.post(
+    "/signals/{signal_id}/feedback",
+    response_model=FeedbackOut,
+    dependencies=[Depends(require_api_key)],
+    include_in_schema=False,
+)
+def save_feedback(signal_id: int, body: FeedbackIn, conn: Connection = Depends(get_conn)) -> FeedbackOut:
+    """Registra feedback do usuario sobre um sinal."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO signal_feedback (signal_id, acao, origem, nota)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, signal_id, acao, origem, nota, criado_em
+            """,
+            (signal_id, body.acao, body.origem, body.nota),
+        )
+        row = cur.fetchone()
+    return FeedbackOut(id=row[0], signal_id=row[1], acao=row[2], origem=row[3],
+                       nota=row[4], criado_em=row[5])
+
+
+@app.get(
+    "/signals/feedback",
+    response_model=FeedbackResponse,
+    dependencies=[Depends(require_api_key)],
+    include_in_schema=False,
+)
+def list_feedback(
+    acao: str | None = Query(None),
+    origem: str | None = Query(None),
+    signal_id: int | None = Query(None),
+    limite: int = Query(200, ge=1, le=2000),
+    dias: int = Query(30, ge=1, le=3650),
+    conn: Connection = Depends(get_conn),
+) -> FeedbackResponse:
+    """Lista feedbacks com filtros."""
+    where = ["criado_em > now() - make_interval(days => %(dias)s)"]
+    params = {"dias": dias, "limite": limite}
+
+    if acao:
+        where.append("acao = %(acao)s")
+        params["acao"] = acao
+    if origem:
+        where.append("origem = %(origem)s")
+        params["origem"] = origem
+    if signal_id:
+        where.append("signal_id = %(signal_id)s")
+        params["signal_id"] = signal_id
+
+    clause = " AND ".join(where)
+
+    with conn.cursor() as cur:
+        # Contagem
+        cur.execute(
+            f"SELECT COALESCE(jsonb_object_agg(acao, cnt), '{{}}'::jsonb) FROM "
+            f"(SELECT acao, COUNT(*) AS cnt FROM signal_feedback "
+            f"WHERE {clause} GROUP BY acao) sub",
+            params,
+        )
+        por_acao = cur.fetchone()[0] or {}
+
+        cur.execute(
+            f"""
+            SELECT sf.id, sf.signal_id, sf.acao, sf.origem, sf.nota, sf.criado_em,
+                   s.symbol, s.timeframe, s.direcao, s.entrada, s.stop, s.alvo_1, s.resultado, s.perfil
+            FROM signal_feedback sf
+            JOIN signals s ON s.id = sf.signal_id
+            WHERE {clause}
+            ORDER BY sf.criado_em DESC
+            LIMIT %(limite)s
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+
+    feedbacks = [
+        FeedbackOut(id=r[0], signal_id=r[1], acao=r[2], origem=r[3],
+                    nota=r[4], criado_em=r[5])
+        for r in rows
+    ]
+    # Inject signal info as extra context via nota
+    for fb, r in zip(feedbacks, rows):
+        fb.__dict__['_signal_symbol'] = r[6]
+        fb.__dict__['_signal_tf'] = r[7]
+        fb.__dict__['_signal_direcao'] = r[8]
+        fb.__dict__['_signal_entrada'] = r[9]
+
+    return FeedbackResponse(feedbacks=feedbacks, total=len(feedbacks), por_acao=por_acao)
+
+
+@app.post(
+    "/webhooks/acoes",
+    response_model=FeedbackOut,
+    include_in_schema=False,
+)
+def webhook_acoes(body: WebhookPayload, conn: Connection = Depends(get_conn)) -> FeedbackOut:
+    """Webhook generico pra WhatsApp/Telegram/n8n. Sem autenticacao extra
+    porque o unico path de entrada e via gateway interno do cluster."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO signal_feedback (signal_id, acao, origem, nota)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, signal_id, acao, origem, nota, criado_em
+            """,
+            (body.signal_id, body.acao, body.origem, body.nota),
+        )
+        row = cur.fetchone()
+    return FeedbackOut(id=row[0], signal_id=row[1], acao=row[2], origem=row[3],
+                       nota=row[4], criado_em=row[5])
+
+
     return AnaliseResponse(
         symbol=symbol,
         perfil=nome_perfil,

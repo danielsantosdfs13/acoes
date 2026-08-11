@@ -199,6 +199,27 @@ CREATE INDEX IF NOT EXISTS signals_pendentes_idx
     ON signals (candle_time)
     WHERE resultado IS NULL OR resultado = 'EM_ABERTO';
 
+-- ------------------------------------------------------------------
+-- Feedback do usuario sobre sinais (ACOMPANHAR, OPERAR, IGNORAR, etc).
+-- Origem pode ser web (Streamlit), whatsapp ou telegram (webhooks).
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signal_feedback (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    signal_id   BIGINT NOT NULL REFERENCES signals(id) ON DELETE CASCADE,
+    acao        TEXT NOT NULL,
+    origem      TEXT NOT NULL DEFAULT 'web',
+    nota        TEXT,
+    criado_em   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT signal_feedback_acao_chk
+        CHECK (acao IN ('ACOMPANHAR', 'OPERAR', 'IGNORAR', 'OPEREI', 'CANCELEI')),
+    CONSTRAINT signal_feedback_origem_chk
+        CHECK (origem IN ('web', 'whatsapp', 'telegram'))
+);
+
+CREATE INDEX IF NOT EXISTS signal_feedback_signal_id_idx ON signal_feedback(signal_id);
+CREATE INDEX IF NOT EXISTS signal_feedback_acao_idx ON signal_feedback(acao);
+CREATE INDEX IF NOT EXISTS signal_feedback_criado_idx ON signal_feedback(criado_em DESC);
+
 -- NÃO acrescente índice pras consultas de assertividade sem medir antes.
 --
 -- Elas agregam a tabela inteira com um recorte de data e quebram por

@@ -239,3 +239,33 @@ class StatsResponse(BaseModel):
     por_direcao: list[StatsRow]
     por_faixa_score: list[StatsRow]
     por_mtf: list[StatsRow]
+
+class FeedbackIn(BaseModel):
+    """Feedback do usuário sobre um sinal."""
+    acao: str  # ACOMPANHAR | OPERAR | IGNORAR | OPEREI | CANCELEI
+    origem: str = "web"  # web | whatsapp | telegram
+    nota: str | None = None
+
+
+class FeedbackOut(BaseModel):
+    id: int
+    signal_id: int
+    acao: str
+    origem: str
+    nota: str | None
+    criado_em: datetime
+
+
+class FeedbackResponse(BaseModel):
+    feedbacks: list[FeedbackOut]
+    total: int
+    por_acao: dict[str, int]  # {"ACOMPANHAR": 5, "IGNORAR": 3, ...}
+
+
+class WebhookPayload(BaseModel):
+    """Payload genérico de webhook (WhatsApp/Telegram)."""
+    signal_id: int
+    acao: str
+    origem: str  # whatsapp | telegram
+    nota: str | None = None
+    user_id: str | None = None  # id do usuário no messenger

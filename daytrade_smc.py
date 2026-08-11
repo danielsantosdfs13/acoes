@@ -2966,6 +2966,49 @@ def signal_payload(
     }
 
 
+
+
+def save_feedback(signal_id: int, acao: str, origem: str = "web", nota: str | None = None) -> dict:
+    """Registra feedback do usuario sobre um sinal.
+
+    acao: ACOMPANHAR | OPERAR | IGNORAR | OPEREI | CANCELEI
+    origem: web | whatsapp | telegram
+    """
+    if not ACOES_API_URL:
+        raise RuntimeError("API do homelab nao configurada.")
+    response = requests.post(
+        f"{_api_base_url()}/signals/{signal_id}/feedback",
+        json={"acao": acao, "origem": origem, "nota": nota},
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_feedback(acao: str | None = None, origem: str | None = None,
+                   signal_id: int | None = None, dias: int = 7, limite: int = 200) -> dict:
+    """Lista feedbacks com filtros.
+
+    Retorna {"feedbacks": [...], "total": N, "por_acao": {...}}"""
+    if not ACOES_API_URL:
+        raise RuntimeError("API do homelab nao configurada.")
+    params = {"limite": limite, "dias": dias}
+    if acao:
+        params["acao"] = acao
+    if origem:
+        params["origem"] = origem
+    if signal_id:
+        params["signal_id"] = signal_id
+    response = requests.get(
+        f"{_api_base_url()}/signals/feedback",
+        params=params,
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
 def save_signal(payload: dict) -> dict:
     """Grava um sinal pela API. LEVANTA erro se a API não estiver
     configurada ou não responder — ver o comentário do bloco acima sobre

@@ -30,6 +30,9 @@ import streamlit as st
 
 import daytrade_smc
 from daytrade_smc import (
+    save_feedback,
+    fetch_feedback,
+    
     ALL_MODALITIES_OPTION,
     AnalysisParams,
     DATA_SOURCES,
@@ -1416,6 +1419,7 @@ def _render_breadcrumb(current: str) -> None:
         "Scanner": "🔍 Scanner",
         "Análise individual": "📈 Análise",
         "Verificação retroativa": "🕵️ Retroativa",
+        "Acompanhamento": "📋 Acompanhamento",
         "Assertividade": "📉 Assertividade",
     }
     items = ["Dashboard"] if current == "Dashboard" else ["Dashboard", current]
@@ -1449,7 +1453,7 @@ def _apply_deep_link() -> None:
 
     # Modo
     if qp.get("mode") and qp["mode"] in [
-        "Dashboard", "Scanner", "Análise individual", "Verificação retroativa", "Assertividade",
+        "Dashboard", "Scanner", "Acompanhamento", "Análise individual", "Verificação retroativa", "Assertividade",
     ]:
         st.session_state.mode_select = qp["mode"]
 
@@ -1477,7 +1481,7 @@ if not st.session_state.get("_deep_link_applied"):
 # ========================================================================
 mode = st.segmented_control(
     "Modo",
-    ["Dashboard", "Scanner", "Análise individual", "Verificação retroativa", "Assertividade",
+    ["Dashboard", "Scanner", "Acompanhamento", "Análise individual", "Verificação retroativa", "Assertividade",
      "Mini Índice (WINFUT)"],
     key="mode_select", default="Dashboard", required=True,
     # `required=True` é obrigatório aqui, não estético: sem ele,
@@ -1486,6 +1490,154 @@ mode = st.segmented_control(
     # Assertividade. Sem o required, um duplo-clique acidental trocaria de
     # modo em silêncio pro usuário achar que ainda está na tela anterior.
 )
+
+def render_acompanhamento(params: AnalysisParams) -> None:
+    """Acompanhamento de sinais — cardapio de acoes sobre sinais recentes.
+    
+    Mostra sinais sem feedback, agrupados por status: pendentes, acompanhando,
+    operados, ignorados. Botoes de acao em cada linha."""
+    _render_breadcrumb("Acompanhamento")
+    _render_share_button()
+    
+    st.markdown("### 📋 Acompanhamento de sinais")
+    
+    if not daytrade_smc.ACOES_API_URL:
+        st.info("Modo Acompanhamento requer a API do homelab configurada.")
+        return
+    
+    # Fetch recent signals (last 24h, operaveis apenas)
+    try:
+        sinais_raw = daytrade_smc.fetch_signals(
+            origem="worker",
+            perfil=st.session_state.perfil_select,
+            dias=1,
+            limite=500,
+        )
+        sinais = sinais_raw.get("signals", []) if isinstance(sinais_raw, dict) else []
+    except Exception as e:
+        st.error(f"Erro ao buscar sinais: {e}")
+        return
+    
+    if not sinais:
+        st.info("Nenhum sinal recente encontrado.")
+        return
+    
+    # Fetch existing feedbacks
+    try:
+        fb_data = daytrade_smc.fetch_feedback(dias=7, limite=2000)
+        fbs = fb_data.get("feedbacks", [])
+        # Map signal_id -> latest feedback acao
+        fb_map = {}
+        for fb in fbs:
+            sid = fb.get("signal_id")
+            if sid and sid not in fb_map:
+                fb_map[sid] = fb["acao"]
+    except Exception:
+        fb_map = {}
+    
+    # Classify signals
+    pendentes = []
+    acompanhando = []
+    operados = []
+    ignorados = []
+    
+    for s in sinais:
+        sid = s.get("id")
+        fb = fb_map.get(sid)
+        if fb == "ACOMPANHAR":
+            acompanhando.append(s)
+        elif fb in ("OPERAR", "OPEREI"):
+            operados.append(s)
+        elif fb == "IGNORAR":
+            ignorados.append(s)
+        else:
+            pendentes.append(s)
+    
+    # Summary metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pendentes", len(pendentes))
+    c2.metric("Acompanhando", len(acompanhando))
+    c3.metric("Operados", len(operados))
+    c4.metric("Ignorados", len(ignorados))
+    
+    # ---- PENDENTES (principal) ----
+    st.markdown("#### ⏳ Pendentes de decisao")
+    if not pendentes:
+        st.info("Nenhum sinal pendente!")
+    else:
+        for s in pendentes[:20]:
+            _render_feedback_row(s)
+    
+    # ---- ACOMPANHANDO ----
+    if acompanhando:
+        with st.expander(f"👀 Acompanhando ({len(acompanhando)})", expanded=False):
+            for s in acompanhando:
+                _render_feedback_row(s, show_actions=False)
+    
+    # ---- OPERADOS ----
+    if operados:
+        with st.expander(f"✅ Operados ({len(operados)})", expanded=False):
+            for s in operados:
+                _render_feedback_row(s, show_actions=False)
+    
+    # ---- IGNORADOS ----
+    if ignorados:
+        with st.expander(f"🚫 Ignorados ({len(ignorados)})", expanded=False):
+            for s in ignorados:
+                _render_feedback_row(s, show_actions=False)
+
+
+def _render_feedback_row(s: dict, show_actions: bool = True) -> None:
+    """Uma linha de sinal com botoes de acao."""
+    direcao = s.get("direcao", "NEUTRO")
+    cor = "#2ed3a3" if direcao == "COMPRA" else "#ff5470" if direcao == "VENDA" else "#8291a1"
+    
+    c1, c2, c3, c4, c5 = st.columns([1.5, 1, 1, 1, 2.5])
+    with c1:
+        st.markdown(
+            f'<span style="color:{cor}; font-weight:600">{direcao}</span> '
+            f'<b>{s.get("symbol")}</b> · {s.get("timeframe")} · '
+            f'<span style="opacity:.6">{s.get("modalidade","")}</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(f"{s.get('setup','')[:40]} · score {s.get('score',0):.0f}")
+    with c2:
+        if s.get("entrada"):
+            st.metric("Entrada", f"R$ {s['entrada']:.2f}")
+    with c3:
+        if s.get("stop"):
+            st.metric("Stop", f"R$ {s['stop']:.2f}")
+    with c4:
+        if s.get("alvo_1"):
+            st.metric("Alvo", f"R$ {s['alvo_1']:.2f}")
+    
+    if show_actions and daytrade_smc.ACOES_API_URL:
+        with c5:
+            ac1, ac2, ac3, ac4 = st.columns(4)
+            sid = s.get("id")
+            with ac1:
+                if st.button("👀", key=f"fb_acomp_{sid}", help="Acompanhar"):
+                    _do_feedback(sid, "ACOMPANHAR")
+            with ac2:
+                if st.button("💰", key=f"fb_oper_{sid}", help="Operei"):
+                    _do_feedback(sid, "OPEREI")
+            with ac3:
+                if st.button("🚫", key=f"fb_ign_{sid}", help="Ignorar"):
+                    _do_feedback(sid, "IGNORAR")
+            with ac4:
+                if st.button("📊", key=f"fb_ver_{sid}", help="Ver analise"):
+                    st.session_state.jump_to_symbol = s.get("symbol")
+                    st.rerun()
+
+
+def _do_feedback(signal_id: int, acao: str) -> None:
+    try:
+        daytrade_smc.save_feedback(signal_id, acao)
+        st.success(f"{acao}!")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Erro: {e}")
+
 
 def render_dashboard(source: str, count: int, risk_budget: float | None, params: AnalysisParams,
                       perfis: list[str], style: str) -> None:
@@ -1823,6 +1975,7 @@ with st.sidebar:
         st.markdown("""
         **Dashboard**: melhores oportunidades agora, organizadas por perfil.
         **Scanner**: tabela com todos os ativos da watchlist.
+        **Acompanhamento**: marque sinais como ignorado, acompanhar ou operar.
         **Análise individual**: gráfico + 6 leituras de um ativo.
         **Retroativa**: veja como um sinal teria se saído no passado.
         **Assertividade**: taxa de acerto medida dos sinais gravados.
@@ -1839,6 +1992,8 @@ if mode == "Dashboard":
     st.title("📊 Oportunidades agora")
 elif mode == "Scanner":
     st.title("🔍 Scanner de mercado")
+elif mode == "Acompanhamento":
+    st.title("📋 Acompanhamento de sinais")
 elif mode == "Análise individual":
     st.title("📈 Análise técnica")
 elif mode == "Verificação retroativa":
@@ -1874,6 +2029,9 @@ if mode == "Dashboard":
                      perfis=[p for p in sorted(st.session_state.perfis)
                              if p != DEFAULT_PROFILE_NAME][:4],  # top 4 perfis custom
                      style=style)
+
+elif mode == "Acompanhamento":
+    render_acompanhamento(params)
 
 elif mode == "Scanner":
     _render_breadcrumb("Scanner")
