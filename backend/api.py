@@ -58,6 +58,7 @@ from models import (
     CandlesResponse,
     FeedbackIn,
     FeedbackOut,
+    FeedbackResponse,
     ProfileAtivoIn,
     ProfileOut,
     ProfileIn,
@@ -1037,16 +1038,3 @@ def webhook_acoes(body: WebhookPayload, conn: Connection = Depends(get_conn)) ->
         row = cur.fetchone()
     return FeedbackOut(id=row[0], signal_id=row[1], acao=row[2], origem=row[3],
                        nota=row[4], criado_em=row[5])
-
-
-    return AnaliseResponse(
-        symbol=symbol,
-        perfil=nome_perfil,
-        confirmacao=list(DAYTRADE_CONFIRMATION_TIMEFRAMES),
-        analisado_em=datetime.now(UTC),
-        leituras=leituras,
-        # Só os erros dos timeframes que o usuário pediu: um erro de M15 puxado
-        # pra dentro só por causa da confirmação viraria ruído numa consulta
-        # que perguntou sobre D1.
-        erros={tf: msg for tf, msg in erros.items() if tf in pedidos},
-    )
