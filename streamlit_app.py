@@ -1515,12 +1515,13 @@ def _render_oportunidade_card(row: pd.Series, symbol: str, style: str, source: s
                 st.caption(f"Risco: R$ {abs(entrada-stop):.2f}/ação · "
                            f"R/R 1:{(alvo-entrada)/(entrada-stop):.2f}")
 
-    # Botão de ação
+    # Botão de ação — NÃO dá pra tocar em mode_select depois do widget
+    # criado: usa jump_to_symbol que o código no topo do script aplica ANTES
+    # do mode widget nascer (e já troca pro modo Análise individual).
     c_esq, c_dir = st.columns([1, 4])
     with c_esq:
         if st.button("📊 Ver", key=f"dash_ver_{symbol}_{perfil}_{row.name}"):
             st.session_state.jump_to_symbol = symbol
-            st.session_state.mode_select = "Análise individual"
             st.rerun()
     with c_dir:
         if daytrade_smc.ACOES_API_URL and st.button("💾 Salvar", key=f"dash_salvar_{symbol}_{perfil}_{row.name}"):
