@@ -1410,15 +1410,125 @@ def _persist_watchlist() -> None:
 # ========================================================================
 mode = st.segmented_control(
     "Modo",
-    ["Análise individual", "Scanner (todos os ativos)", "Verificação retroativa", "Assertividade",
+    ["Dashboard", "Scanner", "Análise individual", "Verificação retroativa", "Assertividade",
      "Mini Índice (WINFUT)"],
-    key="mode_select", default="Análise individual", required=True,
+    key="mode_select", default="Dashboard", required=True,
     # `required=True` é obrigatório aqui, não estético: sem ele,
     # segmented_control deixa clicar no pill já selecionado pra DESMARCAR e
     # devolver None — e o if/elif abaixo termina num `else` que assume
     # Assertividade. Sem o required, um duplo-clique acidental trocaria de
     # modo em silêncio pro usuário achar que ainda está na tela anterior.
 )
+
+def render_dashboard(source: str, count: int, risk_budget: float | None, params: AnalysisParams,
+                      perfis: list[str], style: str) -> None:
+    """Tela principal: top oportunidades de relance, organizadas por perfil.
+
+    Cada card é uma decisão — entrada, stop, alvo, score, perfil. Sem
+    parameter tweaking: isso aqui é pra operar, não pra calibrar. Quem quer
+    calibrar desce pro Scanner ou pra Análise individual."""
+    confirmation = estilo(style)["confirmation"]
+    context_tfs = estilo(style)["context"]
+    tf_entrada = confirmation[0]
+
+    st.markdown("### 🎯 Melhores oportunidades agora")
+    st.caption(f"Scanner sobre {len(st.session_state.watchlist)} ativos · {style} · "
+               f"perfil ativo: **{st.session_state.perfil_select}** · "
+               f"fonte: {SOURCE_LABELS.get(source, source)}")
+
+    # Perfis que o worker está rodando — mostra aba de cada um
+    if len(perfis) > 1:
+        perfil_tabs = st.tabs(["Todos"] + perfis)
+    else:
+        perfil_tabs = [st.container()]
+
+    for idx, tab in enumerate(perfil_tabs):
+        with tab:
+            perfil_filtro = None if idx == 0 else perfis[idx - 1]
+
+            # Rodar o scanner (cacheado)
+            with st.spinner("Analisando oportunidades..."):
+                df = run_scanner(
+                    st.session_state.watchlist, style, "Confluência",
+                    source, count, risk_budget,
+                    params if perfil_filtro is None else st.session_state.perfis.get(perfil_filtro, params),
+                )
+
+            # Filtrar só operáveis (entrada válida)
+            operáveis = df[df["Entrada"].notna()].copy() if "Entrada" in df.columns else df.head(0)
+
+            if operáveis.empty:
+                st.info("Nenhum sinal operável neste momento. Tente outro perfil ou aguarde o próximo ciclo.")
+                continue
+
+            # Top 5 por score
+            top = operáveis.head(5)
+
+            for _, row in top.iterrows():
+                _render_oportunidade_card(row, symbol=row["Ativo"], style=style,
+                                          source=source, count=count, risk_budget=risk_budget,
+                                          params=params, perfil=perfil_filtro or st.session_state.perfil_select)
+
+
+def _render_oportunidade_card(row: pd.Series, symbol: str, style: str, source: str,
+                               count: int, risk_budget: float | None, params: AnalysisParams,
+                               perfil: str) -> None:
+    """Um card de oportunidade — tudo que pra decidir está na cara."""
+    direcao = row.get("Direção", "NEUTRO")
+    if direcao == "COMPRA":
+        cor = "#2ed3a3"
+        icone = "🟢"
+        acao = "COMPRAR"
+    else:
+        cor = "#ff5470"
+        icone = "🔴"
+        acao = "VENDER"
+
+    score = row.get("Score Geral", 0) or 0
+    entrada = row.get("Entrada")
+    stop = row.get("Stop")
+    alvo = row.get("Alvo 1")
+    qty = row.get("Quantidade")
+    total = row.get("Total (R$)")
+
+    # Layout: info principal à esquerda, níveis à direita
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        st.markdown(
+            f'<div style="border-left:4px solid {cor}; padding:8px 12px; background:{cor}10; border-radius:4px;">'
+            f'<span style="font-size:16px; font-weight:600; color:{cor}">{icone} {acao} {symbol}</span>'
+            f'<br><span style="font-size:13px; opacity:.8">score {score:.0f}/100 · {row.get("Setup", "")}</span>'
+            f'<br><span style="font-size:11px; opacity:.6">perfil: {perfil}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    with c2:
+        if entrada and stop and alvo:
+            cols = st.columns(4)
+            cols[0].metric("Entrada", f"R$ {entrada:.2f}")
+            cols[1].metric("Stop", f"R$ {stop:.2f}", f"{(stop-entrada)/entrada*100:+.2f}%")
+            cols[2].metric("Alvo", f"R$ {alvo:.2f}", f"{(alvo-entrada)/entrada*100:+.2f}%")
+            if qty and qty > 0:
+                cols[3].metric("Qtd", f"{int(qty)}", f"R$ {total:.0f}" if total else "")
+            if risk_budget:
+                st.caption(f"Risco: R$ {abs(entrada-stop):.2f}/ação · "
+                           f"R/R 1:{(alvo-entrada)/(entrada-stop):.2f}")
+
+    # Botão de ação
+    c_esq, c_dir = st.columns([1, 4])
+    with c_esq:
+        if st.button("📊 Ver", key=f"dash_ver_{symbol}_{perfil}_{row.name}"):
+            st.session_state.jump_to_symbol = symbol
+            st.session_state.mode_select = "Análise individual"
+            st.rerun()
+    with c_dir:
+        if daytrade_smc.ACOES_API_URL and st.button("💾 Salvar", key=f"dash_salvar_{symbol}_{perfil}_{row.name}"):
+            # Salvar o sinal via API (simplificado)
+            st.info("Use 'Ver' para salvar com confirmação MTF.")
+
+    st.divider()
+
 
 # ========================================================================
 # Sidebar
@@ -1475,7 +1585,7 @@ with st.sidebar:
     # "Ativo para análise" fica SEMPRE visível — é o que se mexe todo dia.
     # Gerenciar a watchlist é configuração de uma vez só, então desce pro
     # expander. Separação sugerida pela auditoria do projeto original.
-    if mode in ("Análise individual", "Verificação retroativa"):
+    if mode in ("Análise individual", "Verificação retroativa", "Dashboard"):
         st.markdown("### Ativo")
         st.selectbox("Ativo para análise", st.session_state.watchlist, key="symbol_select")
 
@@ -1600,8 +1710,9 @@ with st.sidebar:
             "Intervalo", options=[30, 60, 120, 300], value=60, format_func=lambda s: f"{s}s",
             disabled=not auto_refresh,
         )
-    elif mode == "Scanner (todos os ativos)":
+    elif mode == "Scanner":
         run_scanner_clicked = st.button("🔍 Rodar scanner", type="primary", use_container_width=True)
+    # Dashboard não precisa de controles extra — roda automático
 
 
 # ========================================================================
@@ -1630,18 +1741,15 @@ else:
         icon="⏱️",
     )
 
-if mode == "Análise individual":
-    symbol = st.session_state.symbol_select
+if mode == "Dashboard":
+    render_dashboard(source, count, risk_budget, params,
+                     perfis=[p for p in sorted(st.session_state.perfis)
+                             if p != DEFAULT_PROFILE_NAME][:4],  # top 4 perfis custom
+                     style=style)
 
-    if auto_refresh:
-        st.caption(f"🔄 Atualizando automaticamente a cada {refresh_interval}s")
-        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, source, count, risk_budget, params, perfil)
-    else:
-        render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
-
-elif mode == "Scanner (todos os ativos)":
+elif mode == "Scanner":
     st.caption(f"{len(st.session_state.watchlist)} ativo(s) na watchlist · {style} · leitura: {modality} · "
-              f"perfil: {perfil} · {count} candles · recomendação exige {conf_a}+{conf_b} concordando")
+               f"perfil: {perfil} · {count} candles · recomendação exige {conf_a}+{conf_b} concordando")
 
     if run_scanner_clicked:
         st.session_state.scanner_result = run_scanner(st.session_state.watchlist, style, modality, source, count, risk_budget, params)
@@ -1697,6 +1805,15 @@ elif mode == "Scanner (todos os ativos)":
             st.rerun()
     else:
         st.info("Clique em **Rodar scanner** na barra lateral para analisar todos os ativos da watchlist.")
+
+elif mode == "Análise individual":
+    symbol = st.session_state.symbol_select
+
+    if auto_refresh:
+        st.caption(f"🔄 Atualizando automaticamente a cada {refresh_interval}s")
+        _AUTO_REFRESH_FRAGMENTS[refresh_interval](symbol, style, modality, source, count, risk_budget, params, perfil)
+    else:
+        render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
 
 elif mode == "Verificação retroativa":
     symbol = st.session_state.symbol_select
