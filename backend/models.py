@@ -269,3 +269,21 @@ class WebhookPayload(BaseModel):
     origem: str  # whatsapp | telegram
     nota: str | None = None
     user_id: str | None = None  # id do usuário no messenger
+
+
+class AutoAcompanhamentoIn(BaseModel):
+    """Regra de auto-acompanhamento: perfil + modalidade → ACOMPANHAR automático."""
+    perfil: str
+    modalidade: str
+    ativo: bool = True
+
+
+class AutoAcompanhamentoOut(BaseModel):
+    perfil: str
+    modalidade: str
+    ativo: bool
+    criado_em: datetime
+
+
+class AutoAcompanhamentoResponse(BaseModel):
+    regras: list[AutoAcompanhamentoOut]

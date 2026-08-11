@@ -255,3 +255,16 @@ BEGIN
   END IF;
 END
 $$;
+
+-- ------------------------------------------------------------------
+-- Regras de auto-acompanhamento. O worker-acoes consulta esta tabela
+-- e gera feedback automático (`acao = 'ACOMPANHAR'`) para os sinais
+-- cujo perfil + modalidade batem com uma regra ativa.
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS auto_acompanhamento (
+    perfil      TEXT NOT NULL,
+    modalidade  TEXT NOT NULL,
+    ativo       BOOLEAN NOT NULL DEFAULT true,
+    criado_em   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (perfil, modalidade)
+);

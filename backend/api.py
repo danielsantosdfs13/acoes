@@ -19,6 +19,11 @@ para outros consumidores.
   - PUT    /profiles/{nome}/ativo            liga/desliga a geração de alertas
                                             de um perfil no analyzer (tool)
 
+  - GET    /auto-acompanhamento              lista as regras de auto-acompanhamento
+                                            ativas (tool)
+  - PUT    /auto-acompanhamento              cria ou atualiza uma regra de
+                                            auto-acompanhamento (tool)
+
   - POST   /signals                          grava um sinal (dedup por vela)
   - GET    /signals                          histórico com filtros
   - GET    /signals/stats                    assertividade por recorte
@@ -54,6 +59,9 @@ from db import get_conn
 from models import (
     AnaliseIn,
     AnaliseResponse,
+    AutoAcompanhamentoIn,
+    AutoAcompanhamentoOut,
+    AutoAcompanhamentoResponse,
     CandleOut,
     CandlesResponse,
     FeedbackIn,
@@ -919,6 +927,80 @@ def analisar(body: AnaliseIn, conn: Connection = Depends(get_conn)) -> AnaliseRe
                 symbol, timeframe, sinal, contexto, nome_perfil, params,
                 _ORIGEM_CONSULTA, confirmado, direcao_mtf,
             )))
+
+# ========================================================================
+# Auto-acompanhamento
+# ========================================================================
+
+
+@app.get(
+    "/auto-acompanhamento",
+    response_model=AutoAcompanhamentoResponse,
+    dependencies=[Depends(require_api_key)],
+    operation_id="listar_auto_acompanhamento",
+    summary="Regras de auto-acompanhamento ativas",
+    description=(
+        "Lista as regras de auto-acompanhamento ativas: cada regra diz "
+        "'para o perfil X e modalidade Y, marque automaticamente como "
+        "ACOMPANHAR'. Use `configurar_auto_acompanhamento` para criar "
+        "ou atualizar uma regra. O worker-acoes aplica essas regras a "
+        "cada ciclo: sinais que batem ganham feedback automático."
+    ),
+)
+def list_auto_acompanhamento(
+    conn: Connection = Depends(get_conn),
+) -> AutoAcompanhamentoResponse:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT perfil, modalidade, ativo, criado_em "
+            "FROM auto_acompanhamento WHERE ativo ORDER BY criado_em DESC"
+        )
+        rows = cur.fetchall()
+    return AutoAcompanhamentoResponse(regras=[
+        AutoAcompanhamentoOut(perfil=r[0], modalidade=r[1], ativo=r[2], criado_em=r[3])
+        for r in rows
+    ])
+
+
+@app.put(
+    "/auto-acompanhamento",
+    response_model=AutoAcompanhamentoOut,
+    dependencies=[Depends(require_api_key)],
+    operation_id="configurar_auto_acompanhamento",
+    summary="Cria ou atualiza uma regra de auto-acompanhamento",
+    description=(
+        "Configura uma regra de auto-acompanhamento: todo sinal do "
+        "`perfil` + `modalidade` informados será automaticamente marcado "
+        "como ACOMPANHAR pelo worker. Passe `ativo=false` para desativar "
+        "a regra sem removê-la. O worker lê as regras a cada ciclo "
+        "(~15 min); o efeito é visível a partir do próximo sinal "
+        "capturado, não retroativo. As modalidades válidas são: "
+        "Confluência, SMC, Price Action, Médias Móveis, VWAP. Os perfis "
+        "válidos estão em `listar_perfis_analise`."
+    ),
+)
+def configurar_auto_acompanhamento(
+    body: AutoAcompanhamentoIn,
+    conn: Connection = Depends(get_conn),
+) -> AutoAcompanhamentoOut:
+    perfil = body.perfil.strip()
+    modalidade = body.modalidade.strip()
+    if not perfil or not modalidade:
+        raise HTTPException(status_code=400, detail="perfil e modalidade são obrigatórios.")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO auto_acompanhamento (perfil, modalidade, ativo)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (perfil, modalidade) DO UPDATE
+              SET ativo = EXCLUDED.ativo, criado_em = now()
+            RETURNING perfil, modalidade, ativo, criado_em
+            """,
+            (perfil, modalidade, body.ativo),
+        )
+        row = cur.fetchone()
+    return AutoAcompanhamentoOut(perfil=row[0], modalidade=row[1], ativo=row[2], criado_em=row[3])
+
 
 # ========================================================================
 # Feedback e webhooks
