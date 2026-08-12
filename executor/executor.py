@@ -120,13 +120,14 @@ def _regras() -> list[dict]:
     return r.json().get("regras", [])
 
 
-def _reservar(sinal: dict, risco: float) -> tuple[dict, bool]:
+def _reservar(sinal: dict, risco: float, teste: bool = False) -> tuple[dict, bool]:
     r = requests.post(
         f"{API_URL}/ordens",
         json={
             "signal_id": sinal["id"], "symbol": sinal["symbol"],
             "direcao": sinal["direcao"], "risco_maximo": risco,
             "stop": sinal.get("stop"), "alvo": sinal.get("alvo_1"),
+            "teste": teste,
         },
         headers=_api_headers(), timeout=TIMEOUT,
     )
@@ -144,9 +145,17 @@ def _registrar(signal_id: int, dados: dict) -> None:
 
 
 def _ordens_abertas() -> list[dict]:
-    """Ordens que saíram e ainda não têm fechamento gravado."""
+    """Ordens que saíram e ainda não têm fechamento gravado.
+
+    `incluir_testes=true` e não o default: a rota esconde ordem de validação
+    das ESTATÍSTICAS, que é onde ela suja. Aqui não — uma posição de teste
+    aberta na corretora é uma posição aberta, e deixá-la fora da
+    reconciliação a deixaria pendente pra sempre, ocupando o símbolo na
+    guarda de "posição já aberta"."""
     r = requests.get(
-        f"{API_URL}/ordens", params={"aberta": "true", "dias": CONCILIACAO_DIAS, "limite": 500},
+        f"{API_URL}/ordens",
+        params={"aberta": "true", "dias": CONCILIACAO_DIAS, "limite": 500,
+                "incluir_testes": "true"},
         headers=_api_headers(), timeout=TIMEOUT,
     )
     r.raise_for_status()
@@ -286,7 +295,17 @@ def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
     return candidatos
 
 
-def _processar(sinal: dict, regra: dict) -> None:
+def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
+    """Um sinal virando ordem.
+
+    `teste=True` é o caminho de quem está conferindo o encanamento à mão: a
+    ordem sai igual, com as mesmas travas, mas a linha nasce marcada e fica
+    fora das estatísticas. O laço do serviço NUNCA passa isso — só chamada
+    manual passa, o que é exatamente o que distingue uma da outra.
+
+    Marcar em vez de apagar depois: a primeira ordem de validação teve que
+    ser removida na mão do banco, e apagar de tabela de auditoria some com um
+    evento que aconteceu de verdade."""
     symbol, sid = sinal["symbol"], sinal["id"]
     risco = float(regra["risco_maximo"])
     estimada = _quantidade_estimada(sinal, risco)
@@ -297,13 +316,14 @@ def _processar(sinal: dict, regra: dict) -> None:
         log.info("%s: já tem posição aberta, pulando sinal %s.", symbol, sid)
         return
 
-    ordem, duplicado = _reservar(sinal, risco)
+    ordem, duplicado = _reservar(sinal, risco, teste=teste)
     if duplicado:
         log.debug("sinal %s já tinha ordem (%s), pulando.", sid, ordem["status"])
         return
 
     log.info(
-        "ENVIANDO %s %s ~%.0f ações (risco R$%.2f, stop %.2f, alvo %.2f) sinal=%s",
+        "ENVIANDO%s %s %s ~%.0f ações (risco R$%.2f, stop %.2f, alvo %.2f) sinal=%s",
+        " [TESTE]" if teste else "",
         sinal["direcao"], symbol, estimada, risco,
         sinal["stop"], sinal.get("alvo_1") or 0, sid,
     )

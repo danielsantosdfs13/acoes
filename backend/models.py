@@ -345,6 +345,9 @@ class OrdemIn(BaseModel):
     risco_maximo: float | None = None
     stop: float | None = None
     alvo: float | None = None
+    # Ordem de validação: sai de verdade, mas fica fora das estatísticas. Ver
+    # o comentário da coluna em schema.sql.
+    teste: bool = False
 
 
 class OrdemResultado(BaseModel):
@@ -406,6 +409,10 @@ class OrdemOut(BaseModel):
     mensagem: str | None = None
     criado_em: datetime
     enviado_em: datetime | None = None
+    # Ordem de validação — não entra em estatística. Uma interface que liste
+    # estas linhas junto das reais TEM que marcá-las, senão o rótulo só troca
+    # de lugar o problema que ele existe pra resolver.
+    teste: bool = False
     # Desfecho na corretora
     fechado_em: datetime | None = None
     preco_saida: float | None = None

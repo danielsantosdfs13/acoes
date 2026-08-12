@@ -147,6 +147,27 @@ problema de configuração, não de estratégia.
 Pela interface web, a mesma coisa está em **Sinais › Ordens**, junto do
 botão de ligar e desligar cada regra.
 
+## Ordem de teste
+
+Ordem disparada à mão pra conferir o encanamento sai de verdade e executa de
+verdade — e não mede regra nenhuma, porque quem a escolheu foi uma pessoa e
+não o filtro da regra. Por isso ela é **marcada**, não apagada:
+
+```python
+executor._processar(sinal, regra, teste=True)
+```
+
+A linha nasce com `teste=true` e fica fora de `GET /ordens` e
+`GET /ordens/stats` por padrão. Para vê-la, `incluir_testes=true` na rota, ou
+o toggle "Incluir ordens de teste" na tela — onde ela aparece com 🧪 ao lado
+do ativo. A notificação também sai marcada.
+
+O laço do serviço nunca passa `teste=True`; só chamada manual passa, o que é
+exatamente o que distingue uma da outra. E a reconciliação **enxerga** as de
+teste: posição aberta na corretora é posição aberta, e deixá-la de fora a
+deixaria pendente pra sempre, ocupando o símbolo na trava de "posição já
+aberta".
+
 ## Duas contas na mesma máquina
 
 Ver a seção correspondente em `scraper/README.md`. Resumo: instâncias

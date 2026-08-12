@@ -998,7 +998,10 @@ def _linha_ordem(o: dict) -> dict:
                                    o.get("timeframe")) if x)
     return {
         "Quando": criado.strftime("%d/%m %H:%M"),
-        "Ativo": o["symbol"],
+        # Marcado na linha, e não só escondido pelo filtro: quem ligou o
+        # toggle está olhando teste e real na mesma tabela, e sem a marca o
+        # rótulo só trocaria de lugar o problema que ele resolve.
+        "Ativo": ("🧪 " if o.get("teste") else "") + o["symbol"],
         "Direção": o["direcao"],
         "Qtd": None if o.get("volume") is None else int(o["volume"]),
         "Entrada": o.get("preco_executado"),
@@ -1122,10 +1125,15 @@ def render_ordens() -> None:
                                 key="ordens_perfil")
         f_dias = c3.select_slider("Período", options=[1, 7, 30, 90, 365], value=30,
                                   format_func=lambda d: f"{d} dias", key="ordens_dias")
+        # Fora por padrão: ordem de validação saiu de verdade, mas foi
+        # disparada à mão pra conferir o encanamento e não mede regra nenhuma.
+        # O toggle existe pra conferir o teste que você acabou de fazer.
+        f_testes = st.toggle("Incluir ordens de teste", key="ordens_testes")
 
     filtros = {
         "tipo_conta": None if f_conta == "Todas" else f_conta,
         "perfil": None if f_perfil == "Todos" else f_perfil,
+        "incluir_testes": f_testes or None,
         "dias": f_dias,
     }
 

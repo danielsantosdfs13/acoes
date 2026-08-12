@@ -1320,7 +1320,7 @@ def configurar_auto_ordem(
 _ORDEM_CAMPOS_ORDEM = (
     "id", "signal_id", "symbol", "direcao", "volume", "risco_maximo", "preco_pedido",
     "preco_executado", "stop", "alvo", "conta", "servidor", "tipo_conta", "ticket",
-    "status", "retcode", "mensagem", "criado_em", "enviado_em",
+    "status", "retcode", "mensagem", "criado_em", "enviado_em", "teste",
     "fechado_em", "preco_saida", "volume_saida", "resultado_reais", "motivo_saida",
     "conciliado_em",
 )
@@ -1379,13 +1379,14 @@ def reservar_ordem(body: OrdemIn, conn: Connection = Depends(get_conn)) -> Ordem
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            INSERT INTO ordens (signal_id, symbol, direcao, risco_maximo, stop, alvo, status)
-            VALUES (%s, %s, %s, %s, %s, %s, 'ENVIANDO')
+            INSERT INTO ordens (signal_id, symbol, direcao, risco_maximo, stop, alvo,
+                                status, teste)
+            VALUES (%s, %s, %s, %s, %s, %s, 'ENVIANDO', %s)
             ON CONFLICT (signal_id) DO NOTHING
             RETURNING signal_id
             """,
             (body.signal_id, body.symbol.upper(), body.direcao,
-             body.risco_maximo, body.stop, body.alvo),
+             body.risco_maximo, body.stop, body.alvo, body.teste),
         )
         duplicado = cur.fetchone() is None
         row = _uma_ordem(cur, body.signal_id)
@@ -1485,6 +1486,10 @@ WITH base AS (
        AND (%(perfil)s::text     IS NULL OR s.perfil     = %(perfil)s)
        AND (%(modalidade)s::text IS NULL OR s.modalidade = %(modalidade)s)
        AND (%(timeframe)s::text  IS NULL OR s.timeframe  = %(timeframe)s)
+       -- Ordem de validação fica FORA por padrão. Ela saiu de verdade, mas
+       -- não mede regra nenhuma — quem a disparou foi uma pessoa conferindo
+       -- o encanamento, não o filtro da regra.
+       AND (%(incluir_testes)s::bool OR NOT o.teste)
 ),
 -- Só ENVIADA entra nas taxas: RECUSADA e FALHOU não chegaram ao mercado e
 -- não têm desempenho nenhum pra medir. Elas voltam contadas à parte.
@@ -1573,6 +1578,13 @@ def get_ordem_stats(
     modalidade: str | None = Query(None),
     timeframe: str | None = Query(None),
     tipo_conta: str | None = Query(None, description="DEMO ou REAL."),
+    incluir_testes: bool = Query(
+        False,
+        description=(
+            "Inclui as ordens de validação (`teste=true`), que ficam de fora por "
+            "padrão porque não medem regra nenhuma."
+        ),
+    ),
     dias: int = Query(90, ge=1, le=3650),
     conn: Connection = Depends(get_conn),
 ) -> OrdemStatsResponse:
@@ -1582,6 +1594,7 @@ def get_ordem_stats(
         "modalidade": modalidade,
         "timeframe": timeframe.strip().upper() if timeframe else None,
         "tipo_conta": tipo_conta.strip().upper() if tipo_conta else None,
+        "incluir_testes": incluir_testes,
         "dias": dias,
     }
     with conn.cursor() as cur:
@@ -1651,6 +1664,14 @@ def listar_ordens(
             "false = só as já fechadas. Omitido, traz as duas."
         ),
     ),
+    incluir_testes: bool = Query(
+        False,
+        description=(
+            "Inclui as ordens de validação (`teste=true`), que ficam de fora por "
+            "padrão. Elas saíram de verdade, mas foram disparadas à mão pra "
+            "conferir o encanamento — não medem regra nenhuma."
+        ),
+    ),
     dias: int = Query(30, ge=1, le=3650),
     limite: int = Query(200, ge=1, le=2000),
     conn: Connection = Depends(get_conn),
@@ -1663,6 +1684,7 @@ def listar_ordens(
         "timeframe": timeframe.strip().upper() if timeframe else None,
         "tipo_conta": tipo_conta.strip().upper() if tipo_conta else None,
         "aberta": aberta,
+        "incluir_testes": incluir_testes,
         "dias": dias, "limite": limite,
     }
     where = """
@@ -1679,6 +1701,8 @@ def listar_ordens(
           AND (%(aberta)s::bool IS NULL
                OR (%(aberta)s::bool AND o.status = 'ENVIADA' AND o.fechado_em IS NULL)
                OR (NOT %(aberta)s::bool AND o.fechado_em IS NOT NULL))
+          -- Ordem de validação fica FORA por padrão, mesma regra do /stats.
+          AND (%(incluir_testes)s::bool OR NOT o.teste)
     """
     with conn.cursor() as cur:
         cur.execute(f"SELECT count(*) {_ORDEM_FROM} {where}", filtros)

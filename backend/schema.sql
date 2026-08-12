@@ -387,6 +387,21 @@ ALTER TABLE ordens ADD COLUMN IF NOT EXISTS resultado_reais NUMERIC;
 ALTER TABLE ordens ADD COLUMN IF NOT EXISTS motivo_saida    TEXT;
 ALTER TABLE ordens ADD COLUMN IF NOT EXISTS conciliado_em   TIMESTAMPTZ;
 
+-- Ordem de VALIDAÇÃO: saiu de verdade, executou de verdade, e mesmo assim
+-- não mede regra nenhuma (2026-08-12).
+--
+-- Marcar em vez de apagar, no mesmo estilo de `origem='consulta'` nos
+-- payloads do /analisar e de `feedback_origem='auto'`: o repositório
+-- consistentemente ROTULA o que não deve entrar na conta em vez de esconder.
+-- A primeira ordem de teste foi apagada na mão, e apagar de uma tabela de
+-- auditoria some com um evento que aconteceu — além de exigir que alguém se
+-- lembre de fazer a limpeza toda vez.
+--
+-- Quem grava é quem envia fora de regra (ver `executor._processar(teste=)`).
+-- `GET /ordens` e `GET /ordens/stats` filtram estas linhas POR PADRÃO; quem
+-- quiser vê-las pede `incluir_testes=true`.
+ALTER TABLE ordens ADD COLUMN IF NOT EXISTS teste BOOLEAN NOT NULL DEFAULT false;
+
 -- Índice PARCIAL pelo mesmo motivo do `signals_pendentes_idx`: o alvo da
 -- reconciliação é "o que saiu e ainda não fechou", um conjunto que ENCOLHE
 -- sozinho — a linha sai do índice assim que o fechamento é gravado.
