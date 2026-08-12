@@ -11,9 +11,15 @@ vieram depois. Isso é o que separa esta ferramenta de um indicador: dá pra
 perguntar **quanto** cada leitura acerta, e não só o que ela está dizendo
 agora.
 
-**Não envia ordens.** Serve para viés e estrutura — tendência, níveis, força
-relativa entre ativos. Confirme preço e liquidez na sua corretora antes de
-operar.
+**A interface web não envia ordens.** Ela serve para viés e estrutura —
+tendência, níveis, força relativa entre ativos. Confirme preço e liquidez na
+sua corretora antes de operar.
+
+Desde 2026-08-11 existe envio automático de ordens, mas ele é um serviço
+**à parte**, rodando na VM Windows ao lado do terminal MetaTrader 5, e só
+dispara para as regras de (perfil, modalidade, timeframe) que você ligar
+explicitamente. Vem desligado, e trava em conta demo por padrão — ver
+[`executor/README.md`](executor/README.md).
 
 ## Como rodar
 
@@ -68,9 +74,10 @@ funciona** entre as telas:
 | | como o sinal teria se saído · **Retroativa** | `/retroativa` |
 | 📋 Sinais | triagem do que o worker gravou · **Acompanhar** | `/acompanhar` |
 | | taxa de acerto medida · **Assertividade** | `/assertividade` |
+| | o que foi enviado e o que rendeu · **Ordens** | `/ordens` |
 
-Os grupos com duas telas mostram uma segunda linha de botões pra alternar
-entre elas. O Mini Índice deixou de ser uma tela à parte: **`WINFUT` é só
+Os grupos com mais de uma tela mostram uma segunda linha de botões pra
+alternar entre elas. O Mini Índice deixou de ser uma tela à parte: **`WINFUT` é só
 mais um ativo do seletor** e a ferramenta troca sozinha pros timeframes dele
 (ver abaixo).
 
@@ -135,6 +142,36 @@ conta até bater alvo ou stop — por isso a tabela sempre mostra "sinais" e
 
 Esta tela depende de `ACOES_API_URL`: é onde o histórico mora. Sem ela, ela
 explica isso em vez de mostrar número errado.
+
+### Sinais → Ordens
+
+O que o executor realmente mandou pra corretora, e o que rendeu. O resultado
+**não é calculado aqui**: vem do MetaTrader 5, líquido de corretagem, então
+já inclui deslize, fechamento parcial e fechamento na mão.
+
+Três blocos:
+
+- **Resumo** — enviadas, fechadas, taxa de acerto e resultado em reais.
+- **Desempenho por recorte** — por **regra** (perfil · leitura · timeframe),
+  por ativo, por motivo de saída, por direção e por conta. É aqui que se
+  responde *quais das minhas regras estão dando dinheiro*.
+- **Regras** — as regras de ordem automática, com o desempenho de cada uma
+  ao lado e um botão pra ligar e desligar.
+
+Três coisas que a tela faz questão de não confundir:
+
+- **Posição aberta não é resultado.** O que ainda está em curso aparece
+  separado, como "no papel" — somar isso ao realizado seria anunciar lucro
+  que ainda pode sumir.
+- **Conta demo não é dinheiro.** A conta aparece sempre, e se houver ordem em
+  conta real misturada com demo no mesmo recorte, a tela avisa antes de você
+  tirar conclusão.
+- **`MANUAL` em motivo de saída** quer dizer que alguém fechou a posição na
+  mão. Aquela regra não foi medida, foi pilotada.
+
+Ligar uma regra pede uma confirmação a mais que desligar. Não é capricho:
+desligar nunca é o erro perigoso, e ligar é o que faz o executor começar a
+mandar ordem de verdade naquele recorte.
 
 ### Mini Índice (WINFUT)
 

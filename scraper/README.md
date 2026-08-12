@@ -230,3 +230,53 @@ kubectl -n acoes get secret acoes-db -o jsonpath='{.data.ACOES_API_KEY}' | base6
 
 Confirme que o serviço sobrevive a um reboot da VM antes de considerar a
 Fase 2 concluída.
+
+## Escolhendo o terminal e a conta do MT5
+
+Por padrão o scraper anexa no terminal que estiver rodando, com a conta que
+estiver logada. Isso basta enquanto existe **uma** conta na máquina — e vira
+armadilha assim que existem duas (uma real e uma demo, por exemplo): nada
+decide qual delas alimenta o pipeline, e o dado de uma entra no banco com o
+mesmo nome de símbolo da outra.
+
+Quatro variáveis opcionais resolvem, e você só precisa das duas primeiras:
+
+| Variável | Para quê |
+|---|---|
+| `MT5_PATH` | qual `terminal64.exe` usar — o seletor principal |
+| `MT5_LOGIN` | conta esperada; a coleta **falha** se o terminal servir outra |
+| `MT5_SERVER` | servidor (ex.: `ClearInvestimentos-CLEAR`) |
+| `MT5_PASSWORD` | só com os dois acima: faz o terminal **trocar** de conta |
+
+`MT5_LOGIN` sozinho não loga nada — ele afirma. É a guarda barata: configure
+mesmo que você só tenha uma conta, porque o serviço passa a parar com
+mensagem clara em vez de coletar calado do lugar errado. Sem ele, o scraper
+avisa no log a cada subida que aceita qualquer conta.
+
+Ao subir, o serviço registra de onde o dado vem:
+
+```
+[INFO] Conta MT5: login=1000324286 servidor=ClearInvestimentos-CLEAR (Clear (XP
+       Investimentos CCTVM)) tipo=REAL moeda=BRL | terminal=C:\Program Files\...
+```
+
+### Duas contas ao mesmo tempo (real + demo)
+
+Instâncias abertas a partir da **mesma pasta** compartilham o diretório de
+dados (`%APPDATA%\MetaQuotes\Terminal\<hash>`, derivado do caminho de
+instalação) e brigam pela mesma configuração. Para separar de verdade, use
+duas instalações — ou copie a pasta do terminal e rode a cópia com
+`/portable`, que põe os dados ao lado do `.exe`:
+
+```
+nssm set AcoesScraper AppEnvironmentExtra ^
+  PROCESSOR_URL=https://acoes-processor.dondon.services ^
+  ACOES_API_KEY=<a chave> ^
+  MT5_PATH="C:\Program Files\Clear Investimentos MT5 Terminal\terminal64.exe" ^
+  MT5_LOGIN=1000324286
+nssm restart AcoesScraper
+```
+
+Para apontar um processo na demo, troque as duas últimas pelo `.exe` da
+segunda instalação e pelo login da conta demo. Repare que `AppEnvironmentExtra`
+**substitui** a lista inteira — repita as variáveis que já estavam lá.

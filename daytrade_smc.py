@@ -566,6 +566,108 @@ _API_TIMEOUT_SECONDS = 10
 
 _MT5_TIMEFRAME_MAP_NAMES = {"M2": "TIMEFRAME_M2", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4", "D1": "TIMEFRAME_D1", "W1": "TIMEFRAME_W1"}
 
+# Qual terminal e qual CONTA do MetaTrader 5 usar. Injetados pelo scraper a
+# partir do ambiente, no mesmo padrão de `ACOES_API_URL` logo acima — e não
+# lidos de `scraper/config.py`, porque o Makefile entrega este arquivo à VM
+# junto do scraper e um import de primeira parte aqui quebraria a entrega.
+#
+# Por que isto passou a existir: `mt5.initialize()` sem argumento nenhum
+# anexa no terminal que estiver rodando, com a conta que estiver logada. Com
+# mais de uma instância aberta (real e demo, por exemplo) qual delas a API
+# pega não está fixado em lugar nenhum, e o pipeline seguia em silêncio o que
+# viesse. Medido em 2026-08-11: duas instâncias do mesmo terminal no ar, e
+# nada no caminho registrava de qual conta o candle tinha vindo.
+#
+#   MT5_PATH     terminal64.exe a usar. É o seletor PRINCIPAL: duas contas ao
+#                mesmo tempo pedem duas INSTALAÇÕES (ou uma cópia rodando em
+#                /portable), porque instâncias da mesma pasta compartilham o
+#                mesmo diretório de dados.
+#   MT5_LOGIN    conta esperada. Sozinho, é só uma AFIRMAÇÃO: a conexão falha
+#                se o terminal estiver servindo outra conta, em vez de coletar
+#                dado errado calado.
+#   MT5_SERVER   servidor (ex.: ClearInvestimentos-CLEAR, ...-DEMO).
+#   MT5_PASSWORD só junto de login+server, e aí o terminal TROCA de conta —
+#                por isso não é o padrão: derrubaria a sessão de quem estiver
+#                olhando aquele terminal.
+MT5_PATH: str | None = None
+MT5_LOGIN: int | None = None
+MT5_PASSWORD: str | None = None
+MT5_SERVER: str | None = None
+
+
+def _mt5_kwargs() -> dict:
+    """Argumentos do `initialize()` a partir do que foi configurado.
+
+    Vazio reproduz exatamente o comportamento antigo (anexa no que houver),
+    então quem não configurar nada não muda de vida."""
+    kwargs: dict = {}
+    if MT5_PATH:
+        kwargs["path"] = MT5_PATH
+    # Login só entra no initialize com a tripla completa: `login` sem
+    # `password`/`server` faz o MT5 tentar autenticar com credencial vazia e
+    # devolver erro de conexão, o que confundiria com "terminal fechado".
+    if MT5_LOGIN and MT5_PASSWORD and MT5_SERVER:
+        kwargs.update(login=int(MT5_LOGIN), password=MT5_PASSWORD, server=MT5_SERVER)
+    return kwargs
+
+
+def _mt5_conectar(mt5):
+    """`initialize()` + confere que é a conta certa. Devolve o account_info.
+
+    A conferência é o ponto: sem ela, apontar pro terminal errado não dá erro
+    nenhum — dá candle de outra conta, gravado com o mesmo nome de símbolo,
+    indistinguível do certo depois de armazenado."""
+    if not mt5.initialize(**_mt5_kwargs()):
+        raise RuntimeError(
+            f"Não foi possível conectar ao terminal MetaTrader 5 ({mt5.last_error()}). "
+            "Confirme que o MT5 está aberto e logado nesta máquina"
+            + (f", e que o caminho MT5_PATH está certo ({MT5_PATH})." if MT5_PATH else ".")
+        )
+
+    conta = mt5.account_info()
+    if conta is None:
+        mt5.shutdown()
+        raise RuntimeError(
+            f"Terminal MT5 respondeu mas não há conta logada ({mt5.last_error()})."
+        )
+
+    if MT5_LOGIN and int(conta.login) != int(MT5_LOGIN):
+        encontrada, servidor = conta.login, conta.server
+        mt5.shutdown()
+        raise RuntimeError(
+            f"Conta MT5 errada: esperava {MT5_LOGIN}, o terminal está servindo "
+            f"{encontrada} ({servidor}). Recusando coletar — dado de outra conta "
+            "entraria no banco com o mesmo nome de símbolo e ficaria "
+            "indistinguível do certo."
+        )
+    return conta
+
+
+def mt5_conta_ativa() -> dict:
+    """Descreve a conta que o terminal está servindo agora.
+
+    Existe pro scraper poder registrar isso no log ao subir: até 2026-08-11
+    nada no pipeline dizia de qual conta o dado tinha vindo, e a resposta só
+    era obtida abrindo o terminal na VM."""
+    import MetaTrader5 as mt5  # import tardio — DLL de Windows, ver _fetch_ohlcv_mt5
+
+    conta = _mt5_conectar(mt5)
+    try:
+        terminal = mt5.terminal_info()
+        # 0=DEMO, 1=CONCURSO, 2=REAL, na enum ENUM_ACCOUNT_TRADE_MODE
+        tipos = {0: "DEMO", 1: "CONCURSO", 2: "REAL"}
+        return {
+            "login": conta.login,
+            "servidor": conta.server,
+            "corretora": conta.company,
+            "tipo": tipos.get(conta.trade_mode, str(conta.trade_mode)),
+            "moeda": conta.currency,
+            "terminal": getattr(terminal, "name", ""),
+            "path": getattr(terminal, "path", ""),
+        }
+    finally:
+        mt5.shutdown()
+
 
 def fetch_ohlcv(symbol: str, timeframe: str, count: int, source: str = "Yahoo Finance") -> pd.DataFrame:
     """
@@ -656,12 +758,10 @@ def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
         raise ValueError(f"Timeframe {timeframe} não é suportado via MT5.")
     mt5_timeframe = getattr(mt5, _MT5_TIMEFRAME_MAP_NAMES[timeframe])
 
-    if not mt5.initialize():
-        error = mt5.last_error()
-        raise RuntimeError(
-            f"Não foi possível conectar ao terminal MetaTrader 5 ({error}). Confirme que o MT5 "
-            "está aberto e logado nesta máquina."
-        )
+    # Passa por `_mt5_conectar` em vez de `initialize()` cru: é ele que
+    # respeita MT5_PATH/MT5_LOGIN e recusa a coleta se o terminal estiver
+    # servindo outra conta.
+    _mt5_conectar(mt5)
 
     try:
         if not mt5.symbol_select(symbol, True):
@@ -3068,6 +3168,87 @@ def fetch_signal_stats(**filtros) -> dict:
     response = requests.get(
         f"{_api_base_url()}/signals/stats",
         params={k: v for k, v in filtros.items() if v is not None},
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_ordens(**filtros) -> dict:
+    """Ordens enviadas pelo executor. Filtros aceitos: symbol, status, perfil,
+    modalidade, timeframe, tipo_conta, aberta, dias, limite.
+
+    Cada ordem já vem com a REGRA que a produziu (perfil/modalidade/
+    timeframe, do sinal) e com o desfecho lido do MetaTrader 5.
+
+    ⚠️ `resultado_reais` só é dinheiro quando vem com `fechado_em`; enquanto
+    a posição está aberta, ele é o não realizado do momento."""
+    import requests  # import tardio — mesma convenção do resto do arquivo
+
+    response = requests.get(
+        f"{_api_base_url()}/ordens",
+        params={k: v for k, v in filtros.items() if v is not None},
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_ordem_stats(**filtros) -> dict:
+    """Desempenho financeiro das ordens. Filtros: symbol, perfil, modalidade,
+    timeframe, tipo_conta, dias.
+
+    Não confundir com `fetch_signal_stats`: aquela mede o MOTOR sobre velas,
+    com entrada modelada; esta mede o que a corretora pagou. A diferença
+    entre as duas é o custo de executar."""
+    import requests
+
+    response = requests.get(
+        f"{_api_base_url()}/ordens/stats",
+        params={k: v for k, v in filtros.items() if v is not None},
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_auto_ordem(incluir_inativas: bool = False) -> dict:
+    """Regras de ordem automática. Devolve {"regras": [...]}.
+
+    Por padrão só as LIGADAS — que são as que mandam ordem, e é o que o
+    executor consome. Uma tela que deixe religar uma regra precisa passar
+    `incluir_inativas=True`, senão a regra some da lista no instante em que
+    é desligada e não há de onde clicar pra ligar de volta."""
+    import requests
+
+    response = requests.get(
+        f"{_api_base_url()}/auto-ordem",
+        params={"incluir_inativas": "true"} if incluir_inativas else None,
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def save_auto_ordem(perfil: str, modalidade: str, timeframe: str,
+                    risco_maximo: float, ativo: bool = True) -> dict:
+    """Cria, atualiza ou DESLIGA (`ativo=False`) uma regra de ordem
+    automática.
+
+    Ligar uma regra é o ato que faz o executor passar a mandar ordem naquele
+    recorte — quem chama daqui é responsável por isso ser deliberado.
+    `risco_maximo` é em REAIS: a quantidade sai da distância até o stop do
+    sinal, na hora do envio."""
+    import requests
+
+    response = requests.put(
+        f"{_api_base_url()}/auto-ordem",
+        json={"perfil": perfil, "modalidade": modalidade,
+              "timeframe": timeframe, "risco_maximo": risco_maximo, "ativo": ativo},
         headers=_api_headers(),
         timeout=_API_TIMEOUT_SECONDS,
     )

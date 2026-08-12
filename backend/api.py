@@ -28,6 +28,15 @@ para outros consumidores.
   - GET    /signals                          histórico com filtros
   - GET    /signals/stats                    assertividade por recorte
 
+  - GET    /auto-ordem                       regras de ordem automática (tool)
+  - PUT    /auto-ordem                       cria ou atualiza uma regra (tool)
+  - GET    /ordens                           ordens enviadas, com a regra que as
+                                            produziu e o desfecho (tool)
+  - GET    /ordens/stats                     desempenho financeiro por recorte (tool)
+  - POST   /ordens                           reserva antes do envio
+  - PUT    /ordens/{signal_id}               registra a resposta da corretora
+  - PUT    /ordens/{signal_id}/fechamento    registra o desfecho lido do MT5
+
 Com este serviço no lugar, nenhum cliente fora do backend precisa de
 credencial de banco — o Streamlit deixou de falar SQL.
 
@@ -62,11 +71,22 @@ from models import (
     AutoAcompanhamentoIn,
     AutoAcompanhamentoOut,
     AutoAcompanhamentoResponse,
+    AutoOrdemIn,
+    AutoOrdemOut,
+    AutoOrdemResponse,
     CandleOut,
     CandlesResponse,
     FeedbackIn,
     FeedbackOut,
     FeedbackResponse,
+    OrdemFechamento,
+    OrdemIn,
+    OrdemOut,
+    OrdemReserva,
+    OrdemResultado,
+    OrdemStatsResponse,
+    OrdemStatsRow,
+    OrdensResponse,
     ProfileAtivoIn,
     ProfileOut,
     ProfileIn,
@@ -1196,3 +1216,477 @@ def webhook_acoes(body: WebhookPayload, conn: Connection = Depends(get_conn)) ->
         row = cur.fetchone()
     return FeedbackOut(id=row[0], signal_id=row[1], acao=row[2], origem=row[3],
                        nota=row[4], criado_em=row[5])
+
+
+# ========================================================================
+# Ordens
+#
+# ⚠️ As rotas de ESCRITA daqui (`POST /ordens`, `PUT /ordens/{id}`) são
+# `include_in_schema=False`, e isso NÃO é o mesmo motivo dos outros casos do
+# arquivo. Nas outras rotas ocultas o argumento é "um modelo escrevendo isso
+# corromperia a medição". Aqui é mais duro: uma tool de mandar ordem põe
+# dinheiro ao alcance de um texto gerado. Quem manda ordem é o `executor/`
+# rodando na VM, com as travas de `execucao.py` — nunca o agentgateway.
+#
+# As regras (`/auto-ordem`) e a leitura (`GET /ordens`) SÃO tools: decidir
+# que perfil opera e conferir o que foi enviado é exatamente o tipo de
+# pergunta que se quer poder fazer em linguagem natural. A diferença é que
+# nenhuma delas dispara ordem por si.
+# ========================================================================
+
+
+@app.get(
+    "/auto-ordem",
+    response_model=AutoOrdemResponse,
+    dependencies=[Depends(require_api_key)],
+    operation_id="listar_auto_ordem",
+    summary="Regras de ordem automática ativas",
+    description=(
+        "Lista as regras de ordem automática: cada uma diz 'para este perfil, "
+        "modalidade e timeframe, envie ordem, arriscando no máximo R$ X'. "
+        "`risco_maximo` é em REAIS — a quantidade é calculada na hora, a partir "
+        "da distância entre entrada e stop do sinal, então toda operação arrisca "
+        "o mesmo valor. Quem executa é o serviço na VM Windows (o MetaTrader 5 é "
+        "DLL de Windows e não roda no cluster); esta rota só descreve as regras.\n\n"
+        "Por padrão traz só as LIGADAS — que são as que mandam ordem. Use "
+        "`incluir_inativas=true` para ver também as desligadas, por exemplo pra "
+        "responder 'o que eu já tentei e desliguei?'."
+    ),
+)
+def list_auto_ordem(
+    incluir_inativas: bool = Query(
+        False,
+        description="Inclui as regras desligadas (ativo=false) além das ligadas.",
+    ),
+    conn: Connection = Depends(get_conn),
+) -> AutoOrdemResponse:
+    # O default é FALSE e tem que continuar sendo: o executor consome esta
+    # mesma rota e percorre a lista inteira sem olhar `ativo`. Inverter o
+    # default aqui faria ele voltar a mandar ordem por regra desligada — o
+    # tipo de mudança que parece cosmética e volta a operar sozinha.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT perfil, modalidade, timeframe, risco_maximo, ativo, criado_em "
+            "FROM auto_ordem WHERE (ativo OR %s) ORDER BY ativo DESC, criado_em DESC",
+            (incluir_inativas,),
+        )
+        rows = cur.fetchall()
+    return AutoOrdemResponse(regras=[
+        AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2],
+                     risco_maximo=float(r[3]), ativo=r[4], criado_em=r[5])
+        for r in rows
+    ])
+
+
+@app.put(
+    "/auto-ordem",
+    response_model=AutoOrdemOut,
+    dependencies=[Depends(require_api_key)],
+    operation_id="configurar_auto_ordem",
+    summary="Cria ou atualiza uma regra de ordem automática",
+    description=(
+        "Cria ou atualiza a regra de (perfil, modalidade, timeframe). Use "
+        "`ativo=false` para desligar sem apagar o histórico.\n\n"
+        "Antes de ligar uma regra, confira com `assertividade_sinais` se aquele "
+        "recorte tem amostra suficiente — `resolvidos` baixo (menos de ~10) não "
+        "sustenta decisão de operar. E lembre que `timeframe` é obrigatório de "
+        "propósito: sem ele a mesma leitura em M15, H1, H4 e D1 abriria quatro "
+        "posições no mesmo ativo."
+    ),
+)
+def configurar_auto_ordem(
+    body: AutoOrdemIn, conn: Connection = Depends(get_conn)
+) -> AutoOrdemOut:
+    if body.risco_maximo <= 0:
+        raise HTTPException(status_code=400, detail="risco_maximo tem que ser maior que zero.")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO auto_ordem (perfil, modalidade, timeframe, risco_maximo, ativo)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (perfil, modalidade, timeframe) DO UPDATE
+               SET risco_maximo = EXCLUDED.risco_maximo, ativo = EXCLUDED.ativo
+            RETURNING perfil, modalidade, timeframe, risco_maximo, ativo, criado_em
+            """,
+            (body.perfil, body.modalidade, body.timeframe.upper(),
+             body.risco_maximo, body.ativo),
+        )
+        r = cur.fetchone()
+    conn.commit()
+    return AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2],
+                        risco_maximo=float(r[3]), ativo=r[4], criado_em=r[5])
+
+
+_ORDEM_CAMPOS_ORDEM = (
+    "id", "signal_id", "symbol", "direcao", "volume", "risco_maximo", "preco_pedido",
+    "preco_executado", "stop", "alvo", "conta", "servidor", "tipo_conta", "ticket",
+    "status", "retcode", "mensagem", "criado_em", "enviado_em",
+    "fechado_em", "preco_saida", "volume_saida", "resultado_reais", "motivo_saida",
+    "conciliado_em",
+)
+# Vêm do SINAL, por join. É o que diz QUAL REGRA produziu a ordem: as regras
+# de `auto_ordem` têm chave (perfil, modalidade, timeframe), e nenhum desses
+# três está na tabela `ordens`. Sem eles, "qual das minhas regras está dando
+# dinheiro?" não tem resposta possível do lado do cliente.
+_ORDEM_CAMPOS_SINAL = ("perfil", "modalidade", "timeframe", "candle_time", "score",
+                       "resultado", "r_realizado")
+_ORDEM_CAMPOS = _ORDEM_CAMPOS_ORDEM + _ORDEM_CAMPOS_SINAL
+
+# Nomes em vez de índices: com 32 colunas, um `r[26]` a mais ou a menos passa
+# em revisão e troca dois campos de lugar em silêncio.
+_ORDEM_COLUNAS = ", ".join(
+    [f"o.{c}" for c in _ORDEM_CAMPOS_ORDEM] + [f"s.{c}" for c in _ORDEM_CAMPOS_SINAL]
+)
+_ORDEM_FROM = "FROM ordens o LEFT JOIN signals s ON s.id = o.signal_id"
+
+# NUMERIC chega como Decimal, que o Pydantic aceita mas o JSON serializa como
+# string em alguns caminhos.
+_ORDEM_DECIMAIS = ("volume", "risco_maximo", "volume_saida", "resultado_reais")
+
+
+def _ordem_from_row(r: tuple) -> OrdemOut:
+    d = dict(zip(_ORDEM_CAMPOS, r, strict=True))
+    for campo in _ORDEM_DECIMAIS:
+        if d[campo] is not None:
+            d[campo] = float(d[campo])
+
+    # Risco EFETIVO: o dinheiro que ficou de fato exposto, depois de a
+    # quantidade ser arredondada ao lote do papel. Diverge do `risco_maximo`
+    # que a regra pediu, e é essa diferença que se quer enxergar.
+    volume, preco, stop = d["volume"], d["preco_executado"], d["stop"]
+    if volume and preco is not None and stop is not None and abs(preco - stop) > 0:
+        d["risco_efetivo"] = volume * abs(preco - stop)
+        if d["resultado_reais"] is not None:
+            d["resultado_r"] = d["resultado_reais"] / d["risco_efetivo"]
+    return OrdemOut(**d)
+
+
+def _uma_ordem(cur, signal_id: int) -> tuple | None:
+    """Relê a linha já com o join. As rotas de escrita usam RETURNING, que não
+    enxerga o join — reler é o que mantém uma forma só de ordem na API."""
+    cur.execute(f"SELECT {_ORDEM_COLUNAS} {_ORDEM_FROM} WHERE o.signal_id = %s", (signal_id,))
+    return cur.fetchone()
+
+
+@app.post("/ordens", response_model=OrdemReserva,
+          dependencies=[Depends(require_api_key)], include_in_schema=False)
+def reservar_ordem(body: OrdemIn, conn: Connection = Depends(get_conn)) -> OrdemReserva:
+    """RESERVA o sinal antes de a ordem sair. Ver o comentário do bloco acima.
+
+    `duplicado=True` significa "esse sinal já tem ordem" — para o executor é
+    ordem de PARAR, não erro. É o que impede posição dobrada depois de um
+    reinício no meio do envio."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO ordens (signal_id, symbol, direcao, risco_maximo, stop, alvo, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'ENVIANDO')
+            ON CONFLICT (signal_id) DO NOTHING
+            RETURNING signal_id
+            """,
+            (body.signal_id, body.symbol.upper(), body.direcao,
+             body.risco_maximo, body.stop, body.alvo),
+        )
+        duplicado = cur.fetchone() is None
+        row = _uma_ordem(cur, body.signal_id)
+    conn.commit()
+    return OrdemReserva(ordem=_ordem_from_row(row), duplicado=duplicado)
+
+
+@app.put("/ordens/{signal_id}", response_model=OrdemOut,
+         dependencies=[Depends(require_api_key)], include_in_schema=False)
+def registrar_resultado_ordem(
+    signal_id: int, body: OrdemResultado, conn: Connection = Depends(get_conn)
+) -> OrdemOut:
+    """Fecha a reserva com o que a corretora respondeu."""
+    if body.status not in ("ENVIADA", "FALHOU", "RECUSADA"):
+        raise HTTPException(
+            status_code=400,
+            detail="status tem que ser ENVIADA, FALHOU ou RECUSADA.",
+        )
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE ordens SET status = %s, volume = %s, preco_pedido = %s,
+                   preco_executado = %s, conta = %s, servidor = %s, tipo_conta = %s,
+                   ticket = %s, retcode = %s, mensagem = %s, enviado_em = now()
+             WHERE signal_id = %s
+            RETURNING signal_id
+            """,
+            (body.status, body.volume, body.preco_pedido, body.preco_executado,
+             body.conta, body.servidor, body.tipo_conta, body.ticket,
+             body.retcode, body.mensagem, signal_id),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(
+                status_code=404, detail=f"Sem ordem reservada para o sinal {signal_id}.")
+        row = _uma_ordem(cur, signal_id)
+    conn.commit()
+    return _ordem_from_row(row)
+
+
+@app.put("/ordens/{signal_id}/fechamento", response_model=OrdemOut,
+         dependencies=[Depends(require_api_key)], include_in_schema=False)
+def registrar_fechamento_ordem(
+    signal_id: int, body: OrdemFechamento, conn: Connection = Depends(get_conn)
+) -> OrdemOut:
+    """Grava o desfecho lido do MetaTrader 5 pela reconciliação do executor.
+
+    Oculta do schema pela mesma razão das outras escritas de ordem, esticada
+    um passo: quem escreve o resultado financeiro pode fabricar a medição. O
+    agente lê o desempenho; quem o produz é a corretora, por intermédio do
+    executor.
+
+    Chamada REPETIDAMENTE enquanto a posição está aberta, com `fechado_em`
+    nulo e o resultado não realizado do momento — é isso que faz a tela
+    mostrar "3 abertas, +R$ 48 no papel". A gravação é idempotente por
+    construção: sobrescreve os mesmos campos."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE ordens SET resultado_reais = %s, fechado_em = %s, preco_saida = %s,
+                   volume_saida = %s, motivo_saida = %s, conciliado_em = now()
+             WHERE signal_id = %s
+            RETURNING signal_id
+            """,
+            (body.resultado_reais, body.fechado_em, body.preco_saida,
+             body.volume_saida, body.motivo_saida, signal_id),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(
+                status_code=404, detail=f"Sem ordem reservada para o sinal {signal_id}.")
+        row = _uma_ordem(cur, signal_id)
+    conn.commit()
+    return _ordem_from_row(row)
+
+
+# `/ordens/stats` precisa ser declarada ANTES de qualquer `GET /ordens/{…}`
+# que venha a existir, senão o `{signal_id}` engole "stats". Hoje não há
+# conflito (só há PUT nesse caminho) — o cuidado é pro dia em que houver,
+# mesmo arranjo de `/signals/stats` com `/signals/feedback`.
+_ORDEM_STATS_BASE = """
+WITH base AS (
+    SELECT o.tipo_conta, o.symbol, o.direcao, o.motivo_saida, o.fechado_em,
+           o.resultado_reais, o.status,
+           coalesce(s.perfil, '?') || ' · ' || coalesce(s.modalidade, '?')
+               || ' · ' || coalesce(s.timeframe, '?')            AS regra,
+           -- Mesmo risco efetivo do `_ordem_from_row`: o exposto DE FATO,
+           -- depois do arredondamento ao lote. É o denominador que põe
+           -- ativos de preços diferentes na mesma escala.
+           CASE WHEN o.volume IS NOT NULL AND o.preco_executado IS NOT NULL
+                     AND o.stop IS NOT NULL AND abs(o.preco_executado - o.stop) > 0
+                THEN o.volume * abs(o.preco_executado - o.stop)
+           END                                                   AS risco_efetivo
+      FROM ordens o
+      LEFT JOIN signals s ON s.id = o.signal_id
+     WHERE o.criado_em > now() - make_interval(days => %(dias)s)
+       AND (%(symbol)s::text     IS NULL OR o.symbol     = %(symbol)s)
+       AND (%(tipo_conta)s::text IS NULL OR o.tipo_conta = %(tipo_conta)s)
+       AND (%(perfil)s::text     IS NULL OR s.perfil     = %(perfil)s)
+       AND (%(modalidade)s::text IS NULL OR s.modalidade = %(modalidade)s)
+       AND (%(timeframe)s::text  IS NULL OR s.timeframe  = %(timeframe)s)
+),
+-- Só ENVIADA entra nas taxas: RECUSADA e FALHOU não chegaram ao mercado e
+-- não têm desempenho nenhum pra medir. Elas voltam contadas à parte.
+enviadas AS (
+    SELECT *,
+           (fechado_em IS NOT NULL)                      AS fechada,
+           -- NULL pras abertas E pras zeradas: `avg()` pula NULL, então o
+           -- denominador da taxa vira ganhos+perdas. Uma posição que ainda
+           -- pode virar prejuízo não pode contar como acerto.
+           CASE WHEN fechado_em IS NOT NULL AND resultado_reais > 0 THEN 1
+                WHEN fechado_em IS NOT NULL AND resultado_reais < 0 THEN 0
+           END                                           AS acerto,
+           CASE WHEN fechado_em IS NOT NULL AND risco_efetivo > 0
+                THEN resultado_reais / risco_efetivo
+           END                                           AS r
+      FROM base WHERE status = 'ENVIADA'
+)
+"""
+
+_ORDEM_STATS_SELECT = """
+SELECT {recorte}                                                     AS recorte,
+       count(*)                                                      AS n,
+       count(*) FILTER (WHERE fechada)                               AS fechadas,
+       count(*) FILTER (WHERE NOT fechada)                           AS abertas,
+       count(*) FILTER (WHERE fechada AND resultado_reais > 0)       AS ganhos,
+       count(*) FILTER (WHERE fechada AND resultado_reais < 0)       AS perdas,
+       count(*) FILTER (WHERE fechada AND resultado_reais = 0)       AS zeradas,
+       avg(acerto)::float                                            AS taxa_acerto,
+       coalesce(sum(resultado_reais) FILTER (WHERE fechada), 0)::float
+                                                                     AS resultado_reais,
+       avg(r)::float                                                 AS resultado_r_medio,
+       coalesce(sum(resultado_reais) FILTER (WHERE NOT fechada), 0)::float
+                                                                     AS aberto_reais
+FROM enviadas GROUP BY 1 ORDER BY 1
+"""
+
+
+def _ordem_stats_rows(cur, recorte: str, filtros: dict) -> list[OrdemStatsRow]:
+    cur.execute(_ORDEM_STATS_BASE + _ORDEM_STATS_SELECT.format(recorte=recorte), filtros)
+    return [
+        OrdemStatsRow(
+            recorte=str(row[0]), n=row[1], fechadas=row[2], abertas=row[3],
+            ganhos=row[4], perdas=row[5], zeradas=row[6], taxa_acerto=row[7],
+            resultado_reais=row[8], resultado_r_medio=row[9], aberto_reais=row[10],
+        )
+        for row in cur.fetchall()
+    ]
+
+
+@app.get(
+    "/ordens/stats",
+    response_model=OrdemStatsResponse,
+    dependencies=[Depends(require_api_key)],
+    operation_id="desempenho_ordens",
+    summary="Desempenho financeiro das ordens enviadas",
+    description=(
+        "Quanto as ordens realmente renderam, quebrado por regra (perfil · "
+        "modalidade · timeframe), ativo, motivo de saída, direção e conta. É a "
+        "tool pra 'quais das minhas regras de ordem automática estão dando "
+        "dinheiro?'.\n\n"
+        "O resultado NÃO é modelado: vem do MetaTrader 5, líquido de corretagem "
+        "e swap, então já inclui slippage, fechamento parcial e fechamento "
+        "manual. Não confunda com `assertividade_sinais`, que mede o MOTOR sobre "
+        "candles, com entrada modelada — as duas divergem, e a diferença entre "
+        "elas é justamente o custo de executar.\n\n"
+        "Como ler sem mentir:\n"
+        "- **Nunca some DEMO com REAL, e sempre cite `tipo_conta`**: resultado em "
+        "conta demo não é dinheiro. Use `por_conta` quando houver as duas.\n"
+        "- `taxa_acerto` tem como denominador `ganhos + perdas`, nunca `n`: as "
+        "abertas ainda podem virar prejuízo. Cite os dois: '4 de 7 fechadas'.\n"
+        "- `resultado_reais` soma só as FECHADAS. O não realizado das abertas vem "
+        "à parte em `aberto_reais`, e somar os dois é anunciar lucro que ainda "
+        "pode sumir.\n"
+        "- Com menos de ~10 fechadas o percentual não significa nada; diga que a "
+        "amostra é insuficiente em vez de citar o número.\n"
+        "- `motivo_saida='MANUAL'` é posição fechada à mão: aquela regra não foi "
+        "medida, foi pilotada, e não sustenta conclusão sobre a regra.\n"
+        "- `recusadas` e `falhadas` ficam fora das taxas (nada delas chegou ao "
+        "mercado), mas um número alto ali é problema de configuração, não de "
+        "estratégia — vale mencionar."
+    ),
+)
+def get_ordem_stats(
+    symbol: str | None = Query(None),
+    perfil: str | None = Query(None),
+    modalidade: str | None = Query(None),
+    timeframe: str | None = Query(None),
+    tipo_conta: str | None = Query(None, description="DEMO ou REAL."),
+    dias: int = Query(90, ge=1, le=3650),
+    conn: Connection = Depends(get_conn),
+) -> OrdemStatsResponse:
+    filtros = {
+        "symbol": symbol.strip().upper() if symbol else None,
+        "perfil": perfil,
+        "modalidade": modalidade,
+        "timeframe": timeframe.strip().upper() if timeframe else None,
+        "tipo_conta": tipo_conta.strip().upper() if tipo_conta else None,
+        "dias": dias,
+    }
+    with conn.cursor() as cur:
+        geral = _ordem_stats_rows(cur, "'geral'", filtros)
+        por_conta = _ordem_stats_rows(cur, "coalesce(tipo_conta, '?')", filtros)
+        por_regra = _ordem_stats_rows(cur, "regra", filtros)
+        por_symbol = _ordem_stats_rows(cur, "symbol", filtros)
+        # Rótulo em vez de NULL: "ainda aberta" é um grupo legítimo, e um
+        # rótulo nulo viraria linha em branco na tabela.
+        por_motivo = _ordem_stats_rows(cur, "coalesce(motivo_saida, 'EM ABERTO')", filtros)
+        por_direcao = _ordem_stats_rows(cur, "direcao", filtros)
+
+        cur.execute(
+            _ORDEM_STATS_BASE
+            + "SELECT count(*) FILTER (WHERE status = 'RECUSADA'), "
+              "count(*) FILTER (WHERE status = 'FALHOU') FROM base",
+            filtros,
+        )
+        recusadas, falhadas = cur.fetchone()
+
+    return OrdemStatsResponse(
+        filtros=filtros, total=sum(linha.n for linha in geral),
+        recusadas=recusadas, falhadas=falhadas,
+        geral=geral, por_conta=por_conta, por_regra=por_regra,
+        por_symbol=por_symbol, por_motivo_saida=por_motivo, por_direcao=por_direcao,
+    )
+
+
+@app.get(
+    "/ordens",
+    response_model=OrdensResponse,
+    dependencies=[Depends(require_api_key)],
+    operation_id="listar_ordens",
+    summary="Ordens enviadas pelo executor",
+    description=(
+        "O que foi efetivamente enviado à corretora, do mais recente pro mais "
+        "antigo, com o ticket, o preço executado e o desfecho da posição. "
+        "`status`: ENVIANDO (reservada, ainda sem resposta), ENVIADA, FALHOU (a "
+        "corretora recusou) ou RECUSADA (as travas locais barraram antes de "
+        "sair).\n\n"
+        "Cada ordem já vem com a REGRA que a produziu (`perfil`, `modalidade`, "
+        "`timeframe`) — é por ela que se compara uma regra com outra.\n\n"
+        "O desfecho vem do MetaTrader 5: `resultado_reais` é o lucro em reais "
+        "líquido de corretagem, `motivo_saida` diz se saiu no STOP, no ALVO ou "
+        "à mão (MANUAL), e `resultado_r` põe isso em múltiplos do risco. "
+        "⚠️ Enquanto `fechado_em` for nulo a posição está ABERTA e "
+        "`resultado_reais` é o não realizado do momento — não é dinheiro ainda. "
+        "Use `aberta=true` pra ver só as em curso.\n\n"
+        "Não confunda `resultado` (desfecho do SINAL, calculado sobre candles) "
+        "com `resultado_reais` (o que a corretora pagou): a diferença entre os "
+        "dois é o custo de executar.\n\n"
+        "`tipo_conta` diz se foi DEMO ou REAL — cite sempre, porque um resultado "
+        "em conta demo não é dinheiro."
+    ),
+)
+def listar_ordens(
+    symbol: str | None = Query(None),
+    status: str | None = Query(None),
+    perfil: str | None = Query(None),
+    modalidade: str | None = Query(None),
+    timeframe: str | None = Query(None),
+    tipo_conta: str | None = Query(None, description="DEMO ou REAL."),
+    aberta: bool | None = Query(
+        None,
+        description=(
+            "true = posições em curso (enviadas e ainda sem fechamento); "
+            "false = só as já fechadas. Omitido, traz as duas."
+        ),
+    ),
+    dias: int = Query(30, ge=1, le=3650),
+    limite: int = Query(200, ge=1, le=2000),
+    conn: Connection = Depends(get_conn),
+) -> OrdensResponse:
+    filtros = {
+        "symbol": symbol.strip().upper() if symbol else None,
+        "status": status.strip().upper() if status else None,
+        "perfil": perfil,
+        "modalidade": modalidade,
+        "timeframe": timeframe.strip().upper() if timeframe else None,
+        "tipo_conta": tipo_conta.strip().upper() if tipo_conta else None,
+        "aberta": aberta,
+        "dias": dias, "limite": limite,
+    }
+    where = """
+        WHERE o.criado_em > now() - make_interval(days => %(dias)s)
+          AND (%(symbol)s::text     IS NULL OR o.symbol     = %(symbol)s)
+          AND (%(status)s::text     IS NULL OR o.status     = %(status)s)
+          AND (%(tipo_conta)s::text IS NULL OR o.tipo_conta = %(tipo_conta)s)
+          AND (%(perfil)s::text     IS NULL OR s.perfil     = %(perfil)s)
+          AND (%(modalidade)s::text IS NULL OR s.modalidade = %(modalidade)s)
+          AND (%(timeframe)s::text  IS NULL OR s.timeframe  = %(timeframe)s)
+          -- "aberta" é ENVIADA e ainda sem fechamento. Cobra o status de
+          -- propósito: uma RECUSADA também tem `fechado_em` nulo, e nunca
+          -- esteve aberta coisa nenhuma.
+          AND (%(aberta)s::bool IS NULL
+               OR (%(aberta)s::bool AND o.status = 'ENVIADA' AND o.fechado_em IS NULL)
+               OR (NOT %(aberta)s::bool AND o.fechado_em IS NOT NULL))
+    """
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) {_ORDEM_FROM} {where}", filtros)
+        total = cur.fetchone()[0]
+        cur.execute(
+            f"SELECT {_ORDEM_COLUNAS} {_ORDEM_FROM} {where} "
+            "ORDER BY o.criado_em DESC LIMIT %(limite)s",
+            filtros,
+        )
+        rows = cur.fetchall()
+    return OrdensResponse(ordens=[_ordem_from_row(r) for r in rows], total=total)

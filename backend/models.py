@@ -303,3 +303,187 @@ class AutoAcompanhamentoOut(BaseModel):
 
 class AutoAcompanhamentoResponse(BaseModel):
     regras: list[AutoAcompanhamentoOut]
+
+
+class AutoOrdemIn(BaseModel):
+    """Regra de ordem automática: perfil + modalidade + timeframe → ordem.
+
+    `timeframe` faz parte da chave, e não é rigor à toa: sem ele a regra
+    casaria com o mesmo sinal em M15, H1, H4 e D1 e abriria quatro posições
+    no mesmo ativo achando que abriu uma.
+
+    `risco_maximo` é em REAIS. A quantidade sai da distância até o stop do
+    próprio sinal, então toda operação arrisca o mesmo valor independente da
+    volatilidade do papel — que é o oposto do que uma quantidade fixa faz.
+    """
+    perfil: str
+    modalidade: str
+    timeframe: str
+    risco_maximo: float
+    ativo: bool = True
+
+
+class AutoOrdemOut(AutoOrdemIn):
+    criado_em: datetime
+
+
+class AutoOrdemResponse(BaseModel):
+    regras: list[AutoOrdemOut]
+
+
+class OrdemIn(BaseModel):
+    """Reserva de ordem: gravada ANTES de a ordem sair para a corretora.
+
+    O estado inicial é `ENVIANDO` de propósito. Gravar depois do envio
+    deixaria uma janela em que a ordem existe na corretora e não no banco, e
+    um reinício ali dentro mandaria a segunda ordem para o mesmo sinal. Com
+    a reserva antes, o pior caso é uma linha `ENVIANDO` órfã — visível — em
+    vez de posição dobrada, que só aparece no extrato."""
+    signal_id: int
+    symbol: str
+    direcao: str
+    risco_maximo: float | None = None
+    stop: float | None = None
+    alvo: float | None = None
+
+
+class OrdemResultado(BaseModel):
+    """O que a corretora respondeu, gravado depois do envio."""
+    status: str  # ENVIADA | FALHOU | RECUSADA
+    volume: float | None = None
+    preco_pedido: float | None = None
+    preco_executado: float | None = None
+    conta: int | None = None
+    servidor: str | None = None
+    tipo_conta: str | None = None
+    ticket: int | None = None
+    retcode: int | None = None
+    mensagem: str | None = None
+
+
+class OrdemFechamento(BaseModel):
+    """O desfecho da posição, lido do MetaTrader 5 pela reconciliação.
+
+    ⚠️ `resultado_reais` só é FINAL quando vem com `fechado_em`. Enquanto a
+    posição está aberta a reconciliação manda o não realizado, com
+    `fechado_em=None`, e a linha é reescrita a cada passada."""
+    resultado_reais: float | None = None
+    fechado_em: datetime | None = None
+    preco_saida: float | None = None
+    volume_saida: float | None = None
+    motivo_saida: str | None = None   # STOP | ALVO | MANUAL | EXPERT | MARGEM | OUTRO
+
+
+class OrdemOut(BaseModel):
+    """Uma ordem enviada, já com a regra que a produziu e o que ela rendeu.
+
+    Os campos de `perfil` a `r_realizado` vêm do SINAL (join), não da tabela
+    de ordens: sem eles não dá pra dizer qual das regras de `auto_ordem`
+    produziu esta ordem, e "qual regra está dando dinheiro?" fica sem
+    resposta do lado do cliente.
+
+    `resultado` (do sinal, calculado sobre candles com entrada modelada) e
+    `resultado_reais` (o que a corretora pagou) são coisas diferentes de
+    propósito: comparar os dois é o que mostra o quanto o motor promete a
+    mais do que a execução entrega."""
+
+    id: int
+    signal_id: int
+    symbol: str
+    direcao: str
+    volume: float | None = None
+    risco_maximo: float | None = None
+    preco_pedido: float | None = None
+    preco_executado: float | None = None
+    stop: float | None = None
+    alvo: float | None = None
+    conta: int | None = None
+    servidor: str | None = None
+    tipo_conta: str | None = None
+    ticket: int | None = None
+    status: str
+    retcode: int | None = None
+    mensagem: str | None = None
+    criado_em: datetime
+    enviado_em: datetime | None = None
+    # Desfecho na corretora
+    fechado_em: datetime | None = None
+    preco_saida: float | None = None
+    volume_saida: float | None = None
+    resultado_reais: float | None = None
+    motivo_saida: str | None = None
+    conciliado_em: datetime | None = None
+    # A regra que produziu esta ordem, e o que o motor previu
+    perfil: str | None = None
+    modalidade: str | None = None
+    timeframe: str | None = None
+    candle_time: datetime | None = None
+    score: float | None = None
+    resultado: str | None = None       # desfecho do SINAL, não da ordem
+    r_realizado: float | None = None   # idem, em múltiplos de R
+    # Derivados, calculados na resposta e não guardados:
+    # `risco_efetivo` é o dinheiro que ficou DE FATO em risco depois do
+    # arredondamento ao lote — ele diverge do `risco_maximo` configurado, e
+    # essa diferença é exatamente o que se quer enxergar. `resultado_r` põe
+    # ordens de ativos diferentes na mesma escala, e na mesma escala do
+    # `r_realizado` do sinal.
+    risco_efetivo: float | None = None
+    resultado_r: float | None = None
+
+
+class OrdemStatsRow(BaseModel):
+    """Uma linha de desempenho de ordens.
+
+    ATENÇÃO ao denominador, pelo mesmo motivo do `StatsRow`: `n` conta as
+    ordens ENVIADAS do recorte, mas `taxa_acerto` sai de `ganhos + perdas` e
+    `resultado_reais` soma só as FECHADAS. As abertas ainda podem virar
+    prejuízo — por isso o não realizado vive em `aberto_reais`, campo
+    separado, e a interface tem que exibir o denominador junto da taxa.
+
+    `fechadas = ganhos + perdas + zeradas`; as zeradas ficam fora da taxa
+    porque um resultado exatamente zero não é acerto nem erro. Na prática
+    são raras — a corretagem quase sempre desempata."""
+
+    recorte: str
+    n: int
+    fechadas: int
+    abertas: int
+    ganhos: int
+    perdas: int
+    zeradas: int
+    taxa_acerto: float | None = None
+    resultado_reais: float = 0.0
+    resultado_r_medio: float | None = None
+    aberto_reais: float = 0.0
+
+
+class OrdemStatsResponse(BaseModel):
+    """Desempenho das ordens, por recorte.
+
+    `recusadas` e `falhadas` ficam FORA das taxas — nada delas chegou ao
+    mercado, então não têm desempenho — mas vêm no topo porque "40 ordens, 12
+    barradas pelas travas locais" é fato operacional, não ruído: é a
+    diferença entre uma regra ruim e uma configuração errada."""
+
+    filtros: dict
+    total: int
+    recusadas: int
+    falhadas: int
+    geral: list[OrdemStatsRow]
+    por_conta: list[OrdemStatsRow]
+    por_regra: list[OrdemStatsRow]
+    por_symbol: list[OrdemStatsRow]
+    por_motivo_saida: list[OrdemStatsRow]
+    por_direcao: list[OrdemStatsRow]
+
+
+class OrdemReserva(BaseModel):
+    """`duplicado=True` diz "outro processo já reservou este sinal" — é o
+    sinal de PARE do executor, não um erro."""
+    ordem: OrdemOut
+    duplicado: bool
+
+
+class OrdensResponse(BaseModel):
+    ordens: list[OrdemOut]
+    total: int

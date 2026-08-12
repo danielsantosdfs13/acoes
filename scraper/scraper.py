@@ -48,10 +48,15 @@ from zoneinfo import ZoneInfo
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from daytrade_smc import DEFAULT_SYMBOLS, fetch_ohlcv  # noqa: E402
+import daytrade_smc  # noqa: E402
+from daytrade_smc import DEFAULT_SYMBOLS, fetch_ohlcv, mt5_conta_ativa  # noqa: E402
 
 from config import (  # noqa: E402
     ACOES_API_KEY,
+    MT5_LOGIN,
+    MT5_PASSWORD,
+    MT5_PATH,
+    MT5_SERVER,
     MERCADO_ABERTURA_HORA,
     MERCADO_FECHADO_SLEEP_SECONDS,
     MERCADO_FECHAMENTO_HORA,
@@ -158,11 +163,53 @@ def _post_candles(symbol: str, timeframe: str) -> None:
         log.warning("Falha ao enviar %s/%s pro processor: %s", symbol, timeframe, exc)
 
 
+def _anunciar_conta() -> None:
+    """Registra no log qual conta MT5 vai alimentar o pipeline, e para o
+    serviço se não for a esperada.
+
+    Vale a chamada extra na subida porque até 2026-08-11 esta pergunta não
+    tinha resposta em lugar nenhum: com duas instâncias do terminal abertas
+    (real e demo), `mt5.initialize()` pegava uma delas sem critério e nada
+    registrava qual. Falhar aqui é de propósito — o serviço não subir é
+    ruído que se vê; coletar da conta errada é dado que não se vê."""
+    try:
+        conta = mt5_conta_ativa()
+    except Exception as exc:  # noqa: BLE001
+        if MT5_LOGIN:
+            # Com conta declarada, divergência é erro de configuração e o
+            # serviço não deve subir fingindo que está tudo bem.
+            log.error("Conta MT5 não confere com o configurado: %s", exc)
+            raise
+        log.warning("Não consegui identificar a conta MT5 agora (%s) — seguindo.", exc)
+        return
+
+    log.info(
+        "Conta MT5: login=%s servidor=%s (%s) tipo=%s moeda=%s | terminal=%s",
+        conta["login"], conta["servidor"], conta["corretora"],
+        conta["tipo"], conta["moeda"], conta["path"] or conta["terminal"],
+    )
+    if not MT5_LOGIN:
+        log.warning(
+            "MT5_LOGIN não configurado: o scraper aceita QUALQUER conta que o "
+            "terminal estiver servindo. Com real e demo abertas ao mesmo tempo, "
+            "configure MT5_LOGIN (e MT5_PATH) pra fixar de onde vem o dado."
+        )
+
+
 def main() -> None:
     log.info(
         "Iniciando scraper MT5 — versao=%s, processor=%s, intervalo=%ss, timeframes=%s",
         _deployed_version(), PROCESSOR_URL, POLL_INTERVAL_SECONDS, SCRAPER_TIMEFRAMES,
     )
+    # A configuração de conexão vive em `config.py` e é injetada no motor por
+    # atribuição, no mesmo padrão de `ACOES_API_URL` — o motor não importa o
+    # config do scraper (o Makefile entrega os dois arquivos separados).
+    daytrade_smc.MT5_PATH = MT5_PATH
+    daytrade_smc.MT5_LOGIN = MT5_LOGIN
+    daytrade_smc.MT5_SERVER = MT5_SERVER
+    daytrade_smc.MT5_PASSWORD = MT5_PASSWORD
+    _anunciar_conta()
+
     watchlist = _refresh_watchlist(fallback=DEFAULT_SYMBOLS.copy())
     last_refresh = time.monotonic()
     estava_aberto: bool | None = None

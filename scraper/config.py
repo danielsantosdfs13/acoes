@@ -85,3 +85,39 @@ MERCADO_TIMEZONE = os.environ.get("MERCADO_TIMEZONE", "America/Sao_Paulo")
 MERCADO_ABERTURA_HORA = int(os.environ.get("MERCADO_ABERTURA_HORA", "9"))
 MERCADO_FECHAMENTO_HORA = int(os.environ.get("MERCADO_FECHAMENTO_HORA", "19"))
 MERCADO_FECHADO_SLEEP_SECONDS = float(os.environ.get("MERCADO_FECHADO_SLEEP_SECONDS", "300"))
+
+# --- Qual terminal / qual conta do MetaTrader 5 ---
+#
+# Só `MT5_PATH` e `MT5_LOGIN` bastam pro caso normal, e os dois são
+# OPCIONAIS: sem nada configurado o comportamento é o de antes (anexa no
+# terminal que estiver rodando). O que eles compram é determinismo.
+#
+# `mt5.initialize()` sem argumento pega o terminal que encontrar, com a conta
+# que estiver logada. Com duas instâncias abertas — o caso de quem mantém a
+# real e uma demo ao mesmo tempo — nada decide qual delas alimenta o
+# pipeline, e o dado de uma entra no banco com o mesmo nome de símbolo da
+# outra, indistinguível depois de gravado.
+#
+# Como separar de verdade REAL e DEMO na mesma máquina:
+#
+#   Instâncias lançadas da MESMA pasta compartilham o diretório de dados
+#   (%APPDATA%\MetaQuotes\Terminal\<hash>, derivado do caminho de
+#   instalação), então elas brigam pela mesma configuração. Para duas contas
+#   simultâneas e estáveis, use DUAS instalações — ou copie a pasta do
+#   terminal e rode a cópia com `/portable`, que põe os dados ao lado do
+#   .exe — e aponte `MT5_PATH` para o .exe de cada uma:
+#
+#     real  MT5_PATH=C:\Program Files\Clear Investimentos MT5 Terminal\terminal64.exe
+#     demo  MT5_PATH=C:\MT5-Clear-Demo\terminal64.exe
+#
+# `MT5_LOGIN` sozinho NÃO troca de conta: ele afirma qual conta se espera, e
+# a coleta falha alto se o terminal estiver servindo outra. É a guarda barata
+# — vale configurar mesmo sem `MT5_PATH`.
+#
+# `MT5_PASSWORD` + `MT5_SERVER` (junto de `MT5_LOGIN`) fazem o terminal
+# LOGAR naquela conta, derrubando a sessão que estiver aberta nele. Útil pra
+# um processo dedicado, ruim se você estiver olhando aquele terminal.
+MT5_PATH = os.environ.get("MT5_PATH") or None
+MT5_LOGIN = os.environ.get("MT5_LOGIN") or None
+MT5_SERVER = os.environ.get("MT5_SERVER") or None
+MT5_PASSWORD = os.environ.get("MT5_PASSWORD") or None

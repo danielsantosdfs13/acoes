@@ -62,6 +62,12 @@ VM_ADDR    ?= 192.168.122.50
 VM_HOST    := $(VM_USER)@$(VM_ADDR)
 VM_APP_DIR ?= C:/acoes
 VM_SERVICE ?= AcoesScraper
+# O executor é um SEGUNDO serviço na mesma VM, e a entrega tem que parar e
+# subir os DOIS. Até 2026-08-12 só o scraper era reiniciado: os arquivos novos
+# chegavam em C:\acoes\executor e o serviço seguia rodando o código velho em
+# memória, indefinidamente. Falha silenciosa da pior espécie — o deploy diz
+# que deu certo, o arquivo no disco é o novo, e o comportamento é o antigo.
+VM_SERVICE_EXECUTOR ?= AcoesExecutor
 
 # ConnectTimeout + BatchMode vêm do padrão de backup/scripts/backup-oracle-postgres.sh,
 # não do Makefile do fcar: lá o ssh roda pelado e trava esperando quando o
@@ -76,8 +82,17 @@ SCP_VM = scp -i $(VM_SSH_KEY) -o ConnectTimeout=10 -o BatchMode=yes
 # O layout de DOIS NÍVEIS é obrigatório: scraper.py faz
 # sys.path.insert(0, parent.parent) pra achar daytrade_smc. Copiar só a pasta
 # scraper/ quebra o import.
-SCRAPER_ROOT_FILES := daytrade_smc.py
+# `execucao.py` viaja junto porque envio de ordem é DLL de Windows, igual à
+# coleta: quem manda ordem tem que rodar aqui, não no k3s. Ele não é
+# importado por `scraper.py` — vai para a VM porque o executor (e qualquer
+# teste manual por SSH) precisa dele ao lado do motor.
+SCRAPER_ROOT_FILES := daytrade_smc.py execucao.py
 SCRAPER_SUB_FILES  := scraper/scraper.py scraper/config.py
+# O executor vai pro mesmo lugar pelo mesmo motivo do scraper: envio de ordem
+# é DLL de Windows. Ele é um SERVIÇO separado na VM (nssm), não um modo do
+# scraper — o scraper não pode parar de coletar porque o envio de ordem
+# quebrou, e vice-versa.
+EXECUTOR_FILES     := executor/executor.py
 SCRAPER_REQS       := requirements.txt requirements-local.txt scraper/requirements.txt
 
 # Tag = sha curto do HEAD, mais `-dirty.<timestamp>` se a árvore tiver mudança
@@ -244,17 +259,26 @@ scraper-files:
 	@echo ">> copiando $(SCRAPER_ROOT_FILES) $(SCRAPER_SUB_FILES) $(SCRAPER_REQS)"
 	@$(SCP_VM) $(SCRAPER_ROOT_FILES) requirements.txt requirements-local.txt $(VM_HOST):$(VM_APP_DIR)/
 	@$(SCP_VM) $(SCRAPER_SUB_FILES) scraper/requirements.txt $(VM_HOST):$(VM_APP_DIR)/scraper/
+	@$(SSH_VM) "if not exist $(subst /,\\,$(VM_APP_DIR))\\executor mkdir $(subst /,\\,$(VM_APP_DIR))\\executor"
+	@$(SCP_VM) $(EXECUTOR_FILES) $(VM_HOST):$(VM_APP_DIR)/executor/
 	@$(SSH_VM) "(echo VERSION=$(SCRAPER_VERSION)& echo REQS_HASH=$(SCRAPER_REQS_HASH)& echo DEPLOYED_AT=$$(date -Is)) > $(subst /,\\,$(VM_APP_DIR))\\DEPLOY-INFO"
 	@echo ">> arquivos em $(VM_HOST):$(VM_APP_DIR) (versao $(SCRAPER_VERSION))"
 
 scraper-push:
-	@echo ">> parando $(VM_SERVICE)"
+	@echo ">> parando $(VM_SERVICE) e $(VM_SERVICE_EXECUTOR)"
 	@$(SSH_VM) "nssm stop $(VM_SERVICE)" >/dev/null 2>&1 || true
+	@$(SSH_VM) "nssm stop $(VM_SERVICE_EXECUTOR)" >/dev/null 2>&1 || true
 	@$(MAKE) --no-print-directory scraper-files SCRAPER_VERSION='$(SCRAPER_VERSION)'
 	@echo ">> subindo $(VM_SERVICE)"
 	@$(SSH_VM) "nssm start $(VM_SERVICE)" >/dev/null 2>&1 || { \
 		echo "ERRO: nao consegui iniciar $(VM_SERVICE). Rode 'make scraper-status'."; \
 		exit 1; }
+	@# O executor pode nao estar registrado (VM nova, ou quem so coleta), entao
+	@# falhar aqui nao derruba a entrega do scraper - mas TEM que aparecer, ou
+	@# o codigo novo fica no disco sem nunca rodar.
+	@echo ">> subindo $(VM_SERVICE_EXECUTOR)"
+	@$(SSH_VM) "nssm start $(VM_SERVICE_EXECUTOR)" >/dev/null 2>&1 || \
+		echo "   AVISO: $(VM_SERVICE_EXECUTOR) nao subiu (nao registrado?). Confira com 'make scraper-status'."
 	@echo ">> scraper $(SCRAPER_VERSION) em $(VM_HOST):$(VM_APP_DIR)"
 
 # Lento (pip resolve tudo), por isso fica fora do release-scraper. Rode quando
@@ -266,8 +290,9 @@ scraper-deps:
 	@echo ">> dependencias em dia (hash $(SCRAPER_REQS_HASH))"
 
 scraper-status:
-	@echo "=== servico ==="
-	@$(SSH_VM) "nssm status $(VM_SERVICE)" 2>&1 || true
+	@echo "=== servicos ==="
+	@printf '  %-16s ' "$(VM_SERVICE)"; $(SSH_VM) "nssm status $(VM_SERVICE)" 2>&1 || true
+	@printf '  %-16s ' "$(VM_SERVICE_EXECUTOR)"; $(SSH_VM) "nssm status $(VM_SERVICE_EXECUTOR)" 2>&1 || true
 	@echo "=== versao implantada ==="
 	@$(SSH_VM) "type $(subst /,\\,$(VM_APP_DIR))\\DEPLOY-INFO" 2>&1 || echo "  (sem DEPLOY-INFO - nunca teve deploy)"
 	@echo "=== versao aqui ==="

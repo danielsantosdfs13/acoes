@@ -284,3 +284,111 @@ CREATE TABLE IF NOT EXISTS auto_acompanhamento (
     criado_em   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (perfil, modalidade)
 );
+
+-- ------------------------------------------------------------------
+-- Regras de ordem automática. Mesma forma de `auto_acompanhamento`:
+-- "para este perfil + modalidade + timeframe, mande ordem".
+--
+-- `timeframe` faz parte da chave, e não é detalhe: uma regra só por
+-- (perfil, modalidade) casaria com o MESMO sinal em M15, H1, H4 e D1, e
+-- abriria quatro posições no mesmo ativo achando que abriu uma.
+--
+-- `risco_maximo` em REAIS, não quantidade: a quantidade sai da distância
+-- até o stop DO SINAL, então toda operação arrisca o mesmo valor
+-- independente da volatilidade do papel. Guardar quantidade fixa faria o
+-- risco variar de 35 a 120 reais entre ativos sem ninguém escolher isso.
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS auto_ordem (
+    perfil        TEXT NOT NULL,
+    modalidade    TEXT NOT NULL,
+    timeframe     TEXT NOT NULL,
+    risco_maximo  NUMERIC NOT NULL,
+    ativo         BOOLEAN NOT NULL DEFAULT true,
+    criado_em     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (perfil, modalidade, timeframe),
+    CONSTRAINT auto_ordem_risco_chk CHECK (risco_maximo > 0)
+);
+
+-- ------------------------------------------------------------------
+-- Auditoria de ordens enviadas. É também o mecanismo de "não manda duas
+-- vezes": `signal_id` é ÚNICO, e o executor RESERVA a linha antes de
+-- mandar a ordem.
+--
+-- A ordem das operações é o ponto. Gravar depois de enviar deixaria a
+-- janela em que a ordem foi executada e a linha não existe — e um reinício
+-- ali dentro mandaria a segunda ordem para o mesmo sinal. Reservando
+-- antes, um `duplicado` já responde "alguém está cuidando disso", e o pior
+-- caso vira uma linha ENVIANDO órfã (visível) em vez de posição dobrada
+-- (invisível até o extrato).
+--
+-- Por isso `status` não tem DEFAULT 'ENVIADA': o estado inicial é a
+-- reserva, e a transição para ENVIADA/FALHOU é o segundo passo.
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS ordens (
+    id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    signal_id         BIGINT NOT NULL UNIQUE REFERENCES signals(id) ON DELETE CASCADE,
+    symbol            TEXT NOT NULL,
+    direcao           TEXT NOT NULL,
+    volume            NUMERIC,
+    risco_maximo      NUMERIC,
+    preco_pedido      DOUBLE PRECISION,
+    preco_executado   DOUBLE PRECISION,
+    stop              DOUBLE PRECISION,
+    alvo              DOUBLE PRECISION,
+    conta             BIGINT,
+    servidor          TEXT,
+    tipo_conta        TEXT,
+    ticket            BIGINT,
+    status            TEXT NOT NULL,
+    retcode           INTEGER,
+    mensagem          TEXT,
+    criado_em         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    enviado_em        TIMESTAMPTZ,
+    CONSTRAINT ordens_status_chk
+        CHECK (status IN ('ENVIANDO', 'ENVIADA', 'FALHOU', 'RECUSADA'))
+);
+
+CREATE INDEX IF NOT EXISTS ordens_criado_idx ON ordens(criado_em DESC);
+CREATE INDEX IF NOT EXISTS ordens_symbol_idx ON ordens(symbol, criado_em DESC);
+
+-- ------------------------------------------------------------------
+-- Desfecho da posição (2026-08-12). Preenchido pela reconciliação do
+-- `executor`, que lê o MetaTrader 5 — a ÚNICA fonte que é dinheiro.
+--
+-- Por que não derivar de `signals.resultado`: aquilo é o desfecho do
+-- SINAL, com entrada modelada em `preco_fill` (a abertura da vela
+-- seguinte). A ordem executou noutro preço, com quantidade arredondada ao
+-- lote, e pode ter sido fechada à mão, parcialmente, ou com slippage.
+-- Calcular "saiu exato no stop/alvo" inventaria os três casos.
+--
+-- `status` NÃO ganha valor novo, e isso é deliberado: `status` é o ciclo de
+-- vida do ENVIO (reservou / saiu / a corretora recusou / as travas
+-- barraram), enquanto aberta-fechada é ortogonal — uma ordem fechada
+-- continua tendo sido ENVIADA. Enfiar FECHADA no mesmo campo obrigaria
+-- toda consulta de auditoria de envio a listar dois valores para dizer "saiu
+-- da máquina".
+--
+-- ⚠️ `resultado_reais` MUDA DE SENTIDO com `fechado_em`: enquanto ele for
+-- NULL, é o resultado NÃO REALIZADO da posição aberta, reescrito a cada
+-- passada da reconciliação; depois, é o valor final, líquido de corretagem
+-- e swap. Um conceito só ("lucro da posição"), e `fechado_em` diz se
+-- acabou — mas quem AGREGA tem que separar os dois, ou soma dinheiro que
+-- ainda pode virar prejuízo. Ver `GET /ordens/stats`, que devolve
+-- `resultado_reais` e `aberto_reais` em campos distintos.
+-- ------------------------------------------------------------------
+ALTER TABLE ordens ADD COLUMN IF NOT EXISTS fechado_em      TIMESTAMPTZ;
+ALTER TABLE ordens ADD COLUMN IF NOT EXISTS preco_saida     DOUBLE PRECISION;
+ALTER TABLE ordens ADD COLUMN IF NOT EXISTS volume_saida    NUMERIC;
+ALTER TABLE ordens ADD COLUMN IF NOT EXISTS resultado_reais NUMERIC;
+-- STOP | ALVO | MANUAL | EXPERT | MARGEM | OUTRO — traduzido do
+-- `DEAL_REASON_*` do deal de saída. Distinguir MANUAL é o ponto: uma regra
+-- cujo resultado veio de fechamento à mão não está sendo medida, está sendo
+-- pilotada, e misturar as duas coisas corrompe a comparação entre regras.
+ALTER TABLE ordens ADD COLUMN IF NOT EXISTS motivo_saida    TEXT;
+ALTER TABLE ordens ADD COLUMN IF NOT EXISTS conciliado_em   TIMESTAMPTZ;
+
+-- Índice PARCIAL pelo mesmo motivo do `signals_pendentes_idx`: o alvo da
+-- reconciliação é "o que saiu e ainda não fechou", um conjunto que ENCOLHE
+-- sozinho — a linha sai do índice assim que o fechamento é gravado.
+CREATE INDEX IF NOT EXISTS ordens_abertas_idx ON ordens (id)
+    WHERE status = 'ENVIADA' AND fechado_em IS NULL;

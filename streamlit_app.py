@@ -925,6 +925,309 @@ def render_assertividade(perfis: list[str]) -> None:
                  hide_index=True, use_container_width=True)
 
 
+# ========================================================================
+# Ordens enviadas
+#
+# A tela que fecha o ciclo: o Acompanhamento mostra o que foi decidido, a
+# Assertividade mostra o que o MOTOR acertou, e esta mostra o que a
+# CORRETORA pagou. As duas últimas divergem de propósito — a assertividade
+# modela a entrada na abertura da vela seguinte, a ordem executou noutro
+# preço com quantidade arredondada ao lote. A diferença é o custo de
+# executar, e ela só fica visível com as duas telas lado a lado.
+# ========================================================================
+_ORDEM_RECORTES = {
+    "por_regra": "Regra",
+    "por_symbol": "Ativo",
+    "por_motivo_saida": "Motivo de saída",
+    "por_direcao": "Direção",
+    "por_conta": "Conta",
+}
+
+_STATUS_ORDEM = {
+    "ENVIANDO": "⏳ Enviando",
+    "ENVIADA": "✅ Enviada",
+    "FALHOU": "❌ Corretora recusou",
+    "RECUSADA": "🛑 Travas barraram",
+}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_ordens(**filtros) -> dict:
+    return daytrade_smc.fetch_ordens(**filtros)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_ordem_stats(**filtros) -> dict:
+    return daytrade_smc.fetch_ordem_stats(**filtros)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_auto_ordem() -> dict:
+    # Com as desligadas: sem elas, desligar uma regra a faria sumir da lista
+    # e não haveria de onde clicar pra ligar de volta.
+    return daytrade_smc.fetch_auto_ordem(incluir_inativas=True)
+
+
+def _tabela_desempenho(linhas: list[dict], rotulo: str) -> pd.DataFrame:
+    """Um recorte de desempenho virado tabela.
+
+    `Fechadas`, `Ganhos` e `Perdas` ficam SEMPRE visíveis, pelo mesmo motivo
+    de `_tabela_assertividade`: a taxa sai de ganhos+perdas, e esconder o
+    denominador transforma "2 de 3" em "66,7%"."""
+    return pd.DataFrame([{
+        rotulo: linha["recorte"],
+        "Enviadas": linha["n"],
+        "Fechadas": linha["fechadas"],
+        "Abertas": linha["abertas"],
+        "Ganhos": linha["ganhos"],
+        "Perdas": linha["perdas"],
+        "Taxa de acerto": None if linha["taxa_acerto"] is None
+                          else round(linha["taxa_acerto"] * 100, 1),
+        "Resultado (R$)": round(linha["resultado_reais"], 2),
+        "R médio": None if linha["resultado_r_medio"] is None
+                   else round(linha["resultado_r_medio"], 2),
+        "Em aberto (R$)": round(linha["aberto_reais"], 2),
+    } for linha in linhas])
+
+
+def _linha_ordem(o: dict) -> dict:
+    """Uma ordem virada linha de tabela. Construtor puro, no molde do
+    `_linha_feedback` — nenhum `st.*` aqui dentro."""
+    criado = pd.Timestamp(o["criado_em"]).tz_convert("America/Sao_Paulo")
+    regra = " · ".join(x for x in (o.get("perfil"), o.get("modalidade"),
+                                   o.get("timeframe")) if x)
+    return {
+        "Quando": criado.strftime("%d/%m %H:%M"),
+        "Ativo": o["symbol"],
+        "Direção": o["direcao"],
+        "Qtd": None if o.get("volume") is None else int(o["volume"]),
+        "Entrada": o.get("preco_executado"),
+        "Saída": o.get("preco_saida"),
+        "Motivo": o.get("motivo_saida") or ("em aberto" if o["status"] == "ENVIADA" else "—"),
+        "Resultado (R$)": None if o.get("resultado_reais") is None
+                          else round(o["resultado_reais"], 2),
+        "R": None if o.get("resultado_r") is None else round(o["resultado_r"], 2),
+        "Situação": _STATUS_ORDEM.get(o["status"], o["status"]),
+        "Conta": o.get("tipo_conta") or "—",
+        "Regra": regra or "—",
+    }
+
+
+def _alternar_regra(regra: dict, chave: str) -> None:
+    """Liga ou desliga uma regra de ordem automática.
+
+    Escrita pela API e cache invalidado na hora: sem isso a tela mostraria
+    o estado antigo por até 30 segundos, e o usuário clicaria de novo."""
+    ligar = bool(st.session_state.get(chave))
+    try:
+        daytrade_smc.save_auto_ordem(
+            regra["perfil"], regra["modalidade"], regra["timeframe"],
+            float(regra["risco_maximo"]), ativo=ligar,
+        )
+    except Exception as exc:
+        st.session_state[chave] = not ligar        # devolve o widget ao estado real
+        st.session_state["ordens_erro"] = f"Não foi possível alterar a regra: {exc}"
+        return
+    _cached_auto_ordem.clear()
+    st.session_state["ordens_erro"] = None
+
+
+def _render_regras(stats_por_regra: list[dict]) -> None:
+    """As regras de ordem automática, com o desempenho de cada uma ao lado.
+
+    Ligar e desligar são ASSIMÉTRICOS de propósito: desligar é um clique,
+    ligar pede confirmação. Desligar nunca é o erro perigoso; ligar é o ato
+    que faz o executor passar a mandar ordem de verdade naquele recorte, e
+    ele não pode estar a um clique de distância de quem estava só olhando
+    gráfico."""
+    st.markdown("### Regras de ordem automática")
+    try:
+        regras = _cached_auto_ordem().get("regras", [])
+    except Exception as exc:
+        st.error(
+            f"Não foi possível carregar as regras: {exc}\n\n"
+            "Isto **não** quer dizer que não há regra ativa — quer dizer que não "
+            "deu pra saber. O executor segue mandando ordem pelo que estiver "
+            "gravado."
+        )
+        return
+
+    if not regras:
+        st.info(
+            "Nenhuma regra cadastrada: o executor varre e dorme, sem mandar nada. "
+            "Uma regra diz *para este perfil, modalidade e timeframe, envie ordem "
+            "arriscando no máximo R$ X* — crie pelo agente ou pela API "
+            "(`PUT /auto-ordem`). Aqui dá pra ligar e desligar as que existem, não "
+            "criar novas."
+        )
+        return
+
+    ligadas = sum(1 for r in regras if r["ativo"])
+    st.caption(
+        f"{ligadas} de {len(regras)} ligada(s). Enquanto houver regra ligada e o "
+        "pregão estiver aberto, o executor manda ordem sozinho."
+    )
+
+    # Desempenho por regra, chaveado pelo mesmo rótulo que o backend monta.
+    por_regra = {l["recorte"]: l for l in stats_por_regra}
+
+    for regra in regras:
+        chave_regra = f"{regra['perfil']} · {regra['modalidade']} · {regra['timeframe']}"
+        with st.container(border=True):
+            esq, meio, dir_ = st.columns([3, 3, 2])
+            esq.markdown(f"**{regra['perfil']}**  \n{regra['modalidade']} · {regra['timeframe']}")
+
+            linha = por_regra.get(chave_regra)
+            if linha and linha["fechadas"]:
+                taxa = "—" if linha["taxa_acerto"] is None else f"{linha['taxa_acerto'] * 100:.0f}%"
+                meio.markdown(
+                    f"R$ {linha['resultado_reais']:+.2f} em {linha['fechadas']} fechada(s)  \n"
+                    f"acerto {taxa} · {linha['abertas']} aberta(s)"
+                )
+            elif linha:
+                meio.markdown(f"{linha['n']} enviada(s), nenhuma fechada ainda")
+            else:
+                meio.markdown("_sem ordem no período_")
+
+            chave = f"regra_ativa_{chave_regra}"
+            confirmada = st.session_state.get(f"confirma_{chave}", False)
+            st.session_state.setdefault(chave, bool(regra["ativo"]))
+            dir_.toggle(
+                f"Ativa · R$ {float(regra['risco_maximo']):.0f}",
+                key=chave, on_change=_alternar_regra, args=(regra, chave),
+                disabled=not regra["ativo"] and not confirmada,
+                help="Enquanto ligada, o executor manda ordem para todo sinal "
+                     "deste recorte.",
+            )
+            if not regra["ativo"] and not confirmada:
+                dir_.checkbox("Confirmar religar", key=f"confirma_{chave}")
+
+
+def render_ordens() -> None:
+    if not daytrade_smc.ACOES_API_URL:
+        st.info(
+            "As ordens vivem no homelab: configure `ACOES_API_URL` (e a chave) pra "
+            "ver o que o executor enviou. Sem a API não há como saber — e um zero "
+            "aqui seria mentira, não ausência."
+        )
+        return
+
+    if st.session_state.get("ordens_erro"):
+        st.error(st.session_state["ordens_erro"])
+
+    with st.expander("Filtros", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        f_conta = c1.selectbox("Conta", ["Todas", "DEMO", "REAL"], key="ordens_conta")
+        f_perfil = c2.selectbox("Perfil", ["Todos"] + sorted(st.session_state.perfis),
+                                key="ordens_perfil")
+        f_dias = c3.select_slider("Período", options=[1, 7, 30, 90, 365], value=30,
+                                  format_func=lambda d: f"{d} dias", key="ordens_dias")
+
+    filtros = {
+        "tipo_conta": None if f_conta == "Todas" else f_conta,
+        "perfil": None if f_perfil == "Todos" else f_perfil,
+        "dias": f_dias,
+    }
+
+    # Falha de leitura NUNCA é engolida: "nenhuma ordem" e "não consegui ler
+    # as ordens" desenham igual, e só um dos dois é um número em que se pode
+    # confiar. Foi exatamente o `except Exception: fb_map = {}` que escondeu
+    # por semanas o feedback quebrado.
+    try:
+        stats = _cached_ordem_stats(**filtros)
+        dados = _cached_ordens(limite=300, **filtros)
+    except Exception as exc:
+        st.error(f"Não foi possível carregar as ordens: {exc}")
+        return
+
+    contas = {l["recorte"] for l in stats["por_conta"]}
+    if "REAL" in contas:
+        st.warning(
+            "⚠️ Há ordens em conta **REAL** neste recorte"
+            + (" — e os números abaixo somam REAL com DEMO. Filtre por conta "
+               "antes de tirar conclusão." if len(contas) > 1 else ".")
+        )
+    elif contas:
+        st.caption(f"Conta: **{' · '.join(sorted(contas))}** — resultado em demo não é dinheiro.")
+
+    geral = stats["geral"][0] if stats["geral"] else None
+    if geral is None:
+        st.info(
+            "Nenhuma ordem enviada neste recorte. O executor roda na VM Windows, ao "
+            "lado do MetaTrader 5, e só manda ordem quando existe regra ativa e o "
+            "sinal é recente (a trava de frescor descarta vela velha)."
+        )
+        _render_regras(stats["por_regra"])
+        return
+
+    cols = st.columns(4)
+    cols[0].metric("Ordens enviadas", geral["n"], f"{geral['abertas']} em aberto")
+    cols[1].metric("Fechadas", geral["fechadas"],
+                   f"{geral['ganhos']} ganho(s) · {geral['perdas']} perda(s)")
+    cols[2].metric(
+        "Taxa de acerto",
+        "—" if geral["taxa_acerto"] is None else f"{geral['taxa_acerto'] * 100:.1f}%",
+        help="Ganhos ÷ (ganhos + perdas). Posição aberta não conta: ainda pode virar "
+             "prejuízo.",
+    )
+    cols[3].metric(
+        "Resultado (R$)", f"{geral['resultado_reais']:+.2f}",
+        help="Soma só das FECHADAS, líquida de corretagem, como veio do MetaTrader 5.",
+    )
+    if geral["abertas"]:
+        st.caption(
+            f"Mais {geral['abertas']} posição(ões) em aberto valendo "
+            f"**R$ {geral['aberto_reais']:+.2f}** no papel — não somado acima, porque "
+            "ainda pode mudar de sinal."
+        )
+    if stats["recusadas"] or stats["falhadas"]:
+        st.caption(
+            f"Fora da conta: {stats['recusadas']} barrada(s) pelas travas locais e "
+            f"{stats['falhadas']} recusada(s) pela corretora — nenhuma chegou ao mercado."
+        )
+
+    st.markdown("### Desempenho por recorte")
+    disponiveis = {rotulo: chave for chave, rotulo in _ORDEM_RECORTES.items()
+                   if stats.get(chave)}
+    recorte = st.segmented_control(
+        "Recorte", list(disponiveis), key="ordens_recorte",
+        default="Regra", required=True, label_visibility="collapsed",
+    ) or "Regra"
+    st.dataframe(_tabela_desempenho(stats[disponiveis[recorte]], recorte),
+                 hide_index=True, use_container_width=True)
+    st.caption(
+        "**Fechadas** é o denominador: a taxa sai de ganhos + perdas, e posição em "
+        "aberto fica de fora. `MANUAL` em *Motivo de saída* é posição fechada à mão — "
+        "aquela regra não foi medida, foi pilotada."
+    )
+
+    st.markdown("### Ordens")
+    ordens = dados["ordens"]
+    if not ordens:
+        st.caption("Nenhuma ordem neste recorte.")
+    else:
+        st.caption(f"{dados['total']} ordem(ns) no recorte · mostrando as "
+                   f"{len(ordens)} mais recentes")
+        tabela = pd.DataFrame([_linha_ordem(o) for o in ordens])
+        selecao = st.dataframe(
+            tabela, hide_index=True, use_container_width=True,
+            height=min(520, 45 + 35 * len(tabela)),
+            on_select="rerun", selection_mode="single-row", key="ordens_tabela",
+        )
+        linhas = selecao.get("selection", {}).get("rows") or []
+        if linhas:
+            alvo = ordens[linhas[0]]
+            if alvo.get("mensagem"):
+                st.caption(f"Resposta da corretora: {alvo['mensagem']}")
+            if st.button(f"📊 Ver análise de {alvo['symbol']}", type="primary",
+                         key=f"ordem_ver_{alvo['id']}"):
+                _ir_para("ativo", symbol=alvo["symbol"])
+        else:
+            st.caption("Selecione uma linha para abrir a análise do ativo.")
+
+    _render_regras(stats["por_regra"])
+
+
 def _linha_leitura(s: Signal) -> dict:
     """Uma leitura virada linha de tabela. É aqui que as leituras sem entrada
     param de virar painel: elas viram uma linha dizendo que não têm nada, em
@@ -1498,14 +1801,19 @@ ROTAS = {
     "retroativa":    ("🕵️", "Retroativa", "Como o sinal teria se saído numa data passada"),
     "acompanhar":    ("📋", "Acompanhar", "Triagem dos sinais recentes"),
     "assertividade": ("📉", "Assertividade", "Taxa de acerto medida do histórico"),
+    "ordens":        ("💸", "Ordens", "O que foi enviado à corretora, e o que rendeu"),
 }
 
 # Os quatro grupos do topo. Grupo com mais de uma rota ganha sub-nav.
+#
+# "Ordens" fica em Sinais, e não num quinto grupo, porque é a terceira
+# pergunta da mesma sequência: o que eu decidi (Acompanhar), o que o motor
+# acertou (Assertividade), e o que a corretora pagou (Ordens).
 NAV_GRUPOS = {
     "🎯 Oportunidades": ["oportunidades"],
     "🔍 Scanner": ["scanner"],
     "📈 Ativo": ["ativo", "retroativa"],
-    "📋 Sinais": ["acompanhar", "assertividade"],
+    "📋 Sinais": ["acompanhar", "assertividade", "ordens"],
 }
 
 # Links já compartilhados usam os nomes de modo antigos (o card de
@@ -2094,6 +2402,11 @@ def _pagina_assertividade() -> None:
     render_assertividade(sorted(st.session_state.perfis))
 
 
+def _pagina_ordens() -> None:
+    _page_header("Ordens enviadas")
+    render_ordens()
+
+
 _FUNCOES_DE_PAGINA = {
     "oportunidades": _pagina_oportunidades,
     "scanner": _pagina_scanner,
@@ -2101,6 +2414,7 @@ _FUNCOES_DE_PAGINA = {
     "retroativa": _pagina_retroativa,
     "acompanhar": _pagina_acompanhar,
     "assertividade": _pagina_assertividade,
+    "ordens": _pagina_ordens,
 }
 
 # `default=True` faz a rota ser servida na raiz e IGNORA `url_path` (doc do
