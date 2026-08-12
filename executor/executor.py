@@ -35,7 +35,9 @@ As guardas, e o que cada uma evita:
     ordem. É a guarda mais importante do arquivo. Sem ela, subir o serviço
     depois de qualquer parada dispararia uma rajada de ordens para sinais de
     horas atrás, a preços que não existem mais — e o pior momento pra isso é
-    exatamente a volta de uma queda.
+    exatamente a volta de uma queda. Conta a partir do FECHAMENTO da vela, e
+    não da abertura: ver `_fechamento_da_vela`, e a medição que mostrou que
+    a versão antiga era impossível de satisfazer em M15.
   - **reserva antes do envio**: a linha em `ordens` nasce ANTES de a ordem
     sair, com `signal_id` único. Um reinício no meio do envio encontra a
     reserva e não manda de novo.
@@ -277,6 +279,32 @@ def _quantidade_estimada(sinal: dict, risco_maximo: float) -> float | None:
     return risco_maximo / risco_por_acao
 
 
+def _fechamento_da_vela(sinal: dict) -> datetime:
+    """Quando a vela do sinal FECHOU.
+
+    `candle_time` é a ABERTURA da vela (ver o comentário da coluna em
+    schema.sql), então uma vela de M15 recém-fechada já nasce com
+    `candle_time` de 15 minutos atrás. Comparar o frescor contra a abertura
+    descontava a duração inteira da vela do orçamento — e em M15, onde a
+    janela de frescor é do mesmo tamanho da vela, isso a zerava.
+
+    Medido em 2026-08-12, com 24h de dados de produção: dos 3.060 sinais de
+    M15 gravados, ZERO passavam na trava, e o atraso MÍNIMO observado era de
+    15,2 minutos — logo depois do corte de 15. Não era calibragem apertada,
+    era condição impossível: as 6 regras ativas casaram com 1.141 sinais e
+    nenhum virou ordem. Medindo do fechamento, 2.985 dos 3.060 passam, com
+    8,6 minutos de atraso médio depois de a vela fechar.
+
+    Timeframe desconhecido devolve duração zero, que reproduz o
+    comportamento antigo (mais restritivo) em vez de deixar passar sinal
+    velho por engano."""
+    abertura = datetime.fromisoformat(sinal["candle_time"])
+    tf = daytrade_smc.TIMEFRAMES.get(sinal.get("timeframe") or "")
+    if tf is None:
+        return abertura
+    return abertura + tf["duration"].to_pytimedelta()
+
+
 def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
     """Sinais desta regra que ainda são candidatos a virar ordem."""
     resposta = fetch_signals(
@@ -289,7 +317,7 @@ def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
             continue
         if s.get("direcao") not in ("COMPRA", "VENDA"):
             continue
-        if datetime.fromisoformat(s["candle_time"]) < limite_idade:
+        if _fechamento_da_vela(s) < limite_idade:
             continue
         candidatos.append(s)
     return candidatos

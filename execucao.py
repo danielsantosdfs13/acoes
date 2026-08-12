@@ -131,6 +131,48 @@ def _modo_preenchimento(mt5, info) -> int:
     return mt5.ORDER_FILLING_RETURN
 
 
+# Quanto esperar pela PRIMEIRA cotação de um símbolo recém-adicionado ao
+# Market Watch. Folgado em relação ao observado (o segundo pedido, ~1s depois,
+# já vinha bom) e curto em relação ao ciclo do executor, que é de 30s.
+ESPERA_COTACAO_SEGUNDOS = 3.0
+
+
+def _esperar_cotacao(mt5, symbol: str):
+    """A primeira cotação depois de o símbolo entrar no Market Watch.
+
+    `symbol_select(symbol, True)` devolve True na hora, mas o terminal ainda
+    vai assinar o símbolo e receber o primeiro tick — e nesse intervalo o
+    `symbol_info_tick` volta vazio. Pedir uma vez só e desistir transforma
+    isso em recusa, e a recusa é definitiva: a linha em `ordens` já existe, o
+    dedup impede nova tentativa, e o sinal se perde.
+
+    Medido em produção em 2026-08-12, no primeiro ciclo em que o executor
+    disparou de verdade: das 11 tentativas, 6 foram recusadas com "sem
+    cotação" e QUATRO delas eram o primeiro pedido de um símbolo que, um
+    segundo depois, foi negociado sem problema por outra regra. BBAS3 e PRIO3
+    tinham uma regra só e ficaram sem ordem nenhuma — sinal legítimo perdido
+    por corrida de inicialização.
+
+    A pista de que não era mercado fechado estava no próprio erro:
+    `last_error()` devolvia `(1, 'Success')`, ou seja, NENHUM erro. Não era
+    "não há preço", era "o preço ainda não chegou".
+    """
+    import time
+
+    limite = time.monotonic() + ESPERA_COTACAO_SEGUNDOS
+    while True:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is not None and (tick.ask or tick.bid):
+            return tick
+        if time.monotonic() >= limite:
+            raise OrdemRecusada(
+                f"Sem cotação para {symbol} depois de "
+                f"{ESPERA_COTACAO_SEGUNDOS:g}s ({mt5.last_error()}) — mercado "
+                "fechado, símbolo sem book, ou fora do pregão deste ativo."
+            )
+        time.sleep(0.2)
+
+
 def _conferir_coerencia(direcao: str, preco: float, stop: float | None,
                         alvo: float | None) -> None:
     """Stop e alvo têm que estar do lado certo do preço que vai ser pago.
@@ -278,12 +320,7 @@ def enviar_ordem_mercado(
         # 2026-08-12: enquanto o volume era normalizado primeiro, o tamanho da
         # posição saía da entrada MODELADA do sinal e ninguém conferia se o
         # stop e o alvo ainda faziam sentido contra o preço de agora.
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None or not (tick.ask or tick.bid):
-            raise OrdemRecusada(
-                f"Sem cotação para {symbol} agora ({mt5.last_error()}) — mercado "
-                "fechado ou símbolo sem book."
-            )
+        tick = _esperar_cotacao(mt5, symbol)
 
         comprar = direcao == "COMPRA"
         preco = tick.ask if comprar else tick.bid
