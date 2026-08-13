@@ -42,6 +42,7 @@ from daytrade_smc import (
     DEFAULT_PROFILE_NAME,
     DEFAULT_SYMBOLS,
     Direction,
+    MODALITIES,
     MODALITY_CHOICES,
     Signal,
     SWING_CONFIRMATION_TIMEFRAMES,
@@ -765,6 +766,74 @@ def _tabela_assertividade(linhas: list[dict], rotulo: str | None) -> pd.DataFram
     return pd.DataFrame(registros)
 
 
+def _render_papel_x_real(filtros: dict, expectativas: list, peso_total: float) -> None:
+    """O confronto entre o que o motor mede e o que a corretora pagou.
+
+    As duas metades sempre existiram — `/signals/stats` e `/ordens/stats` —
+    mas em telas diferentes, e a distância entre elas só aparecia pra quem
+    cruzasse as duas à mão. Foi assim que o defeito de 2026-08-12 ficou meses
+    invisível: o motor media +0,17R e 61% de acerto em VWAP · M15 enquanto as
+    ordens do MESMO recorte pagavam -0,52R e 27,8%. Nenhuma das duas telas
+    estava errada; faltava pôr uma ao lado da outra.
+
+    A diferença é o CUSTO DE EXECUTAR, e ela é uma medida por si só: quando
+    abre demais, o problema é execução (frescor, desvio do preenchimento,
+    geometria da ordem) e não a regra — culpar a estratégia nesse caso leva a
+    desligar o que funcionava.
+
+    Só aparece quando existe ordem no recorte: sem ordem nenhuma não há o que
+    confrontar, e uma linha de zeros pareceria "executou e não rendeu"."""
+    try:
+        ordens = _cached_ordem_stats(**{
+            k: v for k, v in filtros.items() if k in ("perfil", "symbol", "dias")
+        })
+    except Exception as exc:
+        # NUNCA renderiza zero aqui: "não houve ordem" e "não consegui ler as
+        # ordens" se parecem na tela e só um dos dois é um número em que dá
+        # pra confiar. Mesma regra da tela de acompanhamento.
+        st.warning(f"Não foi possível ler o desempenho das ordens para comparar: {exc}")
+        return
+
+    geral = (ordens.get("geral") or [{}])[0]
+    if not geral.get("n"):
+        return
+
+    motor = (sum(v * p for v, p in expectativas) / peso_total) if peso_total else None
+    real = geral.get("resultado_r_medio")
+
+    st.markdown("### Papel × real")
+    st.caption(
+        "O motor mede sobre velas, com entrada modelada; a corretora pagou o que "
+        "pagou. A diferença entre os dois é o custo de executar — não é erro de "
+        "nenhuma das duas contas."
+    )
+    cols = st.columns(3)
+    cols[0].metric(
+        "Expectativa do motor (R)", "—" if motor is None else f"{motor:+.2f}",
+        help="De `/signals/stats`: sinais avaliados sobre velas, entrada modelada "
+             "na abertura seguinte, já líquido de custo estimado.",
+    )
+    cols[1].metric(
+        "R médio das ordens", "—" if real is None else f"{real:+.2f}",
+        f"{geral.get('fechadas', 0)} fechadas de {geral['n']}",
+        delta_color="off",
+        help="De `/ordens/stats`: lido do MetaTrader 5, líquido de corretagem e "
+             "swap, já com slippage e fechamento parcial dentro.",
+    )
+    cols[2].metric(
+        "Custo de executar (R)",
+        "—" if (motor is None or real is None) else f"{real - motor:+.2f}",
+        help="Quanto a execução consumiu do que o motor prometeu. Muito negativo "
+             "aponta pra execução (frescor do sinal, desvio do preenchimento, "
+             "geometria da ordem), não pra qualidade da regra.",
+    )
+    if geral.get("fechadas", 0) < 10:
+        st.caption(
+            f"⚠️ Só {geral.get('fechadas', 0)} ordem(ns) fechada(s) neste recorte — "
+            "amostra pequena demais pra concluir qualquer coisa do percentual."
+        )
+
+
 def render_assertividade(perfis: list[str]) -> None:
     st.caption(
         "Taxa de acerto e expectativa dos sinais efetivamente gravados: os que o worker "
@@ -800,8 +869,19 @@ def render_assertividade(perfis: list[str]) -> None:
             # "💾 Salvar este sinal" no veredito de cada análise.
             f_origem = st.selectbox("Origem", ["Todas", "worker", "manual", "backfill"],
                                     key="assert_origem")
-            f_dias = st.select_slider("Período", options=[7, 30, 90, 180, 365, 1095], value=90,
-                                      format_func=lambda d: f"{d} dias", key="assert_dias")
+            # Começa em 1 dia: num ciclo de ajuste diário, 7 é grosso demais
+            # pra ver o efeito de uma mudança de parâmetro. O 1095 saiu — três
+            # anos de histórico que não existem. A API sempre aceitou o
+            # intervalo inteiro (`dias: int = Query(90, ge=1, le=3650)`); o
+            # piso de 7 era só o primeiro item desta lista.
+            f_dias = st.select_slider(
+                "Período", options=[1, 3, 7, 15, 30, 90, 180, 365], value=90,
+                format_func=lambda d: f"{d} dias", key="assert_dias",
+                help="A janela é por horário da VELA, não pela hora em que a linha "
+                     "foi gravada: 1 dia mostra os sinais das velas das últimas 24h, "
+                     "e não o que foi inserido hoje — é por isso que um backfill "
+                     "recém-rodado não aparece aqui.",
+            )
 
     filtros = {
         "perfil": None if f_perfil == "Todos" else f_perfil,
@@ -863,6 +943,8 @@ def render_assertividade(perfis: list[str]) -> None:
             "sinal, sem custo) — a expectativa acima mistura os dois modelos. Rode "
             "`analyzer.py --reavaliar-tudo` pra recalcular tudo com o modelo atual."
         )
+
+    _render_papel_x_real(filtros, expectativas, peso_total)
 
     # Um recorte por vez, escolhido num seletor. Eram cinco expanders
     # empilhados abaixo da tabela geral, todos fechados: sete tabelas na
@@ -938,10 +1020,23 @@ def render_assertividade(perfis: list[str]) -> None:
 _ORDEM_RECORTES = {
     "por_regra": "Regra",
     "por_symbol": "Ativo",
+    "por_dia": "Dia",
+    "por_hora": "Hora",
+    "por_dia_semana": "Semana",
     "por_motivo_saida": "Motivo de saída",
     "por_direcao": "Direção",
     "por_conta": "Conta",
+    # Os dois da EXECUÇÃO: existiam na API desde 2026-08-12 e não tinham onde
+    # ser lidos. Respondem "a ordem saiu com a geometria que a regra pediu?",
+    # que é outra pergunta — e foi a que achou 40% do prejuízo numa faixa só.
+    "por_rr_envio": "R/R no envio",
+    "por_desvio_entrada": "Desvio da entrada",
 }
+
+# Recortes em que o executor pode operar: o analyzer varre só os timeframes
+# do Day Trade (M15/H1/H4/D1). Regra em M5/M2 nunca casaria com sinal algum —
+# o worker não grava sinais nessas resoluções.
+_TIMEFRAMES_DE_REGRA = ("M15", "H1", "H4", "D1")
 
 _STATUS_ORDEM = {
     "ENVIANDO": "⏳ Enviando",
@@ -990,6 +1085,122 @@ def _tabela_desempenho(linhas: list[dict], rotulo: str) -> pd.DataFrame:
     } for linha in linhas])
 
 
+def _curva_acumulada(por_dia: list[dict]) -> list[float]:
+    """A soma corrida do resultado, em ordem de data. Construtor puro."""
+    total, curva = 0.0, []
+    for linha in por_dia:
+        total += linha["resultado_reais"]
+        curva.append(total)
+    return curva
+
+
+def _grafico_dia_a_dia(por_dia: list[dict]) -> go.Figure:
+    """O resultado de cada dia (barras) sobre a curva de capital (linha).
+
+    **Um eixo só, e os dois em R$**: a linha é a soma corrida da própria
+    barra. Dois eixos y aqui deixariam a escala de cada série ser escolhida
+    pelo Plotly, e qualquer cruzamento entre as duas curvas viraria uma
+    coincidência de escala com cara de fato.
+
+    Só o REALIZADO entra: `resultado_reais` soma apenas as fechadas. O não
+    realizado das abertas fica de fora de propósito — uma curva de capital
+    que inclui posição aberta muda de forma sozinha a cada refresh, e o que
+    ela mede deixa de ser o que aconteceu.
+
+    A cor da barra é redundante com a posição dela em relação ao zero (verde
+    acima, vermelho abaixo). É de propósito: verde/vermelho é justamente o
+    par que o daltonismo mais comum embaralha, e quem não distingue as duas
+    cores lê o mesmo fato no lado da barra."""
+    dias = [pd.Timestamp(linha["recorte"]) for linha in por_dia]
+    valores = [linha["resultado_reais"] for linha in por_dia]
+    acumulado = _curva_acumulada(por_dia)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=dias, y=valores, name="Resultado do dia",
+        marker_color=[PALETA["compra"] if v >= 0 else PALETA["venda"] for v in valores],
+        # ~0,6 dia em milissegundos: sem largura explícita, uma série de
+        # poucos dias vira blocos de uma semana de largura cada.
+        width=0.6 * 86_400_000,
+        customdata=[[linha["fechadas"], linha["ganhos"], linha["perdas"]]
+                    for linha in por_dia],
+        hovertemplate=("<b>%{x|%d/%m}</b><br>Resultado: R$ %{y:+.2f}<br>"
+                       "%{customdata[0]} fechada(s) · %{customdata[1]} ganho(s) · "
+                       "%{customdata[2]} perda(s)<extra></extra>"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=dias, y=acumulado, name="Acumulado", mode="lines+markers",
+        line=dict(color=PALETA["ema_9"], width=2),
+        marker=dict(size=8, color=PALETA["ema_9"]),
+        hovertemplate="Acumulado: R$ %{y:+.2f}<extra></extra>",
+    ))
+    # Rótulo direto SÓ no último ponto: é o número que resume a série, e
+    # anotar todos devolveria a tabela que já está logo abaixo.
+    if acumulado:
+        fig.add_annotation(
+            x=dias[-1], y=acumulado[-1], text=f"R$ {acumulado[-1]:+.2f}",
+            showarrow=False, xanchor="left", xshift=8,
+            font=dict(color=PALETA["texto"], size=11),
+        )
+    fig.add_hline(y=0, line=dict(color=PALETA["neutro"], width=1))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=PALETA["fundo"], plot_bgcolor=PALETA["fundo"],
+        height=300, margin=dict(l=10, r=60, t=30, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
+        font=dict(family="IBM Plex Mono, monospace", size=11, color=PALETA["neutro"]),
+        hovermode="x unified",
+        yaxis=dict(title="R$", zeroline=False, gridcolor="#1b2430"),
+        xaxis=dict(showgrid=False),
+    )
+    return fig
+
+
+def _render_dia_a_dia(por_dia: list[dict]) -> None:
+    """A dash diária: quatro números, o gráfico e a leitura do que ele diz.
+
+    Vive acima do "Desempenho por recorte" porque responde à pergunta que
+    vem primeiro — *estou* ganhando ou perdendo? — e que nenhum recorte
+    agregado responde: dois meses com a mesma taxa de acerto podem ser uma
+    escada subindo ou um lucro antigo sendo devolvido dia após dia."""
+    st.markdown("### Dia a dia")
+    if not por_dia:
+        st.caption("Nenhum dia com ordem enviada neste recorte.")
+        return
+
+    valores = [linha["resultado_reais"] for linha in por_dia]
+    fechadas = sum(linha["fechadas"] for linha in por_dia)
+    positivos = sum(1 for v in valores if v > 0)
+    negativos = sum(1 for v in valores if v < 0)
+    melhor = max(por_dia, key=lambda linha: linha["resultado_reais"])
+    pior = min(por_dia, key=lambda linha: linha["resultado_reais"])
+
+    cols = st.columns(4)
+    cols[0].metric("Dias com ordem", len(por_dia),
+                   f"{positivos} no positivo · {negativos} no negativo")
+    cols[1].metric("Melhor dia", f"{melhor['resultado_reais']:+.2f}",
+                   pd.Timestamp(melhor["recorte"]).strftime("%d/%m"))
+    cols[2].metric("Pior dia", f"{pior['resultado_reais']:+.2f}",
+                   pd.Timestamp(pior["recorte"]).strftime("%d/%m"))
+    cols[3].metric(
+        "Média por dia", f"{sum(valores) / len(valores):+.2f}",
+        help="Resultado realizado ÷ dias COM ordem enviada. Dia sem ordem não "
+             "entra na conta — ele não é um zero, é uma ausência.",
+    )
+    st.plotly_chart(_grafico_dia_a_dia(por_dia), use_container_width=True)
+    st.caption(
+        "Barra é o dia, linha é o acumulado — os dois em reais, no mesmo eixo. Só o "
+        "**realizado** entra: posição ainda aberta fica de fora até fechar. O dia é o "
+        "do **envio** (horário de Brasília), então uma posição que virou a noite conta "
+        "no dia em que saiu."
+    )
+    if fechadas < 10:
+        st.caption(
+            f"⚠️ Só {fechadas} ordem(ns) fechada(s) na série inteira — a curva ainda "
+            "é ruído. Não tire conclusão de regra com esta amostra."
+        )
+
+
 def _linha_ordem(o: dict) -> dict:
     """Uma ordem virada linha de tabela. Construtor puro, no molde do
     `_linha_feedback` — nenhum `st.*` aqui dentro."""
@@ -1035,6 +1246,125 @@ def _alternar_regra(regra: dict, chave: str) -> None:
     st.session_state["ordens_erro"] = None
 
 
+def _salvar_regra(regra: dict, novo: dict) -> None:
+    """Grava a edição de uma regra: recorte (perfil/modalidade/timeframe) e
+    risco. O `ativo` segue sendo decidido pelo toggle, fora daqui.
+
+    Trocar o recorte é criar regra nova e DESLIGAR a antiga: a chave
+    (perfil, modalidade, timeframe) é a identidade da regra, e o PUT faz
+    upsert por ela. Apagar a antiga esconderia o histórico de configuração;
+    desligar preserva — mesmo padrão do soft-delete de perfil."""
+    antiga = (regra["perfil"], regra["modalidade"], regra["timeframe"])
+    nova = (novo["perfil"], novo["modalidade"], novo["timeframe"])
+
+    # Como nova != antiga, qualquer regra com a chave `nova` é outra regra —
+    # sobrescrevê-la em silêncio apagaria a identidade dela.
+    if nova != antiga and any(
+        (r["perfil"], r["modalidade"], r["timeframe"]) == nova
+        for r in _cached_auto_ordem().get("regras", [])
+    ):
+        st.session_state["ordens_erro"] = (
+            f"Já existe uma regra para {nova[0]} · {nova[1]} · {nova[2]} — "
+            "apague-a antes ou escolha outro recorte."
+        )
+        return
+
+    try:
+        daytrade_smc.save_auto_ordem(
+            novo["perfil"], novo["modalidade"], novo["timeframe"],
+            novo["risco_maximo"], ativo=bool(regra["ativo"]),
+        )
+        if nova != antiga:
+            daytrade_smc.save_auto_ordem(
+                *antiga, float(regra["risco_maximo"]), ativo=False,
+            )
+    except Exception as exc:
+        st.session_state["ordens_erro"] = f"Não foi possível salvar a regra: {exc}"
+        return
+    _cached_auto_ordem.clear()
+    st.session_state["ordens_erro"] = None
+    st.rerun()
+
+
+def _apagar_regra(regra: dict) -> None:
+    """Apaga DE VEZ uma regra de ordem automática.
+
+    As ordens que ela gerou continuam na base (vêm do sinal, não da regra),
+    então apagar não destrói o que foi medido — só a configuração some."""
+    try:
+        daytrade_smc.delete_auto_ordem(
+            regra["perfil"], regra["modalidade"], regra["timeframe"],
+        )
+    except Exception as exc:
+        st.session_state["ordens_erro"] = f"Não foi possível apagar a regra: {exc}"
+        return
+    _cached_auto_ordem.clear()
+    st.session_state["ordens_erro"] = None
+    st.rerun()
+
+
+def _limpar_ordens(incluir_abertas: bool) -> None:
+    """Zera a tabela `ordens` — reset de desenvolvimento, não filtra nada.
+
+    Não apaga sinal: a assertividade do motor fica de pé. Ver o docstring da
+    rota `DELETE /ordens` pro porquê de isto abrir exceção à regra de rotular
+    em vez de apagar."""
+    try:
+        r = daytrade_smc.limpar_ordens(incluir_abertas=incluir_abertas)
+    except Exception as exc:
+        st.session_state["ordens_erro"] = f"Não foi possível limpar as ordens: {exc}"
+        return
+    # Os dois caches têm TTL de 30s: sem limpá-los a tela seguiria mostrando
+    # por meio minuto ordens que não existem mais.
+    _cached_ordens.clear()
+    _cached_ordem_stats.clear()
+    st.session_state["ordens_erro"] = None
+    st.session_state["ordens_limpeza"] = r
+    st.rerun()
+
+
+def _render_manutencao() -> None:
+    """A zona de perigo da tela de ordens.
+
+    Renderizada nos DOIS pontos de saída de `render_ordens`, inclusive no
+    "nenhuma ordem neste recorte": a limpeza é global e o recorte é local, e
+    é justamente quando o filtro não mostra nada que se quer poder zerar o
+    resto."""
+    r = st.session_state.pop("ordens_limpeza", None)
+    if r:
+        st.success(
+            f"{r['apagadas']} ordem(ns) apagada(s) · {r['abertas_preservadas']} "
+            f"posição(ões) aberta(s) preservada(s) · {r['restantes']} na base."
+        )
+
+    with st.expander("🧹 Manutenção", expanded=False):
+        st.caption(
+            "Apaga **todas** as ordens — ignora os filtros acima, inclusive conta, "
+            "perfil e as de teste. **Não apaga sinal nenhum**: a Assertividade "
+            "continua medindo o motor exatamente como antes; some só o que a "
+            "corretora pagou."
+        )
+        st.caption(
+            "⚠️ Limpe com o executor parado ou fora do pregão. A trava contra ordem "
+            "dobrada é a linha em `ordens` (`signal_id` único) — sem ela, um sinal "
+            "ainda dentro da janela de frescor pode virar ordem de novo. A guarda de "
+            "posição já aberta lê o MetaTrader 5 direto e continua valendo, então o "
+            "risco é reenvio, não posição dobrada."
+        )
+        incluir_abertas = st.checkbox(
+            "Incluir posições ainda abertas", key="limpeza_abertas",
+            help="Sem a linha na base, a conciliação nunca lê o desfecho dessa "
+                 "posição — ela segue aberta no MetaTrader 5 sem ninguém olhando.",
+        )
+        # Mesma assimetria de religar uma regra: o clique perigoso exige um
+        # passo a mais que o inofensivo.
+        confirmado = st.checkbox("Confirmo que quero apagar todas as ordens",
+                                 key="limpeza_confirma")
+        if st.button("🧹 Limpar todas as ordens", type="primary",
+                     disabled=not confirmado, key="limpeza_botao"):
+            _limpar_ordens(incluir_abertas)
+
+
 def _render_regras(stats_por_regra: list[dict]) -> None:
     """As regras de ordem automática, com o desempenho de cada uma ao lado.
 
@@ -1042,7 +1372,8 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
     ligar pede confirmação. Desligar nunca é o erro perigoso; ligar é o ato
     que faz o executor passar a mandar ordem de verdade naquele recorte, e
     ele não pode estar a um clique de distância de quem estava só olhando
-    gráfico."""
+    gráfico. Editar o recorte/risco e apagar a regra exigem abrir o
+    "Editar regra" de propósito — e apagar ainda pede confirmação."""
     st.markdown("### Regras de ordem automática")
     try:
         regras = _cached_auto_ordem().get("regras", [])
@@ -1060,8 +1391,8 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
             "Nenhuma regra cadastrada: o executor varre e dorme, sem mandar nada. "
             "Uma regra diz *para este perfil, modalidade e timeframe, envie ordem "
             "arriscando no máximo R$ X* — crie pelo agente ou pela API "
-            "(`PUT /auto-ordem`). Aqui dá pra ligar e desligar as que existem, não "
-            "criar novas."
+            "(`PUT /auto-ordem`). Aqui dá pra ligar, desligar, editar e apagar as "
+            "que existem, não criar do zero."
         )
         return
 
@@ -1104,6 +1435,69 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
             )
             if not regra["ativo"] and not confirmada:
                 dir_.checkbox("Confirmar religar", key=f"confirma_{chave}")
+
+            with st.expander("Editar regra", expanded=False):
+                st.caption(
+                    "Mudar o recorte cria uma regra nova e desliga a antiga — o "
+                    "histórico dela (ordens e desempenho) continua na base."
+                )
+                c_p, c_m, c_t, c_r = st.columns([2, 3, 2, 2])
+
+                chave_perfil = f"regra_perfil_{chave_regra}"
+                st.session_state.setdefault(chave_perfil, regra["perfil"])
+                _atual = st.session_state[chave_perfil]
+                perfil_novo = c_p.selectbox(
+                    "Perfil",
+                    options=sorted(set(st.session_state.perfis)
+                                   | {regra["perfil"], _atual}),
+                    key=chave_perfil,
+                )
+
+                chave_modalidade = f"regra_modalidade_{chave_regra}"
+                st.session_state.setdefault(chave_modalidade, regra["modalidade"])
+                _atual = st.session_state[chave_modalidade]
+                modalidade_nova = c_m.selectbox(
+                    "Modalidade",
+                    options=[*MODALITIES] if _atual in MODALITIES
+                            else [*MODALITIES, _atual],
+                    key=chave_modalidade,
+                )
+
+                chave_timeframe = f"regra_timeframe_{chave_regra}"
+                st.session_state.setdefault(chave_timeframe, regra["timeframe"])
+                _atual = st.session_state[chave_timeframe]
+                timeframe_novo = c_t.selectbox(
+                    "Timeframe",
+                    options=[*_TIMEFRAMES_DE_REGRA] if _atual in _TIMEFRAMES_DE_REGRA
+                            else [*_TIMEFRAMES_DE_REGRA, _atual],
+                    key=chave_timeframe,
+                )
+
+                chave_risco = f"regra_risco_{chave_regra}"
+                st.session_state.setdefault(chave_risco, float(regra["risco_maximo"]))
+                risco_novo = c_r.number_input(
+                    "Risco (R$)", min_value=1.0, step=5.0, key=chave_risco,
+                )
+
+                c_bt_salvar, c_bt_apagar, c_conf_apagar = st.columns([1, 1, 2])
+                if c_bt_salvar.button(
+                    "Salvar alterações", use_container_width=True,
+                    key=f"regra_salvar_{chave_regra}",
+                ):
+                    _salvar_regra(regra, {
+                        "perfil": perfil_novo,
+                        "modalidade": modalidade_nova,
+                        "timeframe": timeframe_novo,
+                        "risco_maximo": risco_novo,
+                    })
+                if c_bt_apagar.button(
+                    "Apagar regra", use_container_width=True,
+                    disabled=not c_conf_apagar.checkbox(
+                        "Confirmar apagar", key=f"confirma_apagar_{chave_regra}",
+                    ),
+                    key=f"regra_apagar_{chave_regra}",
+                ):
+                    _apagar_regra(regra)
 
 
 def render_ordens() -> None:
@@ -1166,6 +1560,7 @@ def render_ordens() -> None:
             "sinal é recente (a trava de frescor descarta vela velha)."
         )
         _render_regras(stats["por_regra"])
+        _render_manutencao()
         return
 
     cols = st.columns(4)
@@ -1194,6 +1589,8 @@ def render_ordens() -> None:
             f"{stats['falhadas']} recusada(s) pela corretora — nenhuma chegou ao mercado."
         )
 
+    _render_dia_a_dia(stats.get("por_dia") or [])
+
     st.markdown("### Desempenho por recorte")
     disponiveis = {rotulo: chave for chave, rotulo in _ORDEM_RECORTES.items()
                    if stats.get(chave)}
@@ -1208,6 +1605,19 @@ def render_ordens() -> None:
         "aberto fica de fora. `MANUAL` em *Motivo de saída* é posição fechada à mão — "
         "aquela regra não foi medida, foi pilotada."
     )
+    if recorte in ("R/R no envio", "Desvio da entrada"):
+        st.caption(
+            "Este recorte mede a **execução**, não a estratégia: diz se a ordem saiu "
+            "com a geometria que a regra pediu. Volume concentrado fora da faixa "
+            "*contratado* (ou longe de *fiel*) aponta o prejuízo pra distância entre "
+            "o preço modelado e o preço pago — aí a culpa não é da regra."
+        )
+    elif recorte in ("Hora", "Semana"):
+        st.caption(
+            "Hora e dia são os do **envio**, no horário de Brasília. Com poucas "
+            "dezenas de ordens cada balde fica com um punhado — é recorte pra "
+            "levantar suspeita, não pra fechar conclusão."
+        )
 
     st.markdown("### Ordens")
     ordens = dados["ordens"]
@@ -1234,6 +1644,7 @@ def render_ordens() -> None:
             st.caption("Selecione uma linha para abrir a análise do ativo.")
 
     _render_regras(stats["por_regra"])
+    _render_manutencao()
 
 
 def _linha_leitura(s: Signal) -> dict:
@@ -1433,44 +1844,6 @@ def render_individual_analysis(symbol: str, style: str, modality: str, source: s
         alvo = next((s for s in sinais if s.name == escolhida), None)
         if alvo is not None:
             render_signal_panel(alvo, symbol, risk_budget, tf_entrada, contexto, mtf, params, perfil)
-
-
-# ========================================================================
-# Fragmentos de auto-atualização — IMPORTANTE: precisam ser definidos
-# UMA ÚNICA VEZ, em nível de módulo. Criar um `st.fragment(...)` novo
-# a cada rerun do script (como dentro de um if/else no corpo principal)
-# faz o Streamlit perder a referência de qual pedaço da tela pertence a
-# qual fragmento entre uma atualização e outra — e o React trava tentando
-# remover um nó do DOM que ele já não reconhece mais (o erro
-# "removeChild ... not a child of this node"). Por isso, um fragmento
-# fixo por intervalo, nunca criado dinamicamente.
-# ========================================================================
-@st.fragment(run_every=30)
-def _auto_refresh_30(symbol, style, modality, source, count, risk_budget, params, perfil):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
-
-
-@st.fragment(run_every=60)
-def _auto_refresh_60(symbol, style, modality, source, count, risk_budget, params, perfil):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
-
-
-@st.fragment(run_every=120)
-def _auto_refresh_120(symbol, style, modality, source, count, risk_budget, params, perfil):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
-
-
-@st.fragment(run_every=300)
-def _auto_refresh_300(symbol, style, modality, source, count, risk_budget, params, perfil):
-    render_individual_analysis(symbol, style, modality, source, count, risk_budget, params, perfil)
-
-
-_AUTO_REFRESH_FRAGMENTS = {
-    30: _auto_refresh_30,
-    60: _auto_refresh_60,
-    120: _auto_refresh_120,
-    300: _auto_refresh_300,
-}
 
 
 def run_scanner(symbols: list[str], style: str, modality: str, source: str, count: int, risk_budget: float | None, params: AnalysisParams = DEFAULT_PARAMS) -> pd.DataFrame:
@@ -1673,6 +2046,9 @@ PARAM_UI = {
         ("peso_vwap", "Peso — VWAP", 0.0, 100.0, 1.0),
         ("normalizacao_score", "Divisor de normalização", 1.0, 200.0, 1.0),
         ("confluencia_banda_empate", "Banda de empate (pontos)", 0.0, 50.0, 0.5),
+        ("ifr_filtro_confirma", "IFR a favor — multiplicador do score", 0.1, 2.0, 0.05),
+        ("ifr_filtro_contra", "IFR contra — multiplicador do score", 0.1, 1.0, 0.05),
+        ("ifr_piso_score", "IFR define direção — piso de score", 0.0, 100.0, 1.0),
     ],
     "Filtro de mercado": [
         ("filtro_isolada_score_max", "Teto de score — leitura isolada", 0.0, 100.0, 1.0),
@@ -1686,6 +2062,7 @@ PARAM_UI = {
     "Risco": [
         ("rr_alvo_1", "Risco/retorno do alvo 1", 0.1, 20.0, 0.1),
         ("rr_alvo_2", "Risco/retorno do alvo 2", 0.1, 20.0, 0.1),
+        ("encolher_alvos", "Encolher alvos (fração da distância)", 0.1, 1.0, 0.05),
         ("stop_minimo_atr", "Distância mínima do stop (× ATR)", 0.0, 5.0, 0.05),
     ],
 }
@@ -1693,7 +2070,7 @@ PARAM_UI = {
 # campo -> (rótulos por posição, passo, formato)
 PARAM_UI_TUPLAS = {
     "Confluência": {
-        "multiplicador_concordancia": (["0", "1", "2", "3", "4"], 0.05, "%.2f"),
+        "multiplicador_proporcao": (["<0.49", "0.49–0.74", "0.74–0.99", "≥0.99"], 0.05, "%.2f"),
     },
     "Filtro de mercado": {
         "bandas_qualidade": (["Evitar", "Baixa", "Monitorar", "Boa", "Forte"], 1.0, "%.0f"),
@@ -1706,7 +2083,11 @@ PARAM_AJUDA = {
     "evento_max_idade": "Um BOS/CHoCH mais velho que isso deixa de contar como sinal recente.",
     "normalizacao_score": "Divide o score de cada leitura antes de aplicar o peso. Acoplado ao teto da leitura isolada.",
     "confluencia_banda_empate": "Diferença mínima entre compra e venda pra a confluência sair de NEUTRO.",
-    "multiplicador_concordancia": "Multiplicador do score da confluência por quantas das 4 categorias estruturais concordam (0 a 4). O IFR não entra nessa conta.",
+    "ifr_filtro_confirma": "Quando o IFR exaurido aponta NO MESMO lado da direção estrutural, o score é multiplicado por isto.",
+    "ifr_filtro_contra": "Quando o IFR exaurido aponta CONTRA a direção estrutural, o score é multiplicado por isto (entrar a favor de movimento exaurido é entrar no fim dele).",
+    "ifr_piso_score": "Se os estruturais não definirem direção e o IFR estiver exaurido, a exaustão vira o sinal com pelo menos este score.",
+    "encolher_alvos": "Fração da distância original em que os alvos 1 e 2 são contratados. 0.85 aproxima o alvo e sobe a taxa de acerto; não afeta os alvos alternativos (Fibonacci/estrutura/expectativa).",
+    "multiplicador_proporcao": "Multiplicador do score da confluência por proporção das leituras ativas concordando (faixas <0.49, 0.49–0.74, 0.74–0.99, ≥0.99). O IFR não entra nessa conta; leituras com peso zero também não.",
     "rsi_periodo": "Período do IFR. 14 é a convenção de Wilder, a mesma do MT5 e do TradingView.",
     "rsi_sobrevenda": "Abaixo disso o IFR marca exaustão vendedora e aponta COMPRA. O padrão 10 é extremo de propósito: dispara pouco, mas quando dispara vale.",
     "rsi_sobrecompra": "Acima disso o IFR marca exaustão compradora e aponta VENDA. Ver a observação do limiar de sobrevenda.",
@@ -2273,6 +2654,66 @@ def render_scanner(style: str, modality: str, source: str, count: int,
 
 
 # ========================================================================
+# Fragmentos de auto-atualização (sem F5)
+#
+# Uma tela com auto-refresh é um `st.fragment(run_every=...)`: o Streamlit
+# reexecuta SÓ aquele bloco no intervalo pedido, sem rerun da página inteira
+# — sidebar, navegação e o resto ficam parados. Cada tela tem UM fragmento
+# por intervalo, e todos são criados AQUI, em nível de módulo e depois de
+# todas as `render_*` existirem.
+#
+# O que o Streamlit proíbe é criar fragmento dinamicamente a cada rerun do
+# script: o id do fragmento é hash(módulo + nome da função + posição no
+# delta path), então um `def` dentro de um if/else muda de identidade a cada
+# execução e o React quebra com "removeChild ... not a child of this node".
+# Gerar funções fixas no load é seguro — e por isso o `__name__` de cada uma
+# é renomeado depois do decorator: sem isso todas nasceriam `_frag` e
+# colidiriam no mesmo id.
+# ========================================================================
+_INTERVALOS_AUTO_REFRESH = (30, 60, 120, 300)
+
+
+def _fragmento_auto_refresh(nome: str, intervalo: int, render_fn) -> None:
+    @st.fragment(run_every=intervalo)
+    def _frag(*args, **kwargs):
+        render_fn(*args, **kwargs)
+    _frag.__name__ = nome
+    _frag.__qualname__ = nome
+    return _frag
+
+
+def _fragmentos_para(nome: str, render_fn) -> dict:
+    """Os quatro fragmentos (um por intervalo) de uma tela, chaveados por
+    intervalo — mesmo desenho do antigo `_AUTO_REFRESH_FRAGMENTS`."""
+    return {i: _fragmento_auto_refresh(f"_auto_refresh_{nome}_{i}", i, render_fn)
+            for i in _INTERVALOS_AUTO_REFRESH}
+
+
+_AUTO_REFRESH_ATIVO = _fragmentos_para("ativo", render_individual_analysis)
+_AUTO_REFRESH_ORDENS = _fragmentos_para("ordens", render_ordens)
+_AUTO_REFRESH_ACOMPANHAR = _fragmentos_para("acompanhar", render_acompanhamento)
+_AUTO_REFRESH_ASSERTIVIDADE = _fragmentos_para("assertividade", render_assertividade)
+_AUTO_REFRESH_RETROATIVA = _fragmentos_para("retroativa", render_retro_check)
+_AUTO_REFRESH_SCANNER = _fragmentos_para("scanner", render_scanner)
+
+
+def _controle_auto_refresh(sufixo: str) -> tuple[bool, int]:
+    """O popover "🔄 Atualização" de uma tela.
+
+    As chaves de session_state são scoped por tela: o estado sobrevive à
+    navegação, e sem o sufixo uma tela herdaria o intervalo escolhido noutra."""
+    with st.popover("🔄 Atualização"):
+        chave_on = f"auto_refresh_on_{sufixo}"
+        chave_intervalo = f"auto_refresh_intervalo_{sufixo}"
+        ligado = st.checkbox("Atualizar automaticamente", key=chave_on)
+        intervalo = st.select_slider(
+            "Intervalo", options=list(_INTERVALOS_AUTO_REFRESH), value=60,
+            format_func=lambda s: f"{s}s", disabled=not ligado, key=chave_intervalo,
+        )
+    return bool(ligado), int(intervalo)
+
+
+# ========================================================================
 # Páginas
 # ========================================================================
 # `st.Page` só aceita callable SEM argumentos ("The callable can't accept
@@ -2349,8 +2790,14 @@ def _pagina_scanner() -> None:
          ("Estilo", CTX["style"]), ("Leitura", CTX["modality"]),
          ("Perfil", CTX["perfil"]), ("Fonte", _rotulo_fonte(CTX["source"]))],
     )
-    render_scanner(CTX["style"], CTX["modality"], CTX["source"], CTX["count"],
-                   CTX["risk_budget"], CTX["params"], CTX["perfil"])
+    ligado, intervalo = _controle_auto_refresh("scanner")
+    args = (CTX["style"], CTX["modality"], CTX["source"], CTX["count"],
+            CTX["risk_budget"], CTX["params"], CTX["perfil"])
+    if ligado:
+        st.caption(f"🔄 Atualizando sozinho a cada {intervalo}s")
+        _AUTO_REFRESH_SCANNER[intervalo](*args)
+    else:
+        render_scanner(*args)
 
 
 def _pagina_ativo() -> None:
@@ -2363,22 +2810,16 @@ def _pagina_ativo() -> None:
     )
 
     # Auto-atualização mora aqui, não na sidebar: é uma ação SOBRE esta tela.
-    with st.popover("🔄 Atualização"):
-        auto_refresh = st.checkbox("Atualizar automaticamente", key="auto_refresh_on")
-        intervalo = st.select_slider(
-            "Intervalo", options=[30, 60, 120, 300], value=60,
-            format_func=lambda s: f"{s}s", disabled=not auto_refresh,
-            key="auto_refresh_intervalo",
-        )
+    ligado, intervalo = _controle_auto_refresh("ativo")
 
     if not _ativo_disponivel(symbol):
         return
 
     args = (symbol, style, CTX["modality"], CTX["source"], CTX["count"],
             CTX["risk_budget"], params_para_estilo(CTX["params"], style), CTX["perfil"])
-    if auto_refresh:
+    if ligado:
         st.caption(f"🔄 Atualizando sozinho a cada {intervalo}s")
-        _AUTO_REFRESH_FRAGMENTS[intervalo](*args)
+        _AUTO_REFRESH_ATIVO[intervalo](*args)
     else:
         render_individual_analysis(*args)
 
@@ -2393,8 +2834,14 @@ def _pagina_retroativa() -> None:
     )
     if not _ativo_disponivel(symbol):
         return
-    render_retro_check(symbol, style, CTX["modality"], CTX["source"],
-                       CTX["count"], params_para_estilo(CTX["params"], style))
+    ligado, intervalo = _controle_auto_refresh("retroativa")
+    args = (symbol, style, CTX["modality"], CTX["source"],
+            CTX["count"], params_para_estilo(CTX["params"], style))
+    if ligado:
+        st.caption(f"🔄 Atualizando sozinho a cada {intervalo}s")
+        _AUTO_REFRESH_RETROATIVA[intervalo](*args)
+    else:
+        render_retro_check(*args)
 
 
 def _pagina_acompanhar() -> None:
@@ -2402,17 +2849,33 @@ def _pagina_acompanhar() -> None:
         "Acompanhamento de sinais",
         [("Perfil", CTX["perfil"]), ("Janela", "últimas 24h")],
     )
-    render_acompanhamento()
+    ligado, intervalo = _controle_auto_refresh("acompanhar")
+    if ligado:
+        st.caption(f"🔄 Atualizando sozinho a cada {intervalo}s")
+        _AUTO_REFRESH_ACOMPANHAR[intervalo]()
+    else:
+        render_acompanhamento()
 
 
 def _pagina_assertividade() -> None:
     _page_header("Assertividade medida")
-    render_assertividade(sorted(st.session_state.perfis))
+    ligado, intervalo = _controle_auto_refresh("assertividade")
+    perfis = sorted(st.session_state.perfis)
+    if ligado:
+        st.caption(f"🔄 Atualizando sozinho a cada {intervalo}s")
+        _AUTO_REFRESH_ASSERTIVIDADE[intervalo](perfis)
+    else:
+        render_assertividade(perfis)
 
 
 def _pagina_ordens() -> None:
     _page_header("Ordens enviadas")
-    render_ordens()
+    ligado, intervalo = _controle_auto_refresh("ordens")
+    if ligado:
+        st.caption(f"🔄 Atualizando sozinho a cada {intervalo}s")
+        _AUTO_REFRESH_ORDENS[intervalo]()
+    else:
+        render_ordens()
 
 
 _FUNCOES_DE_PAGINA = {

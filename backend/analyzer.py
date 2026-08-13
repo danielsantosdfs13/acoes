@@ -118,6 +118,11 @@ def _env_counts(nome: str, padrao: str) -> dict[str, int]:
 # contagem real de sinais. É a lição do TRAILING_WINDOW 10→3 do scraper,
 # aplicada antes de repetir o erro.
 INTERVAL_SECONDS = _env_int("ANALYZER_INTERVAL_SECONDS", 900)
+
+# Folga entre o fechamento da vela e a varredura que a lê. Ver
+# `_segundos_ate_proxima_vela`: sem ela o worker acorda pontualmente e lê a
+# vela ANTERIOR, porque `ler_candles` descarta a que ainda está em formação.
+FOLGA_INGESTAO_SEGUNDOS = _env_int("ANALYZER_FOLGA_INGESTAO_SEGUNDOS", 20)
 FECHADO_SLEEP_SECONDS = _env_int("ANALYZER_FECHADO_SLEEP_SECONDS", 900)
 TIMEFRAMES_VARRIDOS = _env_lista("ANALYZER_TIMEFRAMES", "M15,H1,H4,D1")
 COUNTS = _env_counts("ANALYZER_COUNTS", "M15=250,H1=250,H4=150,D1=250")
@@ -685,6 +690,53 @@ def backfill(conn, velas: int, warmup: int) -> tuple[int, int]:
 # Loop
 # ---------------------------------------------------------------------------
 
+def _segundos_ate_proxima_vela(agora: datetime | None = None) -> float:
+    """Quanto falta até o fechamento da próxima vela do MENOR timeframe
+    varrido, mais a folga de ingestão.
+
+    Existe porque `sleep(INTERVAL_SECONDS)` num laço tem fase LIVRE: ela é
+    onde o pod subiu, e nada a reancora depois. Com 900s e velas de M15, o
+    sinal de uma vela que fechou às 10:15 podia ser gravado às 10:23.
+
+    Medido em 2026-08-12 sobre 24h de produção: **8,6 minutos** de atraso
+    médio entre o fechamento da vela e a gravação do sinal. Esse atraso é o
+    que faz a ordem sair a um preço que já não é o modelado — as 39
+    primeiras ordens renderam -R$ 1.369 com 31% de acerto, enquanto os
+    mesmos recortes mediam +0,17R e 61% na tabela de sinais. Alinhar a fase
+    é a correção na origem; as travas do `execucao.py` são a rede embaixo.
+
+    A FOLGA não é margem de segurança arbitrária: `candles.ler_candles`
+    descarta a vela ainda em formação, então varrer exatamente no minuto do
+    fechamento devolveria a vela ANTERIOR — o worker rodaria pontualmente e
+    mediria sempre 15 minutos atrasado. A folga também dá tempo de o scraper
+    ter enviado a vela recém-fechada (ele varre a cada 5s).
+
+    Nunca devolve mais que `INTERVAL_SECONDS`: se algum timeframe novo tiver
+    duração longa, o teto preserva o comportamento antigo em vez de deixar o
+    worker dormir horas."""
+    duracoes = [
+        TIMEFRAMES[tf]["duration"].total_seconds()
+        for tf in TIMEFRAMES_VARRIDOS
+        if tf in TIMEFRAMES
+    ]
+    if not duracoes:
+        return float(INTERVAL_SECONDS)
+    passo = min(duracoes)
+    agora = agora or datetime.now(UTC)
+    # A grade das velas é ancorada na hora cheia em UTC, e M15/H1/H4 dividem
+    # a hora exatamente — o mesmo alinhamento que o MT5 e o Yahoo usam.
+    desde_a_hora = agora.minute * 60 + agora.second + agora.microsecond / 1e6
+    # `-x % passo` e não `passo - (x % passo)`: em cima do fechamento exato o
+    # segundo dá uma volta inteira (dormiria 900s para acordar na fronteira
+    # SEGUINTE, sem folga nenhuma), enquanto este dá 0 — que somado à folga
+    # varre a vela que acabou de fechar, que é o que se quer.
+    falta = -desde_a_hora % passo
+    # O teto limita a ESPERA, nunca a folga: aplicá-lo depois da soma faria o
+    # `min` devolver exatamente `INTERVAL_SECONDS` no caso acima e devolver o
+    # worker à fronteira sem folga.
+    return min(falta, float(INTERVAL_SECONDS)) + FOLGA_INGESTAO_SEGUNDOS
+
+
 def uma_iteracao() -> None:
     with pool.connection() as conn:
         inicio = time.monotonic()
@@ -751,8 +803,10 @@ def main() -> int:
         return 0
 
     log.info(
-        "analyzer iniciado · timeframes=%s · perfis=%s · intervalo=%ds",
-        ",".join(TIMEFRAMES_VARRIDOS), ",".join(PERFIS), INTERVAL_SECONDS,
+        "analyzer iniciado · timeframes=%s · perfis=%s · alinhado ao fechamento "
+        "da vela (folga %ds, teto %ds)",
+        ",".join(TIMEFRAMES_VARRIDOS), ",".join(PERFIS),
+        FOLGA_INGESTAO_SEGUNDOS, INTERVAL_SECONDS,
     )
 
     estava_aberto: bool | None = None
@@ -771,7 +825,11 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 — o loop nunca morre por uma iteração ruim
             log.exception("iteração falhou: %s", exc)
 
-        time.sleep(INTERVAL_SECONDS)
+        # Dorme até logo DEPOIS do próximo fechamento de vela, não um bloco
+        # fixo a partir de agora: o sono fixo deixa a fase onde o pod subiu, e
+        # era ela a origem dos 8,6 min de atraso medidos. Ver
+        # `_segundos_ate_proxima_vela`.
+        time.sleep(_segundos_ate_proxima_vela())
 
 
 if __name__ == "__main__":

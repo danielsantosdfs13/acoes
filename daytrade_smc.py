@@ -187,32 +187,100 @@ STYLE_RSI_THRESHOLDS = {
 }
 
 
-def params_para_estilo(params: AnalysisParams, style: str) -> AnalysisParams:
-    """Aplica os limiares de IFR sugeridos pro estilo, SE o perfil não
-    tiver escolhido os seus.
+# Calibragem de CONFLUÊNCIA por estilo: os pesos de cada leitura estrutural
+# e se o IFR age como filtro de reversão. Inspirado no upstream 2026-08-12
+# (`STYLE_CONFIG`), adaptado ao nosso `AnalysisParams`.
+#
+# A diferença de natureza entre Day Trade e Swing: o primeiro opera M15/H1
+# (VWAP faz sentido, IFR filtra), o segundo opera Diário/Semanal (VWAP
+# diária não tem o mesmo significado — Swing não usa VWAP e não aplica o
+# filtro de exaustão, que nesse horizonte é raro e pouco seletivo).
+#
+# Day Trade e Mini Índice ficam AMARRADOS aos defaults do `AnalysisParams`
+# (30/20/20/20) — proposital. O upstream recalibrou o Day Trade pra
+# 32/22/22/24, mas aqui quem manda é o perfil em uso e o worker
+# (`backend/analyzer.py`) é Day Trade puro com `DEFAULT_PARAMS`, não passa
+# por `params_para_estilo`: se a interface aplicasse pesos diferentes do
+# default no Day Trade, a leitura da UI divergiria da do worker sobre o
+# mesmo candle. O que o estilo muda é só a dimensão Swing.
+STYLE_CALIBRAGEM = {
+    "Day Trade": {
+        "pesos": {"SMC": 30.0, "Price Action": 20.0, "Médias Móveis": 20.0, "VWAP": 20.0},
+        "rsi_filtro": True,
+    },
+    "Swing Trade": {
+        "pesos": {"SMC": 42.0, "Price Action": 34.0, "Médias Móveis": 24.0, "VWAP": 0.0},
+        "rsi_filtro": False,
+    },
+    # Mini Índice segue o Day Trade: M2/M5 com VWAP e IFR ativos.
+    "Mini Índice (WINFUT)": {
+        "pesos": {"SMC": 30.0, "Price Action": 20.0, "Médias Móveis": 20.0, "VWAP": 20.0},
+        "rsi_filtro": True,
+    },
+}
 
-    "Não escolheu" aqui é "os dois limiares estão no default". A
-    ambiguidade é conhecida e aceita: quem cravar 10/90 num perfil de
-    Swing vai ver 20/80 mesmo assim, porque não há como distinguir o
-    valor escolhido do valor herdado. O caminho pra fixar de verdade é
-    salvar o perfil com qualquer outro par.
+
+def params_para_estilo(params: AnalysisParams, style: str) -> AnalysisParams:
+    """Aplica a calibragem de CONFLUÊNCIA e o limiar de IFR sugeridos pro
+    estilo, SE o perfil não tiver escolhido os seus.
+
+    "Não escolheu" aqui é "os campos estão no default". A ambiguidade é
+    conhecida e aceita: quem cravar 10/90 num perfil de Swing vai ver
+    20/80 mesmo assim, porque não há como distinguir o valor escolhido
+    do valor herdado. O caminho pra fixar de verdade é salvar o perfil
+    com qualquer outro valor.
+
+    A calibragem de estilo mexe em dois grupos:
+      - os pesos estruturais (`peso_smc`, `peso_price_action`,
+        `peso_medias`, `peso_vwap`) e `rsi_filtro`, vindos de
+        `STYLE_CALIBRAGEM` — o Swing não usa VWAP e não aplica o filtro
+        de exaustão;
+      - os limiares de IFR (`rsi_sobrevenda`/`rsi_sobrecompra`), vindos
+        de `STYLE_RSI_THRESHOLDS`.
+
+    Cada grupo só é aplicado se o perfil estiver no default daquele
+    grupo. Um perfil que customizou só os pesos mantém os limiares de
+    estilo, e vice-versa.
 
     Devolve uma instância NOVA — `AnalysisParams` é frozen, e o
     `params_hash` acompanha a troca, que é o ponto: um sinal de Swing
-    gravado com 20/80 tem que ficar distinguível de um de Day Trade
-    gravado com 10/90.
+    gravado com 20/80 e sem VWAP tem que ficar distinguível de um de
+    Day Trade gravado com 10/90 e com VWAP.
     """
+    calibragem = STYLE_CALIBRAGEM.get(style)
     limiares = STYLE_RSI_THRESHOLDS.get(style)
-    if limiares is None:
+    if calibragem is None and limiares is None:
         return params
-    no_default = (
-        params.rsi_sobrevenda == DEFAULT_PARAMS.rsi_sobrevenda
-        and params.rsi_sobrecompra == DEFAULT_PARAMS.rsi_sobrecompra
-    )
-    if not no_default:
-        return params
-    sobrevenda, sobrecompra = limiares
-    return replace(params, rsi_sobrevenda=sobrevenda, rsi_sobrecompra=sobrecompra)
+
+    kwargs: dict = {}
+    if calibragem is not None:
+        pesos_default = (
+            params.peso_smc == DEFAULT_PARAMS.peso_smc
+            and params.peso_price_action == DEFAULT_PARAMS.peso_price_action
+            and params.peso_medias == DEFAULT_PARAMS.peso_medias
+            and params.peso_vwap == DEFAULT_PARAMS.peso_vwap
+        )
+        if pesos_default:
+            kwargs.update(
+                peso_smc=calibragem["pesos"]["SMC"],
+                peso_price_action=calibragem["pesos"]["Price Action"],
+                peso_medias=calibragem["pesos"]["Médias Móveis"],
+                peso_vwap=calibragem["pesos"]["VWAP"],
+            )
+        if params.rsi_filtro == DEFAULT_PARAMS.rsi_filtro:
+            kwargs["rsi_filtro"] = calibragem["rsi_filtro"]
+
+    if limiares is not None:
+        no_default_rsi = (
+            params.rsi_sobrevenda == DEFAULT_PARAMS.rsi_sobrevenda
+            and params.rsi_sobrecompra == DEFAULT_PARAMS.rsi_sobrecompra
+        )
+        if no_default_rsi:
+            sobrevenda, sobrecompra = limiares
+            kwargs["rsi_sobrevenda"] = sobrevenda
+            kwargs["rsi_sobrecompra"] = sobrecompra
+
+    return replace(params, **kwargs) if kwargs else params
 
 
 class Direction(str, Enum):
@@ -309,7 +377,28 @@ class AnalysisParams:
     peso_vwap: float = 20.0
     normalizacao_score: float = 79.0            # divisor que normaliza a força de cada leitura
     confluencia_banda_empate: float = 3.0       # diferença compra/venda abaixo da qual dá NEUTRO
-    multiplicador_concordancia: tuple[float, ...] = (0.60, 0.60, 0.95, 1.0, 1.10)  # indexado por 0..4 leituras concordando
+    # Multiplicador do score por PROPORÇÃO de leituras ativas concordando
+    # com a direção final, indexado pelas faixas
+    # [<0.49, 0.49-0.74, 0.74-0.99, >=0.99]. Portado do upstream 2026-08-12,
+    # que trocou a contagem absoluta (0..4) pela proporção porque o número
+    # de leituras ativas varia por estilo (o Swing não usa VWAP): 3 de 3
+    # no Swing não pode receber o mesmo prêmio de 3 de 4 no Day Trade.
+    multiplicador_proporcao: tuple[float, ...] = (0.60, 0.92, 1.05, 1.15)
+
+    # --- IFR como filtro de reversão na Confluência ---------------------
+    # (portado do upstream 2026-08-12, adaptado ao nosso AnalysisParams)
+    # O IFR continua FORA da votação estrutural (`isolated`), mas passa a
+    # agir DEPOIS de a direção estrutural ser definida:
+    #   · sem direção (NEUTRO) e o IFR exaurido -> IFR define a direção
+    #     (reversão pura), com piso `ifr_piso_score`;
+    #   · IFR a FAVOR da direção -> score × `ifr_filtro_confirma`;
+    #   · IFR CONTRA a direção -> score × `ifr_filtro_contra` (entrar a
+    #     favor de um movimento exaurido é entrar no fim dele).
+    # `rsi_filtro` liga/desliga o filtro por estilo (Swing Trade: False).
+    rsi_filtro: bool = True
+    ifr_filtro_confirma: float = 1.30
+    ifr_filtro_contra: float = 0.45
+    ifr_piso_score: float = 62.0
 
     # --- Filtro de mercado ----------------------------------------------
     filtro_isolada_score_max: float = 79.0
@@ -324,7 +413,12 @@ class AnalysisParams:
     # --- Risco ----------------------------------------------------------
     rr_alvo_1: float = 1.5
     rr_alvo_2: float = 3.0
-    stop_minimo_atr: float = 0.75
+    stop_minimo_atr: float = 1.0
+    # Alvos contratados a `encolher_alvos` da distância original (0.85 =
+    # 85%): aproxima o alvo e sobe a taxa de acerto, no mesmo espírito do
+    # upstream `TARGET_SHRINK`. Não toca nos alvos alternativos
+    # (Fibonacci/estrutura/expectativa), que continuam na medida completa.
+    encolher_alvos: float = 0.85
 
     def to_items(self) -> tuple[tuple[str, object], ...]:
         """Forma canônica e hasheável, ordenada por nome do campo.
@@ -369,7 +463,10 @@ class AnalysisParams:
         tivesse customizado essa tupla, voltaria do banco com 5 posições e
         estouraria `IndexError` na primeira vez que as cinco leituras
         concordassem — meses depois de salvo, num caminho raro, no worker.
-        Uma tupla LONGA demais é truncada pelo mesmo motivo simétrico."""
+        (A troca posterior pra `multiplicador_proporcao` reaproveita o
+        mesmo mecanismo: um perfil com a tupla antiga tem a chave
+        ignorada por "desconhecida" e cai no novo default.) Uma tupla
+        LONGA demais é truncada pelo mesmo motivo simétrico."""
         if not data:
             return cls()
         conhecidos = {campo.name: campo for campo in fields(cls)}
@@ -1747,6 +1844,7 @@ def rsi_signal(context: MarketContext) -> Signal:
 def confluence_signal(
     context: MarketContext,
     isolated: list[Signal],
+    rsi: Signal | None = None,
 ) -> Signal:
     params = context.params
     weights = {
@@ -1755,12 +1853,15 @@ def confluence_signal(
         "Médias Móveis": params.peso_medias,
         "VWAP": params.peso_vwap,
     }
+    # Leituras com peso zero saem da conta (ex.: VWAP no Swing, que não
+    # tem significado em candles diários) — portado do upstream 2026-08-12.
+    direcionais = [s for s in isolated if weights.get(s.name, 0) > 0]
     buy = 0.0
     sell = 0.0
     agreeing = 0
     reasons: list[str] = []
 
-    for signal in isolated:
+    for signal in direcionais:
         normalized_strength = min(signal.score / params.normalizacao_score, 1.0)
         points = weights[signal.name] * normalized_strength
         if signal.direction == Direction.BUY:
@@ -1782,7 +1883,30 @@ def confluence_signal(
     else:
         direction, score = Direction.SELL, sell
 
-    agreeing = sum(signal.direction == direction for signal in isolated)
+    # --- IFR como filtro de reversão, aplicado DEPOIS da direção ---
+    # Portado do upstream 2026-08-12, adaptado ao nosso AnalysisParams:
+    # o IFR não vota, mas se muitos dos quatro estruturais apontarem pra
+    # um lado enquanto o IFR grita exaustão no oposto, é o momento errado
+    # de entrar a favor do movimento.
+    if params.rsi_filtro and rsi is not None and rsi.direction != Direction.NEUTRAL:
+        if direction == Direction.NEUTRAL:
+            # Sem direção estrutural, a exaustão passa a ser o próprio
+            # sinal: reversão pura, sem tendência estabelecida contra.
+            direction = rsi.direction
+            score = max(score, params.ifr_piso_score)
+            reasons.insert(0, f"IFR: {rsi.reasons[0]} — exaustão define a direção")
+        elif rsi.direction == direction:
+            score = min(100.0, score * params.ifr_filtro_confirma)
+            reasons.insert(0, f"IFR CONFIRMA a reversão: {rsi.reasons[0]}")
+        else:
+            score *= params.ifr_filtro_contra
+            reasons.insert(
+                0,
+                f"IFR ALERTA: extremo oposto ({context.rsi:.0f}) — o movimento atual está "
+                f"exaurido, entrar a favor dele agora é entrar no fim do movimento",
+            )
+
+    agreeing = sum(signal.direction == direction for signal in direcionais)
     # O multiplicador de "2 categorias concordando" foi recalibrado de 0.85
     # para 0.95: com 0.85, o teto matemático desse cenário (quando só
     # Médias+VWAP concordam, por exemplo) ficava a poucos pontos do corte
@@ -1790,13 +1914,28 @@ def confluence_signal(
     # categorias conseguia passar, mesmo com concordância forte. 0.95 dá
     # margem real sem abrir mão do critério (ainda exige concordância
     # genuína e pontuação consistente das 2 categorias).
-    multiplier = params.multiplicador_concordancia[agreeing]
+    #
+    # A escala é em PROPORÇÃO das leituras ativas, não em contagem
+    # absoluta: o Swing não usa VWAP, então 3 de 3 lá não pode receber o
+    # mesmo prêmio de 3 de 4 no Day Trade. Portado do upstream 2026-08-12,
+    # que trocou a contagem fixa por faixas de proporção.
+    total_direcionais = len(direcionais)
+    proporcao = agreeing / total_direcionais if total_direcionais else 0.0
+    if proporcao >= 0.99:
+        banda = 3
+    elif proporcao >= 0.74:
+        banda = 2
+    elif proporcao >= 0.49:
+        banda = 1
+    else:
+        banda = 0
+    multiplier = params.multiplicador_proporcao[banda]
     score = min(100.0, score * multiplier)
-    # Sobre `len(isolated)`, não sobre um 4 cravado: o número de leituras
-    # isoladas já mudou uma vez (quatro até a entrada do IFR) e o
-    # denominador fixo teria passado a reportar 125% de confiança na
-    # unanimidade, silenciosamente.
-    confidence = agreeing / len(isolated) * 100 if isolated else 0.0
+    # Sobre `len(direcionais)`, não sobre um 4 cravado: o número de
+    # leituras isoladas já mudou uma vez e, com peso zero no Swing, o
+    # denominador fixo reportaria 125% de confiança ou contaria leitura
+    # inativa como não concordante.
+    confidence = agreeing / total_direcionais * 100 if total_direcionais else 0.0
 
     direction, score, confidence = apply_market_filter(
         direction,
@@ -1816,10 +1955,12 @@ def confluence_signal(
         direction == Direction.SELL and context.bearish_retest
     ):
         setup = "Rompimento + Reteste"
-    elif context.vwap_rejection:
+    elif context.vwap_rejection and weights.get("VWAP", 0) > 0:
         setup = "Pullback na VWAP"
     elif context.fvg_setup:
         setup = "FVG + Retorno"
+    elif params.rsi_filtro and rsi is not None and rsi.direction == direction and rsi.score >= params.normalizacao_score:
+        setup = "Exaustão de IFR"
     elif event and event.direction == direction:
         setup = "Continuação de tendência (BOS)"
     else:
@@ -2020,8 +2161,8 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
         if risk <= 0:
             signal.direction = Direction.NEUTRAL
             return
-        target_1 = round_tick(entry + risk * params.rr_alvo_1, "ceil")
-        target_2 = round_tick(entry + risk * params.rr_alvo_2, "ceil")
+        target_1 = round_tick(entry + risk * params.rr_alvo_1 * params.encolher_alvos, "ceil")
+        target_2 = round_tick(entry + risk * params.rr_alvo_2 * params.encolher_alvos, "ceil")
     else:
         if stop - entry < minimum_distance:
             stop = entry + minimum_distance
@@ -2031,8 +2172,8 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
         if risk <= 0:
             signal.direction = Direction.NEUTRAL
             return
-        target_1 = round_tick(entry - risk * params.rr_alvo_1, "floor")
-        target_2 = round_tick(entry - risk * params.rr_alvo_2, "floor")
+        target_1 = round_tick(entry - risk * params.rr_alvo_1 * params.encolher_alvos, "floor")
+        target_2 = round_tick(entry - risk * params.rr_alvo_2 * params.encolher_alvos, "floor")
 
     alternatives = alternative_targets(
         context,
@@ -2080,15 +2221,20 @@ def analyze(
     verificação retroativa pode divergir levemente da leitura ao vivo
     na modalidade IFR: ao vivo ela tem o Diário, retroativa não.
 
-    O IFR entra como leitura própria, mas FORA da confluência — só as
-    quatro categorias estruturais alimentam `confluence_signal`. O
-    motivo está no comentário dos pesos, em `AnalysisParams`: as quatro
-    leem estrutura e tendência, o IFR lê exaustão e é contrário por
-    natureza. Como ele fica NEUTRO quase sempre, somá-lo ali diluía
-    todo score de confluência sem acrescentar informação — e quebrava
-    a comparação com o histórico já gravado nessa modalidade. Por isso
-    a ordem aqui importa: a confluência é calculada ANTES de o IFR ser
-    anexado à lista.
+    O IFR entra como leitura própria E como FILTRO DE REVERSÃO na
+    confluência — mas não VOTA nos pesos estruturais. As quatro
+    categorias estruturais (`isolated`) definem a direção e o score de
+    confluência; então o IFR, se exaurido, age depois: confirma (score
+    ×1.30), contraria (score ×0.45) ou, se os estruturais não definiram
+    direção, DEFINE a direção (reversão pura). Não computá-lo nos pesos
+    preserva o que já se media de bom: o IFR não dilui o score estrutural
+    com seu NEUTRO recorrente, e a comparação com o histórico gravado
+    desta modalidade continua válida quando ele não dispara. O filtro é
+    opcional por estilo (`rsi_filtro`, ver `STYLE_CALIBRAGEM`) e, no
+    perfil padrão, deixa de mudar o resultado quando o IFR fica NEUTRO
+    (seu estado mais comum). A ordem aqui importa: a confluência é
+    calculada com o IFR como filtro, e o IFR é anexado à lista de sinais
+    devolvida sem re-votar.
     """
     context = build_context(df, params, higher_rsi=higher_rsi)
     isolated = [
@@ -2097,8 +2243,13 @@ def analyze(
         moving_average_signal(context),
         vwap_signal(context),
     ]
-    confluence = confluence_signal(context, isolated)
-    signals = [confluence, *isolated, rsi_signal(context)]
+    rsi = rsi_signal(context)
+    # A confluência recebe o IFR como FILTRO DE REVERSÃO (ver
+    # `confluence_signal`): ele não vota nos pesos estruturais, mas pode
+    # confirmar/contrariar/definir a direção depois. É por isso que o IFR
+    # é calculado ANTES e passado — não anexado à lista `isolated`.
+    confluence = confluence_signal(context, isolated, rsi)
+    signals = [confluence, *isolated, rsi]
 
     for signal in signals:
         attach_risk(signal, context)
@@ -3249,6 +3400,52 @@ def save_auto_ordem(perfil: str, modalidade: str, timeframe: str,
         f"{_api_base_url()}/auto-ordem",
         json={"perfil": perfil, "modalidade": modalidade,
               "timeframe": timeframe, "risco_maximo": risco_maximo, "ativo": ativo},
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def delete_auto_ordem(perfil: str, modalidade: str, timeframe: str) -> dict:
+    """Apaga DE VEZ uma regra de ordem automática.
+
+    Diferente de desligar (`save_auto_ordem(..., ativo=False)`): desligar
+    preserva a regra e o histórico de configuração; apagar remove a linha.
+    As ordens que a regra já gerou continuam na base (vêm do sinal, não da
+    regra), então apagar não apaga o que foi medido. Devolve a lista de
+    regras restantes."""
+    import requests
+
+    response = requests.delete(
+        f"{_api_base_url()}/auto-ordem",
+        params={"perfil": perfil, "modalidade": modalidade, "timeframe": timeframe},
+        headers=_api_headers(),
+        timeout=_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def limpar_ordens(incluir_abertas: bool = False) -> dict:
+    """Apaga TODAS as ordens — reset de fase de desenvolvimento.
+
+    Não aceita filtro de propósito: é zerar a base pra recomeçar a medir, e
+    "apagar só um pedaço" é o caso que a coluna `ordens.teste` já resolve
+    melhor (rotular em vez de apagar).
+
+    NÃO apaga sinal nenhum: a assertividade do motor continua onde está.
+    Posição ainda aberta na corretora é preservada, salvo
+    `incluir_abertas=True` — sem a linha, a conciliação do executor perde a
+    posição de vista pra sempre.
+
+    Devolve {"apagadas", "abertas_preservadas", "restantes"}."""
+    import requests  # import tardio — mesma convenção do resto do arquivo
+
+    response = requests.delete(
+        f"{_api_base_url()}/ordens",
+        params={"confirmar": "true",
+                "incluir_abertas": "true" if incluir_abertas else "false"},
         headers=_api_headers(),
         timeout=_API_TIMEOUT_SECONDS,
     )

@@ -362,6 +362,14 @@ class OrdemResultado(BaseModel):
     ticket: int | None = None
     retcode: int | None = None
     mensagem: str | None = None
+    # O alvo que REALMENTE saiu. A reserva grava o `alvo_1` do sinal, mas o
+    # envio o recoloca à razão contratada sobre o risco real (ver
+    # `execucao._alvo_por_rr`); sem regravar aqui, a coluna guardaria um
+    # nível que a corretora nunca recebeu.
+    alvo: float | None = None
+    # Desvio do preenchimento contra a entrada modelada, em R. Ver o
+    # comentário da coluna em schema.sql.
+    desvio_entrada_r: float | None = None
 
 
 class OrdemFechamento(BaseModel):
@@ -420,6 +428,10 @@ class OrdemOut(BaseModel):
     resultado_reais: float | None = None
     motivo_saida: str | None = None
     conciliado_em: datetime | None = None
+    # Quanto o preenchimento andou contra a entrada modelada, em R planejado
+    # (positivo = preencheu pior). Ver o comentário da coluna em schema.sql:
+    # é a variável que explicou o prejuízo das 39 primeiras ordens.
+    desvio_entrada_r: float | None = None
     # A regra que produziu esta ordem, e o que o motor previu
     perfil: str | None = None
     modalidade: str | None = None
@@ -482,6 +494,22 @@ class OrdemStatsResponse(BaseModel):
     por_symbol: list[OrdemStatsRow]
     por_motivo_saida: list[OrdemStatsRow]
     por_direcao: list[OrdemStatsRow]
+    # Recortes da EXECUÇÃO, não da estratégia: respondem "a ordem saiu com a
+    # geometria que a regra pediu?" em vez de "a regra presta?". Existem
+    # porque a primeira vez que essa pergunta foi feita — à mão, cruzando
+    # `ordens` com `signals` — ela encontrou 40% do prejuízo concentrado numa
+    # única faixa de R/R.
+    por_rr_envio: list[OrdemStatsRow] = []
+    por_desvio_entrada: list[OrdemStatsRow] = []
+    # Recortes TEMPORAIS, agrupados pelo dia/hora do ENVIO no fuso de
+    # Brasília. `por_dia` vem em ordem cronológica e é a série de onde sai a
+    # curva de capital: a soma corrida de `resultado_reais`. Nenhum outro
+    # recorte responde "estou ganhando ou perdendo ao longo do tempo?" —
+    # duas taxas de acerto idênticas podem ser um platô ou uma escada
+    # descendo.
+    por_dia: list[OrdemStatsRow] = []
+    por_hora: list[OrdemStatsRow] = []
+    por_dia_semana: list[OrdemStatsRow] = []
 
 
 class OrdemReserva(BaseModel):
@@ -494,3 +522,14 @@ class OrdemReserva(BaseModel):
 class OrdensResponse(BaseModel):
     ordens: list[OrdemOut]
     total: int
+
+
+class OrdensLimpeza(BaseModel):
+    """O que o reset de desenvolvimento apagou — ver `DELETE /ordens`.
+
+    `abertas_preservadas` é o número que importa conferir: são as posições
+    que continuam vivas na corretora e cuja linha ficou de pé pra
+    conciliação ainda achar."""
+    apagadas: int
+    abertas_preservadas: int
+    restantes: int

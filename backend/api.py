@@ -30,12 +30,15 @@ para outros consumidores.
 
   - GET    /auto-ordem                       regras de ordem automática (tool)
   - PUT    /auto-ordem                       cria ou atualiza uma regra (tool)
+  - DELETE /auto-ordem                       apaga uma regra (tool)
   - GET    /ordens                           ordens enviadas, com a regra que as
                                             produziu e o desfecho (tool)
   - GET    /ordens/stats                     desempenho financeiro por recorte (tool)
   - POST   /ordens                           reserva antes do envio
   - PUT    /ordens/{signal_id}               registra a resposta da corretora
   - PUT    /ordens/{signal_id}/fechamento    registra o desfecho lido do MT5
+  - DELETE /ordens                           reset de desenvolvimento: apaga
+                                            TODAS as ordens (nunca tool)
 
 Com este serviço no lugar, nenhum cliente fora do backend precisa de
 credencial de banco — o Streamlit deixou de falar SQL.
@@ -86,6 +89,7 @@ from models import (
     OrdemResultado,
     OrdemStatsResponse,
     OrdemStatsRow,
+    OrdensLimpeza,
     OrdensResponse,
     ProfileAtivoIn,
     ProfileOut,
@@ -109,6 +113,7 @@ from models import (
 from daytrade_smc import (  # noqa: E402
     DAYTRADE_CONFIRMATION_TIMEFRAMES,
     DEFAULT_PROFILE_NAME,
+    LOCAL_TZ,
     MODALITIES,
     AnalysisParams,
     analyze,
@@ -1317,12 +1322,58 @@ def configurar_auto_ordem(
                         risco_maximo=float(r[3]), ativo=r[4], criado_em=r[5])
 
 
+@app.delete(
+    "/auto-ordem",
+    response_model=AutoOrdemResponse,
+    dependencies=[Depends(require_api_key)],
+    operation_id="remover_auto_ordem",
+    summary="Apaga uma regra de ordem automática",
+    description=(
+        "Apaga DE VEZ a regra de (perfil, modalidade, timeframe). É diferente de "
+        "desligar (`configurar_auto_ordem` com `ativo=false`): desligar preserva a "
+        "regra e o histórico de configuração, apagar remove a linha. As ordens que "
+        "a regra já gerou CONTINUAM na base — vêm do sinal, não da regra — então "
+        "apagar a regra não apaga o que ela mediu.\n\n"
+        "Devolve a lista de regras restantes, como `listar_auto_ordem` com "
+        "`incluir_inativas=true`."
+    ),
+)
+def delete_auto_ordem(
+    perfil: str = Query(..., description="Perfil da regra."),
+    modalidade: str = Query(..., description="Modalidade da regra."),
+    timeframe: str = Query(..., description="Timeframe da regra."),
+    conn: Connection = Depends(get_conn),
+) -> AutoOrdemResponse:
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM auto_ordem "
+            "WHERE perfil = %s AND modalidade = %s AND timeframe = %s",
+            (perfil, modalidade, timeframe.upper()),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Nenhuma regra ({perfil}, {modalidade}, {timeframe}) encontrada.",
+            )
+        cur.execute(
+            "SELECT perfil, modalidade, timeframe, risco_maximo, ativo, criado_em "
+            "FROM auto_ordem ORDER BY ativo DESC, criado_em DESC"
+        )
+        rows = cur.fetchall()
+    conn.commit()
+    return AutoOrdemResponse(regras=[
+        AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2],
+                     risco_maximo=float(r[3]), ativo=r[4], criado_em=r[5])
+        for r in rows
+    ])
+
+
 _ORDEM_CAMPOS_ORDEM = (
     "id", "signal_id", "symbol", "direcao", "volume", "risco_maximo", "preco_pedido",
     "preco_executado", "stop", "alvo", "conta", "servidor", "tipo_conta", "ticket",
     "status", "retcode", "mensagem", "criado_em", "enviado_em", "teste",
     "fechado_em", "preco_saida", "volume_saida", "resultado_reais", "motivo_saida",
-    "conciliado_em",
+    "conciliado_em", "desvio_entrada_r",
 )
 # Vêm do SINAL, por join. É o que diz QUAL REGRA produziu a ordem: as regras
 # de `auto_ordem` têm chave (perfil, modalidade, timeframe), e nenhum desses
@@ -1410,13 +1461,20 @@ def registrar_resultado_ordem(
             f"""
             UPDATE ordens SET status = %s, volume = %s, preco_pedido = %s,
                    preco_executado = %s, conta = %s, servidor = %s, tipo_conta = %s,
-                   ticket = %s, retcode = %s, mensagem = %s, enviado_em = now()
+                   ticket = %s, retcode = %s, mensagem = %s, enviado_em = now(),
+                   -- COALESCE, e não atribuição direta, porque estes dois vêm
+                   -- da RESERVA e não da resposta da corretora: o caminho
+                   -- RECUSADA/FALHOU manda só status e mensagem, e sobrescrever
+                   -- apagaria o alvo que a reserva já tinha gravado.
+                   alvo = COALESCE(%s, alvo),
+                   desvio_entrada_r = COALESCE(%s, desvio_entrada_r)
              WHERE signal_id = %s
             RETURNING signal_id
             """,
             (body.status, body.volume, body.preco_pedido, body.preco_executado,
              body.conta, body.servidor, body.tipo_conta, body.ticket,
-             body.retcode, body.mensagem, signal_id),
+             body.retcode, body.mensagem, body.alvo, body.desvio_entrada_r,
+             signal_id),
         )
         if cur.fetchone() is None:
             raise HTTPException(
@@ -1461,6 +1519,75 @@ def registrar_fechamento_ordem(
     return _ordem_from_row(row)
 
 
+@app.delete("/ordens", response_model=OrdensLimpeza,
+            dependencies=[Depends(require_api_key)], include_in_schema=False)
+def limpar_ordens(
+    confirmar: bool = Query(
+        False, description="Obrigatório `true`. Sem isso a rota recusa e não apaga nada."),
+    incluir_abertas: bool = Query(
+        False, description=(
+            "Apaga também as posições ainda abertas na corretora. Por padrão elas "
+            "ficam — ver o docstring.")),
+    conn: Connection = Depends(get_conn),
+) -> OrdensLimpeza:
+    """RESET de desenvolvimento: apaga a tabela `ordens` inteira.
+
+    Abre exceção — deliberada e de fase — à regra escrita em `schema.sql`
+    (bloco da coluna `ordens.teste`): este repositório ROTULA o que não deve
+    entrar na conta em vez de apagar, porque apagar de uma tabela de
+    auditoria some com um evento que aconteceu. A exceção é que zerar a base
+    inteira num ciclo de ajuste não é esconder uma ordem, é começar a medir
+    de novo — e enquanto o histórico mistura ordens de teste com regras já
+    descartadas, `desempenho_ordens` não responde "esta regra, do jeito que
+    ela está agora, dá dinheiro?". O `teste` continua sendo a resposta certa
+    pra ordem de validação avulsa; isto aqui não substitui aquilo.
+
+    Três propriedades que sustentam a exceção:
+
+    - **`confirmar` é obrigatório.** Um `DELETE /ordens` sem querer — cliente
+      com bug, curl na URL errada — não pode zerar a base. A confirmação
+      viaja no parâmetro, não só no navegador.
+    - **Posição ABERTA fica**, salvo `incluir_abertas=true`. A conciliação do
+      executor descobre o que fechar por `GET /ordens?aberta=true`; apagar a
+      linha de uma posição viva faz o desfecho dela nunca ser lido, e a
+      posição segue aberta no MT5 sem ninguém olhando.
+    - **`signals` não é tocado.** A cascata da FK desce de sinal pra ordem, e
+      não o contrário. Some o que a corretora pagou, fica o que o motor
+      previu — `assertividade_sinais` sobrevive intacta, e é justamente isso
+      que torna a limpeza aceitável.
+
+    Fora do schema pelo motivo mais forte do bloco de comentário acima: uma
+    tool de apagar auditoria na mão de um texto gerado é pior que uma de
+    mandar ordem."""
+    if not confirmar:
+        raise HTTPException(
+            status_code=400,
+            detail=("Limpeza recusada: passe `confirmar=true`. Esta rota apaga TODAS "
+                    "as ordens, sem filtro."),
+        )
+
+    # Mesmo recorte do índice parcial `ordens_abertas_idx`.
+    aberta = "status = 'ENVIADA' AND fechado_em IS NULL"
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM ordens WHERE {aberta}")
+        abertas = cur.fetchone()[0]
+        cur.execute(
+            "DELETE FROM ordens" if incluir_abertas
+            else f"DELETE FROM ordens WHERE NOT ({aberta})"
+        )
+        apagadas = cur.rowcount
+        cur.execute("SELECT count(*) FROM ordens")
+        restantes = cur.fetchone()[0]
+    conn.commit()
+    log.warning("Ordens apagadas: %s (abertas preservadas: %s, restantes: %s).",
+                apagadas, 0 if incluir_abertas else abertas, restantes)
+    return OrdensLimpeza(
+        apagadas=apagadas,
+        abertas_preservadas=0 if incluir_abertas else abertas,
+        restantes=restantes,
+    )
+
+
 # `/ordens/stats` precisa ser declarada ANTES de qualquer `GET /ordens/{…}`
 # que venha a existir, senão o `{signal_id}` engole "stats". Hoje não há
 # conflito (só há PUT nesse caminho) — o cuidado é pro dia em que houver,
@@ -1477,7 +1604,27 @@ WITH base AS (
            CASE WHEN o.volume IS NOT NULL AND o.preco_executado IS NOT NULL
                      AND o.stop IS NOT NULL AND abs(o.preco_executado - o.stop) > 0
                 THEN o.volume * abs(o.preco_executado - o.stop)
-           END                                                   AS risco_efetivo
+           END                                                   AS risco_efetivo,
+           -- O R/R com que a ordem REALMENTE saiu: alvo e stop medidos contra
+           -- o preço executado, não contra a entrada modelada do sinal. Foi a
+           -- variável que explicou o prejuízo das 39 primeiras ordens (mediana
+           -- 1,00 mas faixa de 0,02 a 7,00, contra um projeto de 0,8 a 1,2) e
+           -- não existia em consulta nenhuma — foi preciso cruzar `ordens` com
+           -- `signals` à mão para vê-la.
+           CASE WHEN o.preco_executado IS NOT NULL AND o.stop IS NOT NULL
+                     AND o.alvo IS NOT NULL
+                     AND abs(o.preco_executado - o.stop) > 0
+                THEN abs(o.alvo - o.preco_executado)
+                     / abs(o.preco_executado - o.stop)
+           END                                                   AS rr_envio,
+           o.desvio_entrada_r,
+           -- Data/hora do ENVIO no fuso de Brasília, e não em UTC. O pregão
+           -- inteiro (10h-18h) cai no mesmo dia UTC, então hoje as duas
+           -- convenções empatam — o que não se pode é depender disso: um
+           -- leilão que atravesse as 21h UTC jogaria a ordem no dia seguinte
+           -- em todo relatório diário, silenciosamente. Mesmo cuidado do
+           -- `_fetch_ohlcv_mt5` e do `execucao.hora_do_mt5`.
+           o.criado_em AT TIME ZONE %(tz)s                       AS enviada_local
       FROM ordens o
       LEFT JOIN signals s ON s.id = o.signal_id
      WHERE o.criado_em > now() - make_interval(days => %(dias)s)
@@ -1527,8 +1674,59 @@ FROM enviadas GROUP BY 1 ORDER BY 1
 """
 
 
-def _ordem_stats_rows(cur, recorte: str, filtros: dict) -> list[OrdemStatsRow]:
-    cur.execute(_ORDEM_STATS_BASE + _ORDEM_STATS_SELECT.format(recorte=recorte), filtros)
+# Faixas de execução. Os cortes não são redondos por estética: 0,7-1,3 é a
+# vizinhança dos R/R que os perfis pedem (0,8 a 1,2), e o que cai fora dela
+# saiu com uma geometria que ninguém escolheu.
+_FAIXA_RR_ENVIO = """
+    CASE WHEN rr_envio IS NULL   THEN 'sem dados'
+         WHEN rr_envio <  0.5    THEN 'a) < 0,5'
+         WHEN rr_envio <  0.7    THEN 'b) 0,5-0,7'
+         WHEN rr_envio <= 1.3    THEN 'c) 0,7-1,3 (contratado)'
+         WHEN rr_envio <= 2.0    THEN 'd) 1,3-2,0'
+         ELSE                         'e) > 2,0'
+    END
+"""
+
+# Os cortes TEMPORAIS agrupam pelo dia/hora do ENVIO, nunca do fechamento.
+# Duas razões: a janela do recorte já filtra por `criado_em` (agrupar por
+# outra coluna faria a soma dos dias não bater com o total), e uma posição
+# aberta não tem data de fechamento nenhuma — ela sumiria do dia em que foi
+# mandada. A consequência a documentar é que a posição que atravessa a
+# meia-noite é creditada ao dia em que SAIU, não ao dia em que fechou; em day
+# trade os dois coincidem, e misturar as duas convenções numa mesma tabela
+# seria pior que escolher uma.
+_DIA_ENVIO = "enviada_local::date"
+_HORA_ENVIO = "to_char(enviada_local, 'HH24') || 'h'"
+# Prefixo numérico porque o `ORDER BY 1` do SELECT é alfabético: sem ele a
+# semana sai em ordem de dicionário (dom, qua, qui, sáb, seg…).
+_DIA_SEMANA_ENVIO = """
+    CASE extract(isodow FROM enviada_local)
+         WHEN 1 THEN '1 seg' WHEN 2 THEN '2 ter' WHEN 3 THEN '3 qua'
+         WHEN 4 THEN '4 qui' WHEN 5 THEN '5 sex' WHEN 6 THEN '6 sáb'
+         ELSE '7 dom'
+    END
+"""
+
+# O desvio é assinado: positivo = preencheu PIOR (mais perto do alvo, mais
+# longe do stop). As duas caudas matam de jeitos opostos, então elas NÃO
+# podem cair no mesmo balde — foi exatamente por olhar o módulo que o defeito
+# passou despercebido: a média do desvio é ~0,00R, e mesmo assim 11 das 39
+# ordens andaram mais de 0,5R.
+_FAIXA_DESVIO_ENTRADA = """
+    CASE WHEN desvio_entrada_r IS NULL  THEN 'sem dados'
+         WHEN desvio_entrada_r < -0.5   THEN 'a) < -0,5R (stop apertou)'
+         WHEN desvio_entrada_r < -0.2   THEN 'b) -0,5 a -0,2R'
+         WHEN desvio_entrada_r <= 0.2   THEN 'c) -0,2 a +0,2R (fiel)'
+         WHEN desvio_entrada_r <= 0.5   THEN 'd) +0,2 a +0,5R'
+         ELSE                                'e) > +0,5R (alvo encolheu)'
+    END
+"""
+
+
+def _ordem_stats_rows(cur, recorte: str, params: dict) -> list[OrdemStatsRow]:
+    """`params` são os filtros MAIS o `tz` dos cortes temporais — não é o
+    dicionário que volta na resposta."""
+    cur.execute(_ORDEM_STATS_BASE + _ORDEM_STATS_SELECT.format(recorte=recorte), params)
     return [
         OrdemStatsRow(
             recorte=str(row[0]), n=row[1], fechadas=row[2], abertas=row[3],
@@ -1569,7 +1767,21 @@ def _ordem_stats_rows(cur, recorte: str, filtros: dict) -> list[OrdemStatsRow]:
         "medida, foi pilotada, e não sustenta conclusão sobre a regra.\n"
         "- `recusadas` e `falhadas` ficam fora das taxas (nada delas chegou ao "
         "mercado), mas um número alto ali é problema de configuração, não de "
-        "estratégia — vale mencionar."
+        "estratégia — vale mencionar.\n"
+        "- `por_rr_envio` e `por_desvio_entrada` medem a EXECUÇÃO, não a "
+        "estratégia: dizem se a ordem saiu com a geometria que a regra pediu. "
+        "Volume fora da faixa 'contratado' ou longe de 'fiel' indica que o "
+        "prejuízo é de execução e não do motor — nesse caso não culpe a regra.\n"
+        "- `por_dia` vem em ordem cronológica e é o recorte pra 'como foi a "
+        "semana?' ou 'que dia estragou o mês?'. É também o único que mostra "
+        "TRAJETÓRIA: some `resultado_reais` em ordem pra ter a curva de capital, "
+        "porque um mesmo saldo pode ser uma escada subindo ou um lucro antigo "
+        "sendo devolvido dia após dia. `por_hora` e `por_dia_semana` são o mesmo "
+        "corte agregado — úteis pra 'a primeira hora do pregão me custa "
+        "dinheiro?'.\n"
+        "- Os três agrupam pelo dia/hora do ENVIO (fuso de Brasília), não do "
+        "fechamento: a posição que atravessa a meia-noite conta no dia em que "
+        "saiu. Ao citar uma hora, diga que é a do envio."
     ),
 )
 def get_ordem_stats(
@@ -1597,21 +1809,40 @@ def get_ordem_stats(
         "incluir_testes": incluir_testes,
         "dias": dias,
     }
+    # O fuso NÃO entra em `filtros`: aquele dicionário volta na resposta como
+    # o eco do que foi pedido, e o fuso não é um recorte — é a convenção com
+    # que os cortes temporais são agrupados.
+    params = {**filtros, "tz": LOCAL_TZ}
     with conn.cursor() as cur:
-        geral = _ordem_stats_rows(cur, "'geral'", filtros)
-        por_conta = _ordem_stats_rows(cur, "coalesce(tipo_conta, '?')", filtros)
-        por_regra = _ordem_stats_rows(cur, "regra", filtros)
-        por_symbol = _ordem_stats_rows(cur, "symbol", filtros)
+        geral = _ordem_stats_rows(cur, "'geral'", params)
+        por_conta = _ordem_stats_rows(cur, "coalesce(tipo_conta, '?')", params)
+        por_regra = _ordem_stats_rows(cur, "regra", params)
+        por_symbol = _ordem_stats_rows(cur, "symbol", params)
         # Rótulo em vez de NULL: "ainda aberta" é um grupo legítimo, e um
         # rótulo nulo viraria linha em branco na tabela.
-        por_motivo = _ordem_stats_rows(cur, "coalesce(motivo_saida, 'EM ABERTO')", filtros)
-        por_direcao = _ordem_stats_rows(cur, "direcao", filtros)
+        por_motivo = _ordem_stats_rows(cur, "coalesce(motivo_saida, 'EM ABERTO')", params)
+        por_direcao = _ordem_stats_rows(cur, "direcao", params)
+        # Os dois recortes da EXECUÇÃO, ao lado dos da estratégia. Eles não
+        # respondem "qual regra presta", e sim "a ordem saiu com a geometria
+        # que a regra pediu?" — pergunta que ficou sem resposta possível até
+        # 2026-08-12 e que, quando finalmente foi feita à mão, encontrou 40%
+        # do prejuízo concentrado numa única faixa.
+        por_rr_envio = _ordem_stats_rows(cur, _FAIXA_RR_ENVIO, params)
+        por_desvio = _ordem_stats_rows(cur, _FAIXA_DESVIO_ENTRADA, params)
+        # Os cortes TEMPORAIS. `por_dia` é o que sustenta a curva de capital
+        # da tela — a soma corrida de `resultado_reais` em ordem de data —, e
+        # é a pergunta que nenhum dos outros recortes responde: "estou
+        # ganhando ou perdendo AO LONGO do tempo?". Uma taxa de acerto igual
+        # pode ser um platô ou uma escada descendo, e só a série mostra qual.
+        por_dia = _ordem_stats_rows(cur, _DIA_ENVIO, params)
+        por_hora = _ordem_stats_rows(cur, _HORA_ENVIO, params)
+        por_dia_semana = _ordem_stats_rows(cur, _DIA_SEMANA_ENVIO, params)
 
         cur.execute(
             _ORDEM_STATS_BASE
             + "SELECT count(*) FILTER (WHERE status = 'RECUSADA'), "
               "count(*) FILTER (WHERE status = 'FALHOU') FROM base",
-            filtros,
+            params,
         )
         recusadas, falhadas = cur.fetchone()
 
@@ -1620,6 +1851,8 @@ def get_ordem_stats(
         recusadas=recusadas, falhadas=falhadas,
         geral=geral, por_conta=por_conta, por_regra=por_regra,
         por_symbol=por_symbol, por_motivo_saida=por_motivo, por_direcao=por_direcao,
+        por_rr_envio=por_rr_envio, por_desvio_entrada=por_desvio,
+        por_dia=por_dia, por_hora=por_hora, por_dia_semana=por_dia_semana,
     )
 
 

@@ -25,13 +25,18 @@ As travas, na ordem em que rodam:
      Padrão "DEMO": enquanto ninguém mudar isso explicitamente, este módulo
      é incapaz de tocar em dinheiro de verdade, mesmo que o terminal errado
      responda.
-  4. coerência de stop e alvo — contra a COTAÇÃO do momento, não contra a
-     entrada modelada do sinal. Alvo atrás do preço é prejuízo garantido que
-     ainda se grava como "bateu o alvo".
-  5. volume — dimensionado pelo preço de agora quando vem `risco_maximo`, e
+  4. distância mínima até o stop (`STOP_MINIMO_ATR`) — contra a cotação do
+     momento. Um stop a um centavo do preço é executado por oscilação, não
+     por a tese ter falhado.
+  5. coerência de stop e alvo — também contra a COTAÇÃO do momento, e depois
+     de o alvo ter sido recolocado (`_alvo_por_rr`), para conferir o que
+     realmente sai. A trava 4 confere a DISTÂNCIA do stop; esta confere o
+     LADO de ambos, e alvo atrás do preço é prejuízo garantido que ainda se
+     grava como "bateu o alvo".
+  6. volume — dimensionado pelo preço de agora quando vem `risco_maximo`, e
      normalizado pelo passo do símbolo, porque volume inválido é rejeição no
      servidor, não erro local.
-  6. `order_check` antes de `order_send` — a corretora valida margem e
+  7. `order_check` antes de `order_send` — a corretora valida margem e
      preços sem executar nada.
 
 A trava 3 é a que importa: as outras protegem contra engano de
@@ -39,16 +44,27 @@ configuração, essa protege contra a não-determinação medida em 2026-08-11,
 quando dois terminais (real e demo) da mesma instalação faziam o
 `initialize()` cair ora num, ora noutro, sem nada configurado ter mudado.
 
-As travas 4 e 5 nasceram juntas, da primeira ordem de validação
+As travas 5 e 6 nasceram juntas, da primeira ordem de validação
 (2026-08-12): PETR4 de um sinal com entrada 41,60 e stop 41,46 preencheu a
 41,78, o que fez o risco real virar R$ 128 onde a regra pedia R$ 50, e
 mandou junto um alvo em 41,72 — atrás da própria entrada. Nenhuma das duas
 coisas era visível antes de a reconciliação existir.
+
+A trava 4 e a recolocação do alvo (`_alvo_por_rr`) vieram da mesma raiz,
+medidas depois com volume: as 39 primeiras
+ordens renderam -R$ 1.369 com 31% de acerto, enquanto os MESMOS recortes
+mediam +0,17R e 61% de acerto na tabela de sinais. A diferença é que o
+executor manda os níveis modelados sobre um preenchimento que acontece
+minutos depois, a outro preço — e quando o preço andou A FAVOR, o stop
+estrutural ficou a centavos do preenchimento. Nessa faixa (< 0,6 ATR) foram
+seis ordens, seis stops, -1,00R cada: 40% de todo o prejuízo. Ver
+`STOP_MINIMO_ATR`.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -70,6 +86,28 @@ MODO_CONTA_EXIGIDO = "DEMO"
 # símbolo. Ordem a mercado no book da B3 raramente desliza, mas 0 faria a
 # corretora rejeitar em vez de preencher um tick adiante.
 DESVIO_MAXIMO_POINTS = 20
+
+# Distância MÍNIMA até o stop no instante do envio, em ATRs. Abaixo disso o
+# stop está dentro do ruído do próprio ativo e é executado por oscilação, não
+# por a tese ter falhado.
+#
+# O motor já tem essa ideia: `stop_minimo_atr` (0,85 no perfil fine_tuned_v2)
+# alarga o stop que nasceu apertado demais. Só que ele mede contra a entrada
+# MODELADA, e entre o fechamento da vela e o preenchimento o preço anda — se
+# andar a favor, a distância até o stop encolhe e o piso do motor evapora sem
+# que nada perceba.
+#
+# Medido em 2026-08-12 sobre as 39 ordens enviadas até aqui, por faixa de
+# distância até o stop no preenchimento:
+#
+#   < 0,6 ATR   6 ordens   6 fechadas   0% de acerto   -1,00R CADA UMA
+#   0,6-1,0     6 ordens   5 fechadas  60% de acerto   +0,30R
+#   >= 1,0     27 ordens  18 fechadas  33% de acerto   -0,58R
+#
+# Seis de seis, sem exceção, e valendo -6R dos -14,9R que a carteira inteira
+# perdeu: 40% do prejuízo saiu desta faixa. Os stops eram de UM a QUATRO
+# centavos (MGLU3 com R$ 0,01, BBAS3 com R$ 0,03).
+STOP_MINIMO_ATR = 0.6
 
 
 class OrdemRecusada(RuntimeError):
@@ -173,6 +211,47 @@ def _esperar_cotacao(mt5, symbol: str):
         time.sleep(0.2)
 
 
+def _alvo_por_rr(info, direcao: str, preco: float, stop: float | None,
+                 rr: float | None) -> float | None:
+    """Recoloca o alvo à distância contratada do preço que vai ser PAGO.
+
+    O alvo do sinal foi calculado sobre o fechamento da vela; a ordem sai a
+    mercado depois disso. Mandar o alvo modelado junto de um preenchimento
+    que andou é assinar um R/R que não é o que o perfil pediu — e as duas
+    caudas disso foram medidas em 2026-08-12, nas 39 primeiras ordens:
+
+      - R/R no envio com mediana 1,00 mas faixa de 0,02 a 7,00, contra um
+        projeto de 0,8 a 1,2.
+      - Quando o preço andou A FAVOR, o alvo ficou a um centavo do
+        preenchimento e a ordem fechou registrada como "ALVO" pagando
+        +0,02R. Quatro dos nove ganhos eram ruído assim: inflam a taxa de
+        acerto sem pagar nada, que é exatamente o jeito de a medição mentir.
+
+    O stop NÃO se mexe: ele é estrutural (`stop_for_signal` o tira de swing,
+    EMA21 ou mínima de 10 velas), e movê-lo para uma distância arbitrária do
+    preenchimento destruiria a justificativa dele. Quem se recoloca é o
+    alvo, que é só uma razão sobre o risco.
+
+    A régua é a cotação do envio, não o preenchimento de fato — este só se
+    conhece depois do `order_send`, e a diferença entre os dois está limitada
+    a `DESVIO_MAXIMO_POINTS`. Sem `rr`, devolve None e o chamador mantém o
+    alvo que recebeu."""
+    if rr is None or stop is None or rr <= 0:
+        return None
+    risco = abs(preco - stop)
+    if risco <= 0:
+        return None
+    # Arredonda PARA LONGE da entrada, como `attach_risk` já faz no motor: em
+    # papel barato o tique de R$ 0,01 é uma fatia grande da distância, e
+    # arredondar para dentro encurta o alvo justamente onde ele já é curto.
+    digitos = getattr(info, "digits", 2) or 2
+    bruto = preco + rr * risco if direcao == "COMPRA" else preco - rr * risco
+    fator = 10 ** digitos
+    if direcao == "COMPRA":
+        return math.ceil(bruto * fator) / fator
+    return math.floor(bruto * fator) / fator
+
+
 def _conferir_coerencia(direcao: str, preco: float, stop: float | None,
                         alvo: float | None) -> None:
     """Stop e alvo têm que estar do lado certo do preço que vai ser pago.
@@ -203,6 +282,36 @@ def _conferir_coerencia(direcao: str, preco: float, stop: float | None,
                 f"a ordem já nasceria no prejuízo, e fecharia registrada como "
                 f"'ALVO'. Nada foi enviado."
             )
+
+
+def _conferir_stop_minimo(preco: float, stop: float | None,
+                          atr: float | None) -> None:
+    """O stop tem que estar longe o bastante do preço para medir a tese, e
+    não o ruído.
+
+    A trava anterior (`_conferir_coerencia`) confere o LADO do stop; esta
+    confere a DISTÂNCIA. São defeitos diferentes: um stop do lado certo a um
+    centavo do preço passa naquela e é executado pela primeira oscilação.
+
+    Só roda quando o chamador informa o ATR — sem ele não há régua, e inventar
+    uma a partir do preço (um percentual fixo) mediria volatilidade errada em
+    todo ativo que não fosse o da calibragem. Ausente, o comportamento é o de
+    antes, que é o que mantém a chamada manual de conferência funcionando.
+
+    Ver o comentário de `STOP_MINIMO_ATR` para os números que motivaram o
+    corte: nesta faixa, seis ordens em seis terminaram no stop."""
+    if stop is None or not atr or atr <= 0:
+        return
+    distancia = abs(preco - stop)
+    minima = STOP_MINIMO_ATR * atr
+    if distancia < minima:
+        raise OrdemRecusada(
+            f"Stop {stop:g} está a {distancia:.4g} do preço {preco:g}, menos que "
+            f"o mínimo de {minima:.4g} ({STOP_MINIMO_ATR:g} × ATR {atr:.4g}). "
+            f"A esta distância quem executa o stop é o ruído do ativo, não a "
+            f"tese: medidas em 2026-08-12, seis ordens em seis nesta faixa "
+            f"fecharam no stop, a -1,00R cada. Nada foi enviado."
+        )
 
 
 def _volume_por_risco(info, risco_maximo: float, preco: float,
@@ -265,6 +374,8 @@ def enviar_ordem_mercado(
     comentario: str = "",
     simular: bool = False,
     risco_maximo: float | None = None,
+    atr: float | None = None,
+    rr: float | None = None,
 ) -> dict:
     """Envia uma ordem A MERCADO com stop e alvo anexados.
 
@@ -276,6 +387,16 @@ def enviar_ordem_mercado(
     momento — ver `_volume_por_risco`). `risco_maximo` é o caminho preferido
     de quem opera por regra, porque é o único que faz o risco configurado
     valer depois que o preço andou.
+
+    `atr` é o ATR do sinal que originou a ordem, e serve de régua para a
+    trava de distância mínima até o stop (`_conferir_stop_minimo`). É
+    opcional porque só quem veio de um sinal o tem; sem ele a trava não roda
+    e o comportamento é o de antes.
+
+    `rr` é a razão risco/retorno contratada (o `r_alvo_1` do sinal). Quando
+    vem, o `alvo` recebido é só referência: o que sai é recalculado a essa
+    razão sobre o risco REAL, medido do preço do envio até o stop — ver
+    `_alvo_por_rr`. Sem ele, o `alvo` vai como veio.
 
     `simular=True` roda só o `order_check`: monta a ordem de verdade e deixa
     a corretora validar margem, preço e volume, sem executar. É o caminho
@@ -325,6 +446,23 @@ def enviar_ordem_mercado(
         comprar = direcao == "COMPRA"
         preco = tick.ask if comprar else tick.bid
 
+        # A distância até o stop é conferida ANTES de o alvo ser recolocado:
+        # é ela que serve de base para o alvo, e um stop dentro do ruído não
+        # vira ordem boa só porque o alvo foi recalculado em cima dele.
+        _conferir_stop_minimo(preco, stop, atr)
+
+        alvo_recolocado = _alvo_por_rr(info, direcao, preco, stop, rr)
+        if alvo_recolocado is not None:
+            if alvo is not None:
+                log.info(
+                    "%s: alvo recolocado de %g para %g (R/R %g contra o risco "
+                    "real de %g)", symbol, alvo, alvo_recolocado, rr,
+                    abs(preco - stop),
+                )
+            alvo = alvo_recolocado
+
+        # Depois da recolocação, para conferir o que REALMENTE vai sair. Na
+        # ordem inversa a trava validaria um alvo que já não é o enviado.
         _conferir_coerencia(direcao, preco, stop, alvo)
 
         if risco_maximo is not None:

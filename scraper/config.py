@@ -15,11 +15,24 @@ POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 WATCHLIST_REFRESH_SECONDS = float(os.environ.get("WATCHLIST_REFRESH_SECONDS", "60"))
 
 # H4 é nativo no MT5 (diferente do Yahoo, que precisa de resample) — sem
-# custo extra incluir aqui. W1 fica de fora do loop de tempo real por não
-# fazer sentido reenviar a cada poucos segundos; pode ser adicionado se
-# algum dia for necessário.
+# custo extra incluir aqui.
+#
+# W1 entrou em 2026-08-12. Ficava de fora com o argumento de que não faz
+# sentido reenviar uma vela semanal a cada poucos segundos — mas o D1 já é
+# reenviado exatamente assim e também só muda uma vez por dia, então o
+# argumento não separava os dois. O que ele custa de verdade: uma chamada
+# MT5 a mais por símbolo por laço, a mesma que o D1 já paga, e o
+# `IS DISTINCT FROM` do `_UPSERT_SQL` no processor descarta a repetição sem
+# escrever tupla nova.
+#
+# O que ele DESBLOQUEIA: o estilo Swing Trade exige confirmação em D1+W1
+# (SWING_CONFIRMATION_TIMEFRAMES). Sem W1 no banco, `/candles?timeframe=W1`
+# devolvia 404 e o estilo inteiro era inanalisável — não errado, inexistente.
+#
+# Atenção: isto NÃO preenche o histórico. Com TRAILING_WINDOW=3, o W1
+# acumularia uma vela por semana. Ver `scraper.py --carga-inicial`.
 SCRAPER_TIMEFRAMES = tuple(
-    tf.strip() for tf in os.environ.get("SCRAPER_TIMEFRAMES", "M15,H1,H4,D1").split(",") if tf.strip()
+    tf.strip() for tf in os.environ.get("SCRAPER_TIMEFRAMES", "M15,H1,H4,D1,W1").split(",") if tf.strip()
 )
 
 

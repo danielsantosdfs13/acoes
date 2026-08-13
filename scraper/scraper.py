@@ -31,13 +31,15 @@ dados novos. O que tornou a afirmação verdadeira foi a guarda
 deste lado veio de TRAILING_WINDOW menor e do gate de pregão abaixo.
 
 Uso:
-    python scraper.py
+    python scraper.py                              # laço contínuo (é o do NSSM)
+    python scraper.py --carga-inicial W1 --velas 150   # enche o histórico e sai
 
 Ver README.md deste diretório para rodar como serviço Windows via NSSM.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 import time
@@ -129,17 +131,24 @@ def _refresh_watchlist(fallback: list[str]) -> list[str]:
     return fallback
 
 
-def _post_candles(symbol: str, timeframe: str) -> None:
+def _post_candles(symbol: str, timeframe: str, count: int | None = None) -> bool:
+    """Devolve se as velas chegaram ao processor.
+
+    O laço de tempo real ignora o retorno de propósito — ele reenvia as
+    últimas TRAILING_WINDOW velas a cada ciclo, então uma falha isolada se
+    fecha sozinha no ciclo seguinte. Já a carga inicial passa UMA vez por
+    ativo: lá a diferença entre "enviado" e "falhou" é a diferença entre ter
+    histórico e não ter, e precisa aparecer."""
     # Busca pelo ticker do MT5, publica pelo nome lógico. Os dois só
     # diferem no mini índice (ver SCRAPER_SYMBOL_MT5): é o que permite o
     # contrato rolar de vencimento sem partir a série no banco.
     ticker = SCRAPER_SYMBOL_MT5.get(symbol.upper(), symbol)
     try:
-        df = fetch_ohlcv(ticker, timeframe, TRAILING_WINDOW, source="MetaTrader 5")
+        df = fetch_ohlcv(ticker, timeframe, count or TRAILING_WINDOW, source="MetaTrader 5")
     except Exception as exc:
         alias = f" (MT5: {ticker})" if ticker != symbol else ""
         log.warning("Falha ao buscar %s/%s%s no MT5: %s", symbol, timeframe, alias, exc)
-        return
+        return False
 
     candles = [
         {
@@ -161,6 +170,43 @@ def _post_candles(symbol: str, timeframe: str) -> None:
         response.raise_for_status()
     except Exception as exc:
         log.warning("Falha ao enviar %s/%s pro processor: %s", symbol, timeframe, exc)
+        return False
+    return True
+
+
+def carga_inicial(timeframe: str, count: int) -> None:
+    """Enche o histórico de UM timeframe de uma vez, e sai.
+
+    O laço normal manda `TRAILING_WINDOW` (3) velas por ciclo, o que é o
+    certo para tempo real e inútil para história: um timeframe recém-ligado
+    acumularia uma vela por período — em W1, uma por semana. O MT5 tem a
+    série inteira à mão, então uma passada com `count` grande resolve o que
+    levaria anos.
+
+    É execução única e manual, no mesmo espírito do `analyzer.py --backfill`:
+    não entra no laço, não é rotina, e roda com o mercado fechado sem
+    problema (não depende do gate de pregão, que existe para não gastar
+    chamada à toa em tempo real).
+
+    Idempotente: o `POST /candles` é upsert com guarda `IS DISTINCT FROM`,
+    então repetir a carga não reescreve nada e não custa WAL.
+
+    Uso na VM:
+        python scraper.py --carga-inicial W1 --velas 150
+    """
+    log.info("Carga inicial de %s (%d velas por ativo) via %s — execução única.",
+             timeframe, count, PROCESSOR_URL)
+    watchlist = _refresh_watchlist(fallback=DEFAULT_SYMBOLS.copy())
+    ok, falhou = [], []
+    for symbol in watchlist:
+        (ok if _post_candles(symbol, timeframe, count=count) else falhou).append(symbol)
+    log.info("Carga inicial de %s: %d ok, %d falhou.", timeframe, len(ok), len(falhou))
+    if falhou:
+        # Alto e claro: uma carga que passa UMA vez por ativo e falha em
+        # silêncio deixa buraco permanente no histórico — quem lê o log
+        # precisa saber exatamente quais reexecutar.
+        log.warning("SEM histórico de %s: %s — rode a carga de novo para estes.",
+                    timeframe, ", ".join(falhou))
 
 
 def _anunciar_conta() -> None:
@@ -197,6 +243,14 @@ def _anunciar_conta() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Coletor MT5 do pipeline de ações.")
+    parser.add_argument("--carga-inicial", metavar="TIMEFRAME", default=None,
+                        help="enche o histórico deste timeframe de uma vez e sai "
+                             "(execução única, à mão — ver carga_inicial())")
+    parser.add_argument("--velas", type=int, default=150,
+                        help="velas por ativo na carga inicial (padrão 150)")
+    args = parser.parse_args()
+
     log.info(
         "Iniciando scraper MT5 — versao=%s, processor=%s, intervalo=%ss, timeframes=%s",
         _deployed_version(), PROCESSOR_URL, POLL_INTERVAL_SECONDS, SCRAPER_TIMEFRAMES,
@@ -209,6 +263,10 @@ def main() -> None:
     daytrade_smc.MT5_SERVER = MT5_SERVER
     daytrade_smc.MT5_PASSWORD = MT5_PASSWORD
     _anunciar_conta()
+
+    if args.carga_inicial:
+        carga_inicial(args.carga_inicial.strip().upper(), args.velas)
+        return
 
     watchlist = _refresh_watchlist(fallback=DEFAULT_SYMBOLS.copy())
     last_refresh = time.monotonic()

@@ -547,7 +547,13 @@ operador. Três mudanças, todas em `backend/analyzer.py`:
 2. `analyzer.py --purgar-automaticos` apaga (`DELETE`, irreversível) todo
    `origem IN ('worker', 'backfill')`. Não toca em `manual`. Rodado uma vez,
    à mão, depois do release desta mudança — não é rotina, é a limpeza da
-   abordagem anterior.
+   abordagem anterior. O irmão do lado das ordens é o `DELETE /ordens`
+   (botão "🧹 Manutenção" na tela `/ordens`, 2026-08-12): zera a tabela
+   `ordens` inteira, exige `confirmar=true`, preserva por padrão as posições
+   ainda abertas e **não** toca em `signals` — some o que a corretora pagou,
+   fica o que o motor previu. Cuidado com a direção da cascata: apagar
+   `signals` derruba junto as `ordens` daqueles sinais (FK
+   `ON DELETE CASCADE`), o contrário não.
 3. O botão "💾 Salvar sinal" da interface, que nunca tinha sido usado, saiu
    de dentro de um expander de detalhe pra um botão em destaque logo abaixo
    do veredito de cada análise — vira o mecanismo principal de geração de

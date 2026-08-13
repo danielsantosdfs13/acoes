@@ -279,6 +279,30 @@ def _quantidade_estimada(sinal: dict, risco_maximo: float) -> float | None:
     return risco_maximo / risco_por_acao
 
 
+def _desvio_entrada_r(sinal: dict, preco_executado: float | None) -> float | None:
+    """Quanto o preenchimento andou em relação à entrada modelada, medido em
+    R planejado. Positivo = preencheu PIOR (mais perto do alvo, mais longe do
+    stop); negativo = preencheu melhor.
+
+    Existe para este desvio parar de ser invisível. Ele é a origem dos dois
+    defeitos medidos em 2026-08-12 — stop dentro do ruído numa ponta, alvo a
+    um centavo na outra — e não havia nenhuma coluna em que ele aparecesse:
+    foi preciso cruzar `ordens` com `signals` à mão para vê-lo. Foi assim
+    também com `risco_efetivo`, que só denunciou o dimensionamento errado
+    depois de a reconciliação começar a gravá-lo.
+
+    Em R e não em reais nem em porcentagem, porque é a única unidade em que
+    o número é comparável entre um MGLU3 de R$ 4 e um VALE3 de R$ 74."""
+    entrada, stop = sinal.get("entrada"), sinal.get("stop")
+    if not entrada or not stop or not preco_executado:
+        return None
+    risco = abs(entrada - stop)
+    if risco <= 0:
+        return None
+    sentido = 1 if sinal.get("direcao") == "COMPRA" else -1
+    return (preco_executado - entrada) * sentido / risco
+
+
 def _fechamento_da_vela(sinal: dict) -> datetime:
     """Quando a vela do sinal FECHOU.
 
@@ -363,6 +387,11 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
             risco_maximo=risco,
             stop=sinal.get("stop"), alvo=sinal.get("alvo_1"),
             comentario=f"auto {regra['modalidade'][:8]}",
+            atr=(sinal.get("detalhes") or {}).get("atr"),
+            # O R/R sai do próprio sinal (`r_alvo_1`), e não do perfil: é a
+            # razão que o motor de fato conseguiu depois de arredondar o alvo
+            # ao tique, que é a que se quer reproduzir sobre o risco real.
+            rr=sinal.get("r_alvo_1"),
         )
     except execucao.OrdemRecusada as exc:
         # RECUSADA e não FALHOU: as travas locais barraram, nada saiu da
@@ -383,6 +412,11 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
         "servidor": r["servidor"], "tipo_conta": r["tipo_conta"],
         "ticket": r.get("ticket"), "retcode": r.get("retcode"),
         "mensagem": (r.get("comentario") or "")[:500],
+        # O alvo que REALMENTE saiu, que não é mais o `alvo_1` reservado
+        # antes do envio — ver `execucao._alvo_por_rr`. Sem regravar, a
+        # coluna mostraria um alvo que a corretora nunca recebeu.
+        "alvo": r.get("alvo"),
+        "desvio_entrada_r": _desvio_entrada_r(sinal, r.get("preco_executado")),
     })
     log.info(
         "%s ticket=%s preço=%s vol=%s risco R$%.2f de R$%.2f (%s)",

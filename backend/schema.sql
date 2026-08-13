@@ -402,6 +402,24 @@ ALTER TABLE ordens ADD COLUMN IF NOT EXISTS conciliado_em   TIMESTAMPTZ;
 -- quiser vê-las pede `incluir_testes=true`.
 ALTER TABLE ordens ADD COLUMN IF NOT EXISTS teste BOOLEAN NOT NULL DEFAULT false;
 
+-- Quanto o preenchimento andou em relação à `entrada` modelada do sinal,
+-- medido em R planejado (2026-08-12). Positivo = preencheu pior.
+--
+-- É a variável que explicou o prejuízo das 39 primeiras ordens e que não
+-- existia em coluna nenhuma: -R$ 1.369 e 31% de acerto nas ordens contra
+-- +0,17R e 61% nos MESMOS recortes da tabela `signals`. A diferença é que a
+-- ordem sai minutos depois do fechamento da vela, a outro preço, com os
+-- níveis calculados sobre o preço antigo — e as duas caudas do desvio matam
+-- de jeitos opostos: para um lado o stop fica dentro do ruído (6 ordens
+-- abaixo de 0,6 ATR, 6 stops, -1,00R cada), para o outro o alvo fica a um
+-- centavo e a ordem fecha como "ALVO" pagando +0,02R.
+--
+-- Em R, e não em reais nem em porcentagem, porque é a única unidade
+-- comparável entre um MGLU3 de R$ 4 e um VALE3 de R$ 74. Descobrir isso
+-- exigiu cruzar `ordens` com `signals` à mão; com a coluna, um recorte de
+-- `/ordens/stats` responde.
+ALTER TABLE ordens ADD COLUMN IF NOT EXISTS desvio_entrada_r DOUBLE PRECISION;
+
 -- Índice PARCIAL pelo mesmo motivo do `signals_pendentes_idx`: o alvo da
 -- reconciliação é "o que saiu e ainda não fechou", um conjunto que ENCOLHE
 -- sozinho — a linha sai do índice assim que o fechamento é gravado.
