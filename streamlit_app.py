@@ -2191,6 +2191,7 @@ ROTAS = {
     "acompanhar":    ("📋", "Acompanhar", "Triagem dos sinais recentes"),
     "assertividade": ("📉", "Assertividade", "Taxa de acerto medida do histórico"),
     "ordens":        ("💸", "Ordens", "O que foi enviado à corretora, e o que rendeu"),
+    "docs":          ("📚", "Docs", "Como o motor funciona: leituras, fluxos e conceitos"),
 }
 
 # Os quatro grupos do topo. Grupo com mais de uma rota ganha sub-nav.
@@ -2203,6 +2204,7 @@ NAV_GRUPOS = {
     "🔍 Scanner": ["scanner"],
     "📈 Ativo": ["ativo", "retroativa"],
     "📋 Sinais": ["acompanhar", "assertividade", "ordens"],
+    "📚 Docs": ["docs"],
 }
 
 # Links já compartilhados usam os nomes de modo antigos (o card de
@@ -2878,6 +2880,316 @@ def _pagina_ordens() -> None:
         render_ordens()
 
 
+def _pagina_docs() -> None:
+    _page_header("Documentação")
+
+    st.caption(
+        "Como o motor funciona, de onde vêm os dados, e o que cada número "
+        "nesta tela realmente significa. Sem jargão acadêmico: o que importa "
+        "é o que cada leitura faz com o dinheiro."
+    )
+
+    aba_motor, aba_fluxo, aba_conceitos, aba_operacao = st.tabs([
+        "🧠 O motor", "🔁 Fluxo de dados", "📏 Conceitos", "🛠️ Operação",
+    ])
+
+    with aba_motor:
+        st.markdown("""
+### O que o motor faz, em uma frase
+
+Lê os candles de um ativo, monta um **contexto de mercado** a partir deles,
+gera **seis leituras independentes** sobre esse contexto, combina-as num score
+de **confluência**, aplica um **filtro de volatilidade**, desenha um **plano de
+risco** (entrada, stop e alvos) e — por fim — exige que **dois timeframes
+concordem** antes de chamar aquilo de sinal.
+
+Cada etapa da cadeia:
+
+1. **`fetch_ohlcv`** — busca os candles (Homelab/API, Yahoo ou MetaTrader 5).
+2. **`build_context`** — transforma o OHLCV bruto num `MarketContext`: ATR e ATR%,
+   RVOL (volume relativo), bucket de volatilidade, EMAs (9/21/50/200), VWAP diário
+   com inclinação/distância/rejeição, topos e fundos (`detect_swings`), eventos de
+   estrutura BOS/CHoCH (`detect_structure`), padrões de candle, breakout/reteste,
+   setup de FVG, IFR e o IFR do Diário (`higher_rsi`) quando fornecido.
+3. **Cinco geradores de sinal** consomem o contexto e cada um devolve um `Signal`
+   (direção, score, confiança, razões, alertas, plano de risco):
+   - **SMC** — estrutura/BOS/CHoCH/FVG.
+   - **Price Action** — padrões de candle + breakout/reteste.
+   - **Médias Móveis** — empilhamento/inclinação das EMAs.
+   - **VWAP** — distância/inclinação/rejeição.
+   - **IFR** — **exaustão apenas** (≤10 / ≥90 no default), logo `NEUTRO` é a
+     resposta normal. De propósito não existe a faixa "chegando perto": uma
+     leitura que pontua fora do extremo é só mais um seguidor de tendência.
+   - **Confluência** — combina as **quatro leituras estruturais** num único
+     score ponderado. O IFR **não vota** aqui (o `NEUTRO` dele diluiria todo
+     score), mas ganhou um papel pós-decisão: ver abaixo.
+4. **`apply_market_filter`** — limita direção/score/confiança conforme o regime de
+   volatilidade (ex.: volatilidade baixa bloqueia entrada; leitura isolada é
+   capada abaixo dos limiares de "confirmado").
+5. **`attach_risk`** — preenche o `RiskPlan` de cada sinal: entrada, stop, alvos e
+   RR. O stop vem de um toco estrutural (swing, EMA21 ou mínima de 10 velas); os
+   alvos de ATR, Fibonacci, estrutura e expectância estatística — as mesmas
+   fórmulas em todos os timeframes, só escalam com os dados.
+6. **`analyze` / `analyze_symbol_mtf`** — roda a cadeia toda num timeframe, ou
+   nos timeframes de confirmação + contexto de um símbolo, devolvendo um
+   `MultiTimeframeResult`.
+
+### O IFR é a sexta leitura, e agrega em quase nada
+
+O IFR está em `MODALITIES`, é selecionável e gera linha própria no histórico —
+mas fica de fora das **duas** agregações: não vota na confluência e não entra no
+Score Geral / direção geral (`MODALIDADES_FORA_DO_AGREGADO`). Isso não é
+arrumação: o IFR é uma leitura de **exaustão contrária** que fica NEUTRO quase
+sempre, e votar com ele derrubou a confluência em ~10-12% e quebrou a direção
+geral em 9 de 20 séries. Ele só age **depois** da decisão: se estiver exausto ele
+**confirma** (×1.30), **contradiz** (×0.45) ou **define a direção** quando o voto
+estrutural é NEUTRO (reversão) — ligado/desligado por estilo via `rsi_filtro`
+(Swing: desligado).
+
+### Score de confluência e `multiplicador_proporcao`
+
+Quando a leitura ativa é a Confluência, o score das quatro estruturais é
+multiplicado por um fator que cresce com a **proporção** de leituras ativas
+concordando na mesma direção (`multiplicador_proporcao`), com faixas
+`<0.49`, `0.49–0.74`, `0.74–0.99`, `≥0.99`. Quanto mais leituras concordam, mais
+o score penaliza o meio-termo — é isso que separa "um palpite" de "tudo apontando
+pro mesmo lado". O IFR não entra nessa conta (e leituras com peso zero, como o
+VWAP no Swing, também não).
+
+### Confirmação multi-timeframe: só sinal quando dois timeframes concordam
+
+| Estilo | Confirmação exigida | Só contexto |
+|---|---|---|
+| Day Trade | M15 + H1 | H4, D1 |
+| Swing Trade | D1 + W1 | H4 |
+| Mini Índice (WINFUT) | M5 + M15 | M2, H1 |
+
+Se os dois obrigatórios discordarem, a recomendação é **forçada a NEUTRO**, mesmo
+que um dos timeframes sozinho esteja forte. É o campo `mtf_confirmado`: ele é o
+que separa um sinal sério de ruído.
+
+O **Diário é analisado primeiro** em todo lugar, e o IFR dele é injetado como
+`higher_rsi` nas demais — `rsi_signal` desconta 0.55 de uma leitura quando o
+Diário está exausto no sentido contrário.
+
+### Parâmetros, estilos e perfis
+
+O motor é dirigido por `AnalysisParams` (~35 limiares) — todos no
+`daytrade_smc.py`, sem widget pra cada um no front. O `params_hash` diferencia
+calibragens no histórico; `from_dict` aceita perfil antigo mesmo depois de o
+formato mudar (ignora campo obsoleto, como `multiplicador_concordancia`).
+
+Os **estilos** (`params_para_estilo`) mexem nos pesos de confluência e no IFR
+**apenas quando o perfil não escolheu valores próprios**:
+- **Day Trade** e **Mini Índice**: pinados aos defaults (30/20/20/20 e filtro IFR
+  ligado) — assim o front e o worker (que é Day Trade fixo) leem o mesmo candle.
+- **Swing Trade**: SMC 42 / PA 34 / Médias 24 / VWAP 0 (sem VWAP), faixa de IFR
+  20/80 e `rsi_filtro` desligado.
+
+Um **perfil** é um conjunto nomeado de parâmetros. Cada sinal salvo guarda o
+perfil que o gerou, e é isso que permite comparar a assertividade de uma
+calibragem contra a outra na tela Assertividade.
+""")
+
+    with aba_fluxo:
+        st.markdown("""
+### De onde os dados vêm, e por onde passam
+
+```
+MetaTrader 5 (Windows)                  k3s (Linux)                    Windows (VM)
+┌────────────────────────────┐   ┌────────────────────────────────┐   ┌──────────────┐
+│ scraper/ (coletor)         │──▶│ processor  (POST /candles)      │   │ executor/    │
+│   fetch_ohlcv MT5          │   │        ↓                        │   │   (envia     │
+│   a cada poucos segundos   │   │ TimescaleDB (candles)           │   │    ordens)   │
+└────────────────────────────┘   │        ↓                        │   └──────▲───────┘
+                                 │ api (GET /candles, /signals,    │          │
+                                 │      /profiles, /ordens …)      │          │
+                                 │ analyzer (worker de sinais)     │──────────┘
+                                 │      → grava signals            │
+                                 └────────────────────────────────┘
+                                              ▲
+                          streamlit (front) — só HTTP, nunca SQL
+```
+
+- **`scraper/`** roda na mesma máquina Windows com um MetaTrader 5 **logado**, é o
+  único que fala com o MT5 (`source="MetaTrader 5"`), e envia os candles pra
+  `POST /candles`. O fuso é tratado explicitamente: o MT5 devolve a hora local do
+  servidor como se fosse UTC, então o scraper converte pra UTC — sem isso, tudo
+  desloca 3h e o guarda de vela em formação se perde.
+- **`backend/`** é uma imagem só com quatro entrypoints:
+  - `processor` — escrita (`POST /candles`, `GET /watchlist` pro scraper).
+  - `api` — leitura (`GET /candles`, `/status`, `/profiles`, `/signals`,
+    `/ordens`, e `POST /analisar`).
+  - `analyzer` — o **worker de sinais**: varre a watchlist, grava `signals`, avalia
+    os desfechos em aberto e aplica o `auto_acompanhamento`. Tem também `--backfill`,
+    que reconstrói sinais históricos a partir dos candles já armazenados.
+  - `migrate` — aplica o `schema.sql` (PreSync hook do ArgoCD).
+- **`streamlit_app.py`** é puramente camada de UI: importa do `daytrade_smc.py`,
+  desenha gráficos Plotly, e **não contém lógica de análise**. Fala com o backend
+  só por HTTP — não carrega driver de Postgres de propósito, pra desacoplagem não
+  regredir em silêncio.
+
+### Sinais: quem grava, e como não se repetem
+
+Sinais são persistidos por **três produtores**, todos com o mesmo `signal_payload()`:
+- o worker (`origem='worker'`),
+- o botão "salvar sinal" no front (`'manual'`),
+- o `--backfill` (`'backfill'`).
+
+`origem` faz parte da chave de dedup `(symbol, timeframe, modalidade, candle_time,
+perfil, origem)` — as três podem descrever o mesmo candle sem colidir, e a medição
+em tempo real se mantém separável da reconstruída. Janelas de consulta contam pela
+`candle_time`, nunca por `criado_em`.
+
+### A execução: quem pode mandar ordem
+
+**Envio de ordens mora fora do motor, de propósito** — análise não tem efeito colateral
+no mundo. Quem envia ordem é o `executor/`, que **só roda no Windows** (a integração
+MT5 é binário Windows; o analyzer é Linux e jamais enviaria). Seis guardas correm em
+ordem antes de qualquer `order_send`: chave-mestra (`ORDENS_HABILITADAS`, desligada
+por default), identidade da conta (`MT5_LOGIN`), **tipo de conta exigido
+(`MODO_CONTA_EXIGIDO`, "DEMO" por default)** — foi isso que tornou incapaz de tocar
+dinheiro real mesmo com o terminal errado logado —, coerência stop/alvo contra o
+cote ao vivo, volume dimensionado pelo risco e normalizado pro lote do símbolo, e
+`order_check` antes de `order_send`.
+
+Três propriedades do loop que são estruturais:
+- **Frescura** (`EXECUTOR_FRESCOR_MINUTOS`, 15): sinal de vela velha nunca vira
+  ordem — senão reiniciar o serviço dispara uma rajada de ordens a preços que já
+  não existem.
+- **Reserva antes do envio**: a linha de `ordens` (com `signal_id` único) é escrita
+  **antes** de a ordem sair. Escrever depois deixa uma janela onde a ordem existe na
+  corretora e não no banco; reiniciar dentro dela envia a segunda ordem pro mesmo
+  sinal.
+- **`timeframe` é parte da chave da regra**: regra só com (perfil, modalidade)
+  casaria o mesmo sinal em M15/H1/H4/D1 e abriria quatro posições achando que abriu
+  uma.
+
+A **reconciliação** lê o desfecho **do terminal MT5** (nunca deriva de
+`signals.resultado` — quem fechou à mão, em partes ou com slippage não saiu
+"exatamente no stop/alvo"): `fechado_em`, `preco_saida`, `resultado_reais`,
+`motivo_saida`. `MANUAL` é marcado como "não é medição". Roda mesmo com o envio
+desligado — ler o que já saiu não envia nada.
+""")
+
+    with aba_conceitos:
+        st.markdown("""
+### Assertividade é o nome de uma métrica que pode mentir
+
+A tela Assertividade mostra `taxa_acerto` e `expectativa_r` juntas — e são as duas
+**que devem** ser lidas juntas:
+
+- **`taxa_acerto`** = acertou / **resolvidos** (os `EM_ABERTO` não têm desfecho e
+  ficam de fora do denominador). Com menos de ~10 resolvidos, o percentual não
+  significa nada.
+- **`expectativa_r`** = retorno médio em múltiplos do risco, líquido de custo.
+  NEGATIVO quer dizer que o recorte perde dinheiro mesmo acertando às vezes.
+
+O ponto que o histórico provou: **"assertividade" é maximizada exatamente nos
+ajustes que perdem dinheiro.** Perfis com alvo curto (RR 0.5) batem 71% de acerto,
+mas `expectativa_r ≈ 0`; (RR 0.25) batem 82% com expectativa negativa. O mesmo
+risco unitário que compra 80% de acerto compra também a perda. Por isso a
+calibragem é feita em `expectativa_r`, e `taxa_acerto` só faz sentido lendo junto.
+
+Onde o motor e a corretora divergem, também há medição separada: a
+`assertividade` aponta o **sinal** (entrada modelada na abertura da vela seguinte),
+e `desempenho_ordens` aponta **o que o broker pagou** (execução real, lote
+arredondado, slippage). A diferença entre os dois é o **custo de executar** — e só
+é visível porque são medidos à parte.
+
+### Linguagem do motor
+
+- **R** = múltiplo do risco. A única unidade que compara uma ação de R$ 4 com uma de
+  R$ 74. `expectativa_r` e o RR informado no enviar são sempre em R.
+- **RR ao enviar** bate com a promessa: `_alvo_por_rr` recoloca o alvo na distância
+  contratada a partir do preço que está saindo (próximo é o do sinal, `r_alvo_1` —
+  a razão que o motor realmente alcançou depois de arredondar o alvo pra dentro).
+- **`stop_minimo_atr`** — distância mínima do stop em múltiplos do ATR. É a guarda
+  contra o stop-centavo: o desvio de execução pode deixar o stop a 1-4 centavos do
+  fill (MGLU3 a R$ 0.01, BBAS3 a R$ 0.03), e aí o risco real explode. Aplicado **no
+  envio**, contra a distância real, não a modelada.
+- **`encolher_alvos`** — contrai a distância dos alvos em relação ao padrão
+  (`attach_risk`). O padrão do repo é alvo longe = mais R por acerto; encolher
+  sobe acerto e derruba expectativa — a mesma troca que a tabela acima mostra.
+- **`motivo_saida`** — por que a posição fechou. `ALVO`, `STOP`, `MANUAL`…
+  `MANUAL` (fechou à mão) **não é medição**: a regra foi pilotada, não medida.
+- **`ordens.teste`** — ordem de validação disparada à mão: vai de verdade e
+  executa, mas mede zero regra. É rotulada (🧪), nunca deletada — e fica fora das
+  estatísticas por default (`incluir_testes=true` traz de volta).
+
+### Volume relativo (RVOL) — o aviso medido
+
+O motor já filtra volume (padrão de candle só acima de 1.3× a média), e a tentação
+natural era estender esse tipo de filtro às outras leituras. A varredura de 94.770
+avaliações refutou: na banda >1.3× a expectativa é **negativa**, e em <0.8× é a
+mais alta. Não existe "volume alto = sinal melhor" medido aqui — a leitura do RVOL
+não é porta de entrada, e não deve ser copiada pros outros quatro grupos.
+
+### Multiplicador da confluência e o meio-termo
+
+`multiplicador_proporcao` penaliza o score quando só parte das leituras ativas
+concorda — é o mecanismo que faz a confluência distinguir "muita coisa apontando
+pro mesmo lado" de "metade sim, metade não". O IFR não vota e as leituras com peso
+zero por estilo (VWAP no Swing) também não entram — a proporção é sobre as leituras
+**ativas**.
+""")
+
+    with aba_operacao:
+        st.markdown("""
+### Onde cada coisa roda
+
+| Componente | Onde roda | Imagem / forma |
+|---|---|---|
+| Web UI | k3s (container) | `acoes-streamlit` |
+| Backend (api/processor/analyzer/migrate) | k3s (contêiner) | `acoes-backend` |
+| Banco | k3s | TimescaleDB (Postgres) |
+| Coletor (scraper) | VM Windows + MT5 logado | serviço NSSM |
+| Executor (ordens) | VM Windows | serviço NSSM |
+
+- **Não há registry.** As imagens são construídas localmente e importadas direto
+  pro containerd do k3s (`docker save | k3s ctr images import`), com a tag sendo o
+  commit git. Os manifests vivem no repo `homelab` (`applications/acoes/`) e são
+  entregues por **ArgoCD** (source of truth) — `make release` publica a tag, `make
+  sync` força o sync, e o ArgoCD aplica. O Makefile **não** ganha `apply`.
+- **VM Windows** consome `make release-scraper` (`C:/acoes`), instalando
+  `scraper/` e `executor/` como serviços (`AcoesScraper`, `AcoesExecutor`). Um
+  `python scraper.py` manual na VM NÃO herda as variáveis do serviço — o
+  `PROCESSOR_URL` cai pra `localhost:8000` e cada POST falha em silêncio.
+- **Variáveis críticas** do back/config: `ACOES_API_URL` + `ACOES_API_KEY`
+  (configuram o front a falar com a API), `MT5_PATH/LOGIN/SERVER/PASSWORD` (qual
+  terminal alimenta o pipeline), `ORDENS_HABILITADAS` (chave-mestra do envio,
+  default **desligado**), `MODO_CONTA_EXIGIDO` (default `DEMO`).
+
+### Interface com a API
+
+O `backend/api.py` é **interface de agente**, não só HTTP: o `/openapi.json` vira
+tools MCP pro agentgateway — `operation_id` é nome de ferramenta e `description` é
+o texto que o modelo lê pra decidir chamar. Routes `include_in_schema=False` ainda
+são servidas e suportadas; o flag significa só "não é uma tool". Lugares de ordem
+(`/auto-ordem`, escrita de `ordens`) ficam de fora do schema por segurança —
+colocar dinheiro ao alcance de texto gerado é pior que corromper a medição.
+
+Rotas-chave:
+- `GET/PUT /watchlist` — a lista inteira de símbolos (PUT substitui tudo).
+- `POST /analisar` — roda o motor na hora, **não persiste nada** (`origem='consulta'`).
+  É a ferramenta por trás de "como está a VALE3 agora?".
+- `GET /signals`, `/signals/stats` — histórico dos sinais e assertividade.
+- `GET/PUT /profiles` — criação e leitura de perfis de parâmetros.
+- `GET /ordens`, `/ordens/stats` — auditoria do que saiu e o que rendeu.
+- `POST /signals` + `signal_feedback` — decisão humana (ACOMPANHAR/OPERAR/…), uma
+  linha por decisão, sempre a mais recente.
+
+### Linha de comando
+
+```bash
+python daytrade_smc.py VALE3 --timeframe M15 --count 250 --risco 500
+```
+
+Roda a cadeia completa num símbolo e imprime o relatório — a mesma lógica exata
+que o front usa, sem a UI.
+""")
+
+
 _FUNCOES_DE_PAGINA = {
     "oportunidades": _pagina_oportunidades,
     "scanner": _pagina_scanner,
@@ -2886,6 +3198,7 @@ _FUNCOES_DE_PAGINA = {
     "acompanhar": _pagina_acompanhar,
     "assertividade": _pagina_assertividade,
     "ordens": _pagina_ordens,
+    "docs": _pagina_docs,
 }
 
 # `default=True` faz a rota ser servida na raiz e IGNORA `url_path` (doc do
