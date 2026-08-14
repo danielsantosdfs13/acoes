@@ -109,12 +109,31 @@ DESVIO_MAXIMO_POINTS = 20
 # centavos (MGLU3 com R$ 0,01, BBAS3 com R$ 0,03).
 STOP_MINIMO_ATR = 0.6
 
+# Tipos de conta do MT5. Fora das funções porque agora são DUAS as que
+# precisam conferir isto: o envio e a movimentação de stop.
+_TIPOS_CONTA = {0: "DEMO", 1: "CONCURSO", 2: "REAL"}
+
 
 class OrdemRecusada(RuntimeError):
     """Recusa ANTES de qualquer coisa sair da máquina.
 
     Distinta de falha do servidor: se isto sobe, nada foi enviado e nada
     precisa ser desfeito."""
+
+
+def _conferir_tipo_conta(conta) -> str:
+    """Devolve o tipo da conta, recusando se não for o exigido.
+
+    Vale para tudo que escreve na corretora, e não só para o envio: apertar o
+    stop de uma posição também é uma escrita, e a trava que impede este módulo
+    de tocar em dinheiro de verdade não pode ter porta dos fundos."""
+    tipo = _TIPOS_CONTA.get(conta.trade_mode, str(conta.trade_mode))
+    if tipo != MODO_CONTA_EXIGIDO:
+        raise OrdemRecusada(
+            f"Conta é {tipo} e este módulo só opera em {MODO_CONTA_EXIGIDO}: "
+            f"login {conta.login} em {conta.server}. Nada foi enviado."
+        )
+    return tipo
 
 
 def _normalizar_volume(info, volume: float) -> float:
@@ -423,13 +442,7 @@ def enviar_ordem_mercado(
 
     conta = _mt5_conectar(mt5)
     try:
-        tipos = {0: "DEMO", 1: "CONCURSO", 2: "REAL"}
-        tipo = tipos.get(conta.trade_mode, str(conta.trade_mode))
-        if tipo != MODO_CONTA_EXIGIDO:
-            raise OrdemRecusada(
-                f"Conta é {tipo} e este módulo só opera em {MODO_CONTA_EXIGIDO}: "
-                f"login {conta.login} em {conta.server}. Nada foi enviado."
-            )
+        tipo = _conferir_tipo_conta(conta)
 
         if not mt5.symbol_select(symbol, True):
             raise OrdemRecusada(f"Símbolo {symbol} não existe nesta conta ({mt5.last_error()}).")
@@ -538,6 +551,158 @@ def enviar_ordem_mercado(
 
 
 # ==========================================================================
+# Proteção do stop de uma posição já aberta (2026-08-14)
+#
+# Até aqui a única saída que o sistema tinha era o par `sl`/`tp` que sai
+# grudado na ordem de abertura: ou o preço batia num, ou no outro, ou a
+# posição ficava. A ITUB4 aberta em 12/08 mostrou o buraco — dois dias no ar,
+# +1,86R não realizados, alvo a 0,43 de distância que o preço nunca alcançou,
+# e nada em lugar nenhum capaz de transformar aquele lucro em dinheiro. Um
+# recuo normal devolveria os +1,86R e ainda cobraria -1,00R.
+#
+# A regra é uma só, e a mesma nas duas pontas: passando de `gatilho_r` de
+# avanço, o stop passa a andar a `distancia_r` atrás do preço. Com 0,8/0,8 a
+# primeira mexida cai exatamente no zero a zero, e daí em diante é trailing.
+#
+# O que torna isto seguro de rodar até com o ENVIO desligado é o invariante:
+# **o stop só aperta**. Nunca afrouxa, nunca se afasta do preço, nunca
+# aumenta exposição. Por isso `mover_stop` compara contra o `sl` que está NA
+# CORRETORA no instante da escrita, e não contra o banco: se alguém mexeu à
+# mão, a mão vence.
+# ==========================================================================
+
+
+def _arredondar_stop(bruto: float, comprar: bool, digitos: int) -> float:
+    """Arredonda o stop PARA LONGE do preço — piso na compra, teto na venda.
+
+    O inverso de `_alvo_por_rr`, e pela razão simétrica: lá o alvo não podia
+    encurtar, aqui o stop não pode apertar mais do que a conta pediu. Em papel
+    de R$ 4 o tique de um centavo é uma fatia grande da distância.
+
+    A folga de 1e-9 é contra a representação binária, e é o que torna esta
+    função IDEMPOTENTE: o mesmo valor passa por ela duas vezes (a política
+    calcula, e `mover_stop` reconfere depois de afastar pelo `stops_level`), e
+    39,41 vale 3940,9999... vezes cem — sem a folga, o piso comeria um centavo
+    a cada passada."""
+    fator = 10 ** digitos
+    escala = bruto * fator
+    if comprar:
+        return math.floor(escala + 1e-9) / fator
+    return math.ceil(escala - 1e-9) / fator
+
+
+def stop_protegido(direcao: str, preco_executado: float, preco_atual: float,
+                   risco: float, *, gatilho_r: float, distancia_r: float,
+                   digitos: int = 2) -> float | None:
+    """Onde o stop DEVERIA estar, dado o quanto o preço já andou a favor.
+
+    Função pura, sem MT5: é a política, e quem a aplica é o executor. `risco`
+    é o R ORIGINAL da ordem (|preço executado − stop do envio|), imutável —
+    medir contra o stop já movido faria a proteção se perseguir, encolhendo o
+    R a cada passada até fechar a posição na primeira oscilação.
+
+    Devolve None enquanto o avanço não chega ao gatilho, que é o caso comum:
+    quem chama não faz nada e a posição segue com o stop do envio."""
+    if risco <= 0 or gatilho_r <= 0 or distancia_r <= 0:
+        return None
+    comprar = direcao == "COMPRA"
+    avanco = (preco_atual - preco_executado) if comprar else (preco_executado - preco_atual)
+    if avanco < gatilho_r * risco:
+        return None
+    bruto = (preco_atual - distancia_r * risco) if comprar else (preco_atual + distancia_r * risco)
+    return _arredondar_stop(bruto, comprar, digitos)
+
+
+def mover_stop(mt5, ticket: int, novo_stop: float, *,
+               simular: bool = False) -> dict | None:
+    """Aperta o stop de uma posição aberta. NÃO abre, não fecha, não aumenta.
+
+    NÃO conecta nem desconecta — mesma convenção de `consultar_posicao`, e
+    pelo mesmo motivo: quem chama percorre um lote.
+
+    Devolve None para "não havia o que fazer" (posição já fechou, ou o stop
+    proposto não é melhor que o que está lá). Isso é o caso COMUM, chamada a
+    cada passada da reconciliação, e por isso não é exceção: só é
+    `OrdemRecusada` o que denuncia configuração ou estado errado.
+
+    ⚠️ `TRADE_ACTION_SLTP` grava OS DOIS níveis da posição. Mandar só `sl`
+    apaga o alvo — e o alvo é hoje a única saída que de fato funciona. Por
+    isso o `tp` vivo é relido e reenviado igual, e é o que a conferência pós
+    deploy tem que olhar primeiro."""
+    conta = mt5.account_info()
+    if conta is None:
+        raise OrdemRecusada(f"Sem informação da conta ({mt5.last_error()}).")
+    _conferir_tipo_conta(conta)
+
+    # Releitura logo antes de escrever, e não o estado que o chamador já tem:
+    # entre a leitura do lote e esta linha o preço andou, e o `sl` pode até ter
+    # sido movido à mão. Quem manda é o que está na corretora agora.
+    posicoes = mt5.positions_get(ticket=ticket)
+    if not posicoes:
+        return None
+    p = posicoes[0]
+    comprar = p.type == mt5.POSITION_TYPE_BUY
+    preco = float(p.price_current)
+
+    info = mt5.symbol_info(p.symbol)
+    if info is None:
+        raise OrdemRecusada(f"Sem informação do símbolo {p.symbol} ({mt5.last_error()}).")
+
+    # Distância mínima que o servidor aceita entre o stop e o preço. Abaixo
+    # dela a resposta é "Invalid stops" (10016) — recusa que não diz nada a
+    # quem lê o log dois dias depois. Afasta em vez de tentar e falhar.
+    minimo = float(getattr(info, "trade_stops_level", 0) or 0) * float(info.point or 0.0)
+    if minimo:
+        limite = preco - minimo if comprar else preco + minimo
+        novo_stop = min(novo_stop, limite) if comprar else max(novo_stop, limite)
+    novo_stop = _arredondar_stop(novo_stop, comprar, getattr(info, "digits", 2) or 2)
+
+    # Só aperta. `sl == 0` é posição SEM stop na corretora (não um stop no
+    # zero), e aí qualquer valor do lado certo é melhora.
+    anterior = float(p.sl or 0.0)
+    if anterior:
+        melhora = novo_stop > anterior if comprar else novo_stop < anterior
+        if not melhora:
+            return None
+
+    # Do lado certo do preço de agora. Reaproveita a trava do envio: um stop
+    # do lado errado fecharia a posição a mercado na hora.
+    _conferir_coerencia("COMPRA" if comprar else "VENDA", preco, novo_stop, None)
+
+    pedido = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "position": int(ticket),
+        "symbol": p.symbol,
+        "sl": float(novo_stop),
+        # O alvo vivo, reenviado igual. Ver o aviso da docstring.
+        "tp": float(p.tp or 0.0),
+    }
+    base = {
+        "symbol": p.symbol, "ticket": int(ticket),
+        "stop_anterior": anterior or None, "stop_novo": novo_stop,
+        "alvo": float(p.tp or 0.0) or None, "preco_atual": preco,
+    }
+
+    if simular:
+        # `order_check` só no ensaio: no caminho valendo ele seria uma ida a
+        # mais ao servidor para validar margem, que numa mudança de stop não
+        # muda. Aqui vale, porque é o único jeito de conferir sem escrever.
+        checagem = mt5.order_check(pedido)
+        return {**base, "simulado": True, "enviado": False,
+                "retcode": getattr(checagem, "retcode", None),
+                "comentario": getattr(checagem, "comment", None)}
+
+    resultado = mt5.order_send(pedido)
+    if resultado is None:
+        raise OrdemRecusada(f"order_send (SLTP) não respondeu ({mt5.last_error()}).")
+    return {
+        **base, "simulado": False,
+        "enviado": resultado.retcode == mt5.TRADE_RETCODE_DONE,
+        "retcode": resultado.retcode, "comentario": resultado.comment,
+    }
+
+
+# ==========================================================================
 # Leitura do desfecho
 #
 # Daqui pra baixo nada envia ordem: é a reconciliação, que pergunta à
@@ -619,6 +784,15 @@ def consultar_posicao(mt5, ticket: int) -> dict | None:
             "volume_saida": None,
             "motivo_saida": None,
             "abertura_em": hora_do_mt5(p.time),
+            # Os quatro abaixo existem só enquanto a posição está viva, e são
+            # o que a proteção de stop precisa: onde ela abriu, quanto vale
+            # agora, e onde estão os dois níveis NA CORRETORA (que podem ter
+            # sido movidos à mão desde o envio). `sl`/`tp` em zero significam
+            # "não tem", não "está no zero" — daí o `or None`.
+            "sl": float(p.sl) or None,
+            "tp": float(p.tp) or None,
+            "preco_abertura": float(p.price_open),
+            "preco_atual": float(p.price_current),
         }
 
     deals = mt5.history_deals_get(position=ticket)
@@ -660,4 +834,7 @@ def consultar_posicao(mt5, ticket: int) -> dict | None:
         "volume_saida": volume_saida,
         "motivo_saida": _motivo_da_saida(mt5, ultima.reason),
         "abertura_em": hora_do_mt5(entrada.time) if entrada else None,
+        # Mesma forma nos dois ramos, para quem consome não ter que adivinhar
+        # quais chaves existem. Posição fechada não tem mais níveis vivos.
+        "sl": None, "tp": None, "preco_abertura": None, "preco_atual": None,
     }

@@ -388,6 +388,11 @@ class OrdemFechamento(BaseModel):
     preco_saida: float | None = None
     volume_saida: float | None = None
     motivo_saida: str | None = None   # STOP | ALVO | MANUAL | EXPERT | MARGEM | OUTRO
+    # O stop VIVO na corretora nesta passada (o trailing move, e a mão também).
+    # Vem junto do fechamento, e não em rota própria, porque é a mesma ida por
+    # ordem por minuto que a reconciliação já faz. Nulo NÃO apaga o guardado —
+    # ver o COALESCE em `registrar_fechamento_ordem`.
+    stop_atual: float | None = None
 
 
 class OrdemOut(BaseModel):
@@ -433,6 +438,11 @@ class OrdemOut(BaseModel):
     resultado_reais: float | None = None
     motivo_saida: str | None = None
     conciliado_em: datetime | None = None
+    # Onde o stop está agora, contra `stop`, que é onde ele SAIU. Divergem
+    # quando o trailing agiu — e é isso que distingue uma saída protegida de
+    # um -1,00R. Ver o comentário das colunas em schema.sql.
+    stop_atual: float | None = None
+    stop_movido_em: datetime | None = None
     # Quanto o preenchimento andou contra a entrada modelada, em R planejado
     # (positivo = preencheu pior). Ver o comentário da coluna em schema.sql:
     # é a variável que explicou o prejuízo das 39 primeiras ordens.

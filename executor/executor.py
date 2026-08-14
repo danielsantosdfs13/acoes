@@ -25,9 +25,15 @@ aconteceu com cada posição em curso e grava o desfecho — preço de saída,
 motivo (STOP/ALVO/MANUAL) e resultado em reais, líquido de corretagem. É o
 que transforma "mandei 40 ordens" em "estas regras deram dinheiro".
 
-Ela roda mesmo com `ORDENS_HABILITADAS` desligado, porque ler o desfecho do
-que já saiu não manda nada — e é justamente o que se quer poder fazer depois
-de desligar o envio.
+Ela também é quem PROTEGE o stop (2026-08-14): passando de `PROTECAO_GATILHO_R`
+de avanço, o stop da posição passa a andar `PROTECAO_DISTANCIA_R` atrás do
+preço. É a única saída do sistema que não é o `sl`/`tp` do envio — antes dela,
+uma posição com lucro no papel só tinha dois destinos, e nenhum era realizar.
+
+Ela roda mesmo com `ORDENS_HABILITADAS` desligado. Enquanto só lia, o
+argumento era que ler não manda nada; agora que ela também aperta stop, o
+argumento é que apertar stop só REDUZ exposição — e desligar o envio é
+exatamente quando se quer que o que já está aberto siga protegido.
 
 As guardas, e o que cada uma evita:
 
@@ -91,9 +97,36 @@ CONCILIACAO_SEGUNDOS = float(os.environ.get("EXECUTOR_CONCILIACAO_SEGUNDOS", "60
 # por mais que isso é assunto de gente, não de laço.
 CONCILIACAO_DIAS = int(os.environ.get("EXECUTOR_CONCILIACAO_DIAS", "30"))
 
+
+def _liga(nome: str, padrao: str) -> bool:
+    return (os.environ.get(nome) or padrao).lower() in ("1", "true", "sim")
+
+
+# Proteção do stop das posições abertas (2026-08-14). LIGADA por padrão, e
+# com interruptor PRÓPRIO — não é o `ORDENS_HABILITADAS`.
+#
+# Parece contradizer o resto do arquivo, onde tudo que escreve na corretora
+# nasce desligado, e não contradiz: aquelas travas existem contra ABRIR
+# posição por engano. Esta escrita só aperta stop, nunca afrouxa (ver o
+# invariante em `execucao.mover_stop`), então o pior caso dela é sair de uma
+# posição cedo demais — enquanto o pior caso de não rodar é a posição de
+# 12/08 que ficou dois dias com +1,86R no papel sem nada capaz de realizá-los.
+# E desligar o envio é exatamente quando mais se quer que o que já está
+# aberto fique protegido, pelo mesmo argumento que faz a reconciliação
+# inteira rodar com o envio desligado.
+PROTECAO_HABILITADA = _liga("EXECUTOR_PROTECAO_STOP", "1")
+# Ensaio: calcula e loga o que faria, sem escrever nada. Para a primeira
+# subida, no molde do `simular=True` do envio.
+PROTECAO_SIMULAR = _liga("EXECUTOR_PROTECAO_SIMULAR", "0")
+# Avanço a partir do qual o stop começa a andar, e distância em que ele
+# segue, ambos em R do risco ORIGINAL da ordem. Com 0,8/0,8 a primeira mexida
+# cai exatamente no zero a zero.
+PROTECAO_GATILHO_R = float(os.environ.get("EXECUTOR_PROTECAO_GATILHO_R", "0.8"))
+PROTECAO_DISTANCIA_R = float(os.environ.get("EXECUTOR_PROTECAO_DISTANCIA_R", "0.8"))
+
 # Interruptor mestre do serviço. Desligado por padrão: instalar e subir o
 # serviço não pode ser a mesma decisão que autorizar envio de ordem.
-ORDENS_HABILITADAS = os.environ.get("ORDENS_HABILITADAS", "").lower() in ("1", "true", "sim")
+ORDENS_HABILITADAS = _liga("ORDENS_HABILITADAS", "")
 
 # Tipo de conta exigido. Só muda quem quiser operar de verdade, e a mudança
 # fica registrada na config do serviço em vez de escondida no código.
@@ -195,12 +228,58 @@ def _conferir_fuso(ordem: dict, abertura_em: datetime | None) -> None:
         )
 
 
-def _conciliar() -> None:
-    """Pergunta à corretora o que aconteceu com cada posição em curso.
+def _proteger(mt5, ordem: dict, preco_atual: float | None) -> float | None:
+    """Aperta o stop desta posição, se o preço já andou o bastante a favor.
 
-    Roda mesmo com `ORDENS_HABILITADAS` desligado: ler o desfecho do que já
-    foi enviado não manda nada, e é exatamente o que se quer poder fazer
-    depois de desligar o envio.
+    Devolve o stop novo quando MOVEU de verdade, e None em qualquer outro
+    caso — inclusive no ensaio (`PROTECAO_SIMULAR`), porque lá a corretora
+    continua com o stop antigo e gravar o proposto como se fosse o vivo
+    inventaria um nível que não existe.
+
+    O R vem de `preco_executado` e `stop` da linha de `ordens`, que são o
+    preenchimento e o stop DO ENVIO e não mudam nunca — `ordens.stop` não é
+    reescrito quando o stop se move, ou `risco_efetivo`, `resultado_r` e o
+    recorte `por_rr_envio` passariam a medir outra coisa."""
+    entrada, stop = ordem.get("preco_executado"), ordem.get("stop")
+    ticket = ordem.get("ticket")
+    if not entrada or not stop or not preco_atual or not ticket:
+        return None
+    risco = abs(entrada - stop)
+    if risco <= 0:
+        return None
+
+    info = mt5.symbol_info(ordem["symbol"])
+    candidato = execucao.stop_protegido(
+        ordem["direcao"], entrada, preco_atual, risco,
+        gatilho_r=PROTECAO_GATILHO_R, distancia_r=PROTECAO_DISTANCIA_R,
+        digitos=(getattr(info, "digits", 2) or 2) if info else 2,
+    )
+    if candidato is None:
+        return None
+
+    r = execucao.mover_stop(mt5, int(ticket), candidato, simular=PROTECAO_SIMULAR)
+    if r is None:                      # não era melhora, ou a posição já fechou
+        return None
+
+    sentido = 1 if ordem["direcao"] == "COMPRA" else -1
+    travado = (r["stop_novo"] - entrada) * sentido / risco
+    log.info(
+        "PROTEGENDO%s %s ticket=%s stop %s → %s (%+.2fR travado, preço %s)",
+        " [ENSAIO]" if PROTECAO_SIMULAR else "", ordem["symbol"], ticket,
+        r["stop_anterior"], r["stop_novo"], travado, r["preco_atual"],
+    )
+    return None if PROTECAO_SIMULAR else r["stop_novo"]
+
+
+def _conciliar() -> None:
+    """Pergunta à corretora o que aconteceu com cada posição em curso — e,
+    de passagem, aperta o stop do que já andou a favor.
+
+    Roda mesmo com `ORDENS_HABILITADAS` desligado. Isso era trivialmente
+    verdade enquanto ela só LIA; com a proteção de stop (2026-08-14) deixou
+    de ser, e continua valendo por um argumento a mais: a única escrita que
+    ela faz aperta o stop, nunca o afrouxa, então não abre posição nem
+    aumenta exposição. Ver `PROTECAO_HABILITADA`.
 
     Uma conexão para o lote inteiro — o `_tem_posicao` conecta e desconecta
     por chamada, o que aqui viraria N conexões por ciclo."""
@@ -227,12 +306,31 @@ def _conciliar() -> None:
 
             _conferir_fuso(ordem, estado.pop("abertura_em", None))
             fechou = not estado.pop("aberta")
+            # O stop VIVO na corretora, que pode não ser o do envio: ou porque
+            # a proteção logo abaixo o moveu, ou porque alguém mexeu à mão. Vai
+            # pro banco em toda passada, e é o que distingue depois uma saída
+            # protegida de um -1R do plano original.
+            stop_vivo = estado.pop("sl", None)
+            preco_atual = estado.pop("preco_atual", None)
+            estado.pop("tp", None)
+            estado.pop("preco_abertura", None)
+
+            if not fechou and PROTECAO_HABILITADA:
+                try:
+                    movido = _proteger(mt5, ordem, preco_atual)
+                except Exception as exc:  # noqa: BLE001 — não pode impedir a gravação
+                    log.warning("ordem %s: falha ao proteger o stop: %s",
+                                ordem["signal_id"], exc)
+                else:
+                    stop_vivo = movido or stop_vivo
+
             _registrar_fechamento(ordem["signal_id"], {
                 "resultado_reais": estado["resultado_reais"],
                 "fechado_em": estado["fechado_em"].isoformat() if estado["fechado_em"] else None,
                 "preco_saida": estado["preco_saida"],
                 "volume_saida": estado["volume_saida"],
                 "motivo_saida": estado["motivo_saida"],
+                "stop_atual": stop_vivo,
             })
             if fechou:
                 log.info(
@@ -455,6 +553,12 @@ def main() -> None:
         "Executor — api=%s ciclo=%ss frescor=%smin | conta %s (%s) tipo=%s",
         API_URL, CICLO_SEGUNDOS, FRESCOR_MAXIMO_MINUTOS,
         conta["login"], conta["servidor"], conta["tipo"],
+    )
+    log.info(
+        "Proteção de stop: %s (gatilho %sR, distância %sR)%s",
+        "LIGADA" if PROTECAO_HABILITADA else "desligada",
+        PROTECAO_GATILHO_R, PROTECAO_DISTANCIA_R,
+        " — ENSAIO, nada será escrito na corretora" if PROTECAO_SIMULAR else "",
     )
     if not ORDENS_HABILITADAS:
         log.warning(

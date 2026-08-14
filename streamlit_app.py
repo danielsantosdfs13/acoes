@@ -1208,6 +1208,13 @@ def _linha_ordem(o: dict) -> dict:
     criado = pd.Timestamp(o["criado_em"]).tz_convert("America/Sao_Paulo")
     regra = " · ".join(x for x in (o.get("perfil"), o.get("modalidade"),
                                    o.get("timeframe")) if x)
+    # `stop_atual` é onde o stop está AGORA; `stop`, onde ele saiu. Divergem
+    # quando o trailing agiu — e uma saída por stop movido não é o -1R do
+    # plano, então a linha tem que dizer isso antes de alguém somar as duas
+    # como se fossem a mesma coisa.
+    stop_vivo = o.get("stop_atual") or o.get("stop")
+    protegido = (o.get("stop_atual") is not None and o.get("stop") is not None
+                 and abs(o["stop_atual"] - o["stop"]) > 1e-9)
     return {
         "Quando": criado.strftime("%d/%m %H:%M"),
         # Marcado na linha, e não só escondido pelo filtro: quem ligou o
@@ -1217,8 +1224,11 @@ def _linha_ordem(o: dict) -> dict:
         "Direção": o["direcao"],
         "Qtd": None if o.get("volume") is None else int(o["volume"]),
         "Entrada": o.get("preco_executado"),
+        "Stop": stop_vivo,
         "Saída": o.get("preco_saida"),
-        "Motivo": o.get("motivo_saida") or ("em aberto" if o["status"] == "ENVIADA" else "—"),
+        "Motivo": (("🔒 " if protegido else "") +
+                   (o.get("motivo_saida")
+                    or ("em aberto" if o["status"] == "ENVIADA" else "—"))),
         "Resultado (R$)": None if o.get("resultado_reais") is None
                           else round(o["resultado_reais"], 2),
         "R": None if o.get("resultado_r") is None else round(o["resultado_r"], 2),
@@ -1625,8 +1635,12 @@ def render_ordens() -> None:
     if not ordens:
         st.caption("Nenhuma ordem neste recorte.")
     else:
-        st.caption(f"{dados['total']} ordem(ns) no recorte · mostrando as "
-                   f"{len(ordens)} mais recentes")
+        st.caption(
+            f"{dados['total']} ordem(ns) no recorte · mostrando as "
+            f"{len(ordens)} mais recentes · **Stop** é onde ele está agora, e "
+            "🔒 marca stop já movido pela proteção: se a saída vier por ele, "
+            "não é o −1R do plano original."
+        )
         tabela = pd.DataFrame([_linha_ordem(o) for o in ordens])
         selecao = st.dataframe(
             tabela, hide_index=True, use_container_width=True,

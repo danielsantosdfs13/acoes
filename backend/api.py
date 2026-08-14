@@ -1400,7 +1400,7 @@ _ORDEM_CAMPOS_ORDEM = (
     "preco_executado", "stop", "alvo", "conta", "servidor", "tipo_conta", "ticket",
     "status", "retcode", "mensagem", "criado_em", "enviado_em", "teste",
     "fechado_em", "preco_saida", "volume_saida", "resultado_reais", "motivo_saida",
-    "conciliado_em", "desvio_entrada_r",
+    "conciliado_em", "desvio_entrada_r", "stop_atual", "stop_movido_em",
 )
 # Vêm do SINAL, por join. É o que diz QUAL REGRA produziu a ordem: as regras
 # de `auto_ordem` têm chave (perfil, modalidade, timeframe), e nenhum desses
@@ -1526,17 +1526,38 @@ def registrar_fechamento_ordem(
     Chamada REPETIDAMENTE enquanto a posição está aberta, com `fechado_em`
     nulo e o resultado não realizado do momento — é isso que faz a tela
     mostrar "3 abertas, +R$ 48 no papel". A gravação é idempotente por
-    construção: sobrescreve os mesmos campos."""
+    construção: sobrescreve os mesmos campos.
+
+    `stop_atual` é a exceção: entra por COALESCE, e não por sobrescrita. A
+    passada em que a posição aparece FECHADA não tem mais stop vivo pra ler, e
+    sobrescrever com nulo apagaria justamente o nível em que ela morreu — o
+    único dado que depois distingue uma saída protegida de um -1,00R.
+    `stop_movido_em` só anda quando o valor muda de fato; no Postgres todo
+    `SET` enxerga a linha ANTIGA, então os dois se leem coerentes."""
     with conn.cursor() as cur:
         cur.execute(
             """
             UPDATE ordens SET resultado_reais = %s, fechado_em = %s, preco_saida = %s,
-                   volume_saida = %s, motivo_saida = %s, conciliado_em = now()
+                   volume_saida = %s, motivo_saida = %s, conciliado_em = now(),
+                   -- Os casts não são decoração: num parâmetro solto dentro de
+                   -- `IS NOT NULL` o Postgres não tem de onde inferir o tipo e
+                   -- recusa a consulta inteira ("could not determine data type
+                   -- of parameter") — o que só aparece quando o valor chega
+                   -- NULO, que é justamente toda passada de posição fechada. No
+                   -- COALESCE ele infere da coluna.
+                   -- (E nada de escrever um marcador de parâmetro aqui dentro:
+                   --  o psycopg conta os que estão em comentário também.)
+                   stop_movido_em = CASE
+                       WHEN %s::double precision IS NOT NULL
+                        AND %s::double precision IS DISTINCT FROM stop_atual
+                       THEN now() ELSE stop_movido_em END,
+                   stop_atual = COALESCE(%s, stop_atual)
              WHERE signal_id = %s
             RETURNING signal_id
             """,
             (body.resultado_reais, body.fechado_em, body.preco_saida,
-             body.volume_saida, body.motivo_saida, signal_id),
+             body.volume_saida, body.motivo_saida,
+             body.stop_atual, body.stop_atual, body.stop_atual, signal_id),
         )
         if cur.fetchone() is None:
             raise HTTPException(

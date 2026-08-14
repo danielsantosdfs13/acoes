@@ -420,6 +420,22 @@ ALTER TABLE ordens ADD COLUMN IF NOT EXISTS teste BOOLEAN NOT NULL DEFAULT false
 -- `/ordens/stats` responde.
 ALTER TABLE ordens ADD COLUMN IF NOT EXISTS desvio_entrada_r DOUBLE PRECISION;
 
+-- Onde o stop está NA CORRETORA agora, e quando ele mudou pela última vez
+-- (2026-08-14). Escrito pela reconciliação a cada passada, com o `sl` vivo da
+-- posição — então também registra stop movido à mão.
+--
+-- `stop` continua sendo o nível que SAIU no envio, e não pode ser reescrito:
+-- é dele que saem `risco_efetivo`, `resultado_r` e o recorte `por_rr_envio`.
+-- Com o trailing, os dois passam a divergir de propósito.
+--
+-- Sem esta coluna a medição mente por omissão: uma posição fechada pelo stop
+-- JÁ MOVIDO grava `motivo_saida='STOP'` exatamente igual a um -1,00R do plano
+-- original, e "o trailing ajudou ou atrapalhou?" fica sem resposta possível.
+-- Mesmo defeito que `risco_efetivo` e `desvio_entrada_r` tiveram: os dois só
+-- existiram como pergunta depois de alguém gravar a coluna.
+ALTER TABLE ordens ADD COLUMN IF NOT EXISTS stop_atual      DOUBLE PRECISION;
+ALTER TABLE ordens ADD COLUMN IF NOT EXISTS stop_movido_em  TIMESTAMPTZ;
+
 -- Índice PARCIAL pelo mesmo motivo do `signals_pendentes_idx`: o alvo da
 -- reconciliação é "o que saiu e ainda não fechou", um conjunto que ENCOLHE
 -- sozinho — a linha sai do índice assim que o fechamento é gravado.
