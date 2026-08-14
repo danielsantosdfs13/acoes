@@ -249,6 +249,11 @@ class StatsResponse(BaseModel):
     por_symbol: list[StatsRow]
     por_direcao: list[StatsRow]
     por_faixa_score: list[StatsRow]
+    # Recorte por RVOL, lido do JSONB `detalhes->>'rvol'`. As faixas são as do
+    # harness de 2026-08-12, que mediu o gate de volume atual (1,3-2,0×) como
+    # a pior faixa de todas — é o recorte que responde "devo confiar mais num
+    # sinal de volume baixo?" em produção, sem tocar no motor.
+    por_rvol: list[StatsRow]
     por_mtf: list[StatsRow]
     # Recorte pela decisão do operador. É o que responde "acertei mais no
     # que eu escolhi operar do que na média?" — a única pergunta que

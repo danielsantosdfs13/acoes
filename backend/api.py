@@ -733,12 +733,30 @@ WITH base AS (
            CASE WHEN resultado IN ('ALVO_1', 'ALVO_2') THEN 1
                 WHEN resultado  =  'STOP'              THEN 0
            END AS acerto,
-           CASE WHEN score >= 80 THEN '80+'
+           -- Separa 90-100 do resto do antigo "80+": o harness de 2026-08-12
+           -- mediu o topo do score como a PIOR faixa (expR −0,25, e 100%
+           -- Confluência), enquanto 70-80 é a melhor. Um recorte "80+"
+           -- agrupando as duas esconderia exatamente esse sinal.
+           CASE WHEN score >= 90 THEN '90-100'
+                WHEN score >= 80 THEN '80-90'
                 WHEN score >= 70 THEN '70-80'
                 WHEN score >= 60 THEN '60-70'
                 WHEN score >= 40 THEN '40-60'
                 ELSE '<40'
-           END AS faixa_score
+           END AS faixa_score,
+           -- RVOL lido do JSONB `detalhes`: o motor grava `context.rvol` ali
+           -- desde sempre, mas nenhum recorte o lia. As faixas são as MESMAS
+           -- do harness (`scripts/analisar-varredura.py`), ancoradas no gate
+           -- de volume que `candle_patterns` e `_confirmed_breakout` já
+           -- aplicam — e que a varredura de 2026-08-12 mediu como a pior
+           -- faixa. Recorte novo para responder isso em produção.
+           CASE WHEN NOT (detalhes ? 'rvol') THEN 'sem dado'
+                WHEN (detalhes->>'rvol')::float < 0.8 THEN 'a) < 0,8'
+                WHEN (detalhes->>'rvol')::float < 1.0 THEN 'b) 0,8-1,0'
+                WHEN (detalhes->>'rvol')::float < 1.3 THEN 'c) 1,0-1,3'
+                WHEN (detalhes->>'rvol')::float < 2.0 THEN 'd) 1,3-2,0'
+                ELSE 'e) >= 2,0'
+           END AS faixa_rvol
     FROM signals s
     {_FEEDBACK_LATERAL}
     WHERE s.resultado IS NOT NULL
@@ -800,8 +818,16 @@ def _stats_rows(cur, recorte: str, filtros: dict) -> list[StatsRow]:
     summary="Taxa de acerto histórica do motor",
     description=(
         "Quanto o motor acertou de verdade, quebrado por modalidade e ainda por "
-        "timeframe, ação, direção, faixa de score, confirmação multi-timeframe e "
-        "decisão do operador. É a tool pra 'vale a pena confiar neste sinal?'.\n\n"
+        "timeframe, ação, direção, faixa de score, RVOL, confirmação "
+        "multi-timeframe e decisão do operador. É a tool pra 'vale a pena "
+        "confiar neste sinal?'.\n\n"
+        "Dois recortes novos no 2026-08-14, vindos de uma varredura com régua do "
+        "acaso (~422 mil avaliações, cada candle com um trade cara-ou-coroa de "
+        "referência): a faixa de score 90-100 mediu a PIOR expectativa (−0,25R, "
+        "e 100% Confluência) com 70-80 como a melhor — um recorte '80+' unificado "
+        "escondia isso; e `por_rvol` lê `detalhes->>'rvol'` (faixas do harness: "
+        "o gate de volume atual 1,3-2,0× mediu a pior faixa). São medições, não "
+        "decisões de motor — existem para acompanhar o comportamento em produção.\n\n"
         "`por_feedback` recorta pelo que a PESSOA decidiu (ACOMPANHAR, OPERAR, "
         "IGNORAR, OPEREI, CANCELEI, ou PENDENTE quando não decidiu nada), e o filtro "
         "`acao` restringe a conta a um desses grupos — é assim que se responde "
@@ -858,14 +884,15 @@ def get_signal_stats(
         por_symbol = _stats_rows(cur, "symbol", filtros)
         por_direcao = _stats_rows(cur, "direcao", filtros)
         por_faixa_score = _stats_rows(cur, "faixa_score", filtros)
+        por_rvol = _stats_rows(cur, "faixa_rvol", filtros)
         por_mtf = _stats_rows(cur, "mtf_confirmado::text", filtros)
         por_feedback = _stats_rows(cur, "feedback", filtros)
 
     return StatsResponse(
         filtros=filtros, total=sum(linha.n for linha in geral),
         geral=geral, por_timeframe=por_timeframe, por_symbol=por_symbol,
-        por_direcao=por_direcao, por_faixa_score=por_faixa_score, por_mtf=por_mtf,
-        por_feedback=por_feedback,
+        por_direcao=por_direcao, por_faixa_score=por_faixa_score,
+        por_rvol=por_rvol, por_mtf=por_mtf, por_feedback=por_feedback,
     )
 
 

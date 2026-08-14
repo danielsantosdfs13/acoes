@@ -728,6 +728,7 @@ RECORTE_LABELS = {
     "por_symbol": "Ativo",
     "por_direcao": "Direção",
     "por_faixa_score": "Faixa de score",
+    "por_rvol": "RVOL",
     "por_mtf": "Confirmado no multi-timeframe",
     # O recorte que justifica coletar feedback: responde "acertei mais no
     # que eu escolhi operar do que na média?". `PENDENTE` agrupa os sinais

@@ -4,3 +4,9 @@ __pycache__
 # ACOES_API_URL não está configurada (ver load_symbols/load_profiles).
 daytrade_symbols.json
 daytrade_profiles.json
+
+# Saídas da varredura de parâmetros (scripts/varrer-parametros.py): o JSON de
+# resultado tem ~117MB e o cache de velas é derivável — nenhum dos dois é
+# fonte de verdade, são artefatos de medição local.
+varredura-resultado.json
+.cache-velas/

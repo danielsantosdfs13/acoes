@@ -590,7 +590,7 @@ neutra, não.
 | DELETE | `/profiles/{nome}` | `X-API-Key` | soft-delete (`ativo=false`); 400 no perfil `padrão` |
 | POST | `/signals` | `X-API-Key` | grava um sinal; devolve `duplicado=true` se a vela já tinha aquele registro |
 | GET | `/signals` | `X-API-Key` | histórico com filtros (symbol, timeframe, modalidade, perfil, origem, resultado, dias, limite) |
-| GET | `/signals/stats` | `X-API-Key` | assertividade por modalidade, com recortes por timeframe, ativo, direção, faixa de score e confirmação MTF |
+| GET | `/signals/stats` | `X-API-Key` | assertividade por modalidade, com recortes por timeframe, ativo, direção, faixa de score, RVOL e confirmação MTF |
 
 **`analyzer`** — worker, sem porta e sem Service: não expõe rota nenhuma.
 

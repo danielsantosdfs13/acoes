@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -89,7 +90,7 @@ def buscar_candles(api: str, symbol: str, timeframe: str, count: int, cache: Pat
 
 
 def varrer_par(df, params: AnalysisParams, rrs: tuple[float, ...],
-               rr2: float | None = None) -> list[dict]:
+               rr2: float | None = None, baseline: bool = False) -> list[dict]:
     """Um par symbol/timeframe, vela a vela, com o desfecho já resolvido.
 
     DUAS decisões de memória, ambas aprendidas na marra (a primeira versão
@@ -115,6 +116,11 @@ def varrer_par(df, params: AnalysisParams, rrs: tuple[float, ...],
     já davam.
     """
     linhas: list[dict] = []
+    # Semente fixa por configuração: o mesmo par sorteia a mesma sequência em
+    # toda execução, então duas varreduras comparam o MESMO acaso — sem ela,
+    # a própria mudança de sorte viraria "diferença de parâmetro" (a mesma
+    # armadilha que o cache de velas já evita para a série).
+    aleatorio = random.Random(20260812)
     for i in range(WARMUP, len(df) - 1):
         historico = df.iloc[: i + 1]
         futuro = df.iloc[i + 1 :]
@@ -124,6 +130,45 @@ def varrer_par(df, params: AnalysisParams, rrs: tuple[float, ...],
             contexto, sinais = analyze(historico, params)
         except Exception:  # noqa: BLE001 — uma vela ruim não derruba a série
             continue
+
+        if baseline:
+            # BASELINE DE ACASO: um trade cara-ou-coroa neste mesmo candle,
+            # com o mesmo perfil de risco que o motor usa (entrada no close,
+            # stop a 1 ATR, alvo no rr) e direção sorteada. Serve de régua:
+            # "quanto um sorteio teria pago neste mercado, nesta janela?".
+            # Avaliado no MESMO `futuro` dos sinais reais, por isso compara
+            # de igual para igual. Roda por candle — não por sinal — porque
+            # a pergunta é sobre o mercado, não sobre onde o motor decidiu.
+            fechamento = float(historico["close"].iloc[-1])
+            atr_atual = float(contexto.atr or 0.0)
+            if atr_atual > 0:
+                for rr in rrs:
+                    direcao = Direction.BUY if aleatorio.random() < 0.5 else Direction.SELL
+                    risco = atr_atual
+                    if direcao == Direction.BUY:
+                        stop = fechamento - risco
+                        alvo = fechamento + rr * risco
+                    else:
+                        stop = fechamento + risco
+                        alvo = fechamento - rr * risco
+                    plano = RiskPlan(entry=fechamento, stop=stop,
+                                     target_1=alvo, target_2=None)
+                    desfecho = evaluate_signal_outcome(plano, direcao, futuro)
+                    linhas.append({
+                        "candle_time": historico.index[-1].isoformat(),
+                        "modalidade": "BASELINE",
+                        "direcao": str(direcao),
+                        "score": 0.0,
+                        "confianca": 0.0,
+                        "rvol": round(float(contexto.rvol), 4),
+                        "atr_pct": round(float(contexto.atr_pct), 4),
+                        "volatilidade": str(contexto.volatility),
+                        "rr": rr,
+                        "resultado": desfecho.resultado,
+                        "r": (round(float(desfecho.r_realizado), 4)
+                              if desfecho.r_realizado is not None else None),
+                        "velas": desfecho.candles_ate_resultado,
+                    })
 
         for sinal in sinais:
             if sinal.direction == Direction.NEUTRAL:
@@ -198,6 +243,12 @@ def main() -> int:
     parser.add_argument("--rr2", type=float, default=None,
                         help="liga o alvo 2 (ex.: 1.8) — só para conferir o "
                              "harness contra /signals/stats, não para calibrar")
+    parser.add_argument("--baseline", action="store_true",
+                        help="avalia, em cada candle, um trade cara-ou-coroa "
+                             "com o mesmo perfil de risco (entrada no close, "
+                             "stop a 1 ATR, alvo no rr) e direção sorteada. "
+                             "São as linhas modalidade=BASELINE que o "
+                             "analisar-varredura usa como régua do acaso")
     parser.add_argument("--saida", default=str(RAIZ / "varredura-resultado.json"))
     parser.add_argument("--cache", default=str(RAIZ / ".cache-velas"))
     args = parser.parse_args()
@@ -248,7 +299,7 @@ def main() -> int:
             if len(df) <= WARMUP + 10:
                 print(f"  {symbol}: ignorado (só {len(df)} velas, warm-up exige {WARMUP})")
                 continue
-            achados = varrer_par(df, params, rrs, args.rr2)
+            achados = varrer_par(df, params, rrs, args.rr2, baseline=args.baseline)
             for linha in achados:
                 linha["symbol"] = symbol
             linhas.extend(achados)
