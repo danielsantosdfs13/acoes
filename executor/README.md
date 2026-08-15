@@ -1,7 +1,7 @@
 # executor — envio automático de ordens
 
 Serviço Windows que transforma sinais em ordens no MetaTrader 5, segundo
-regras de (perfil, modalidade, timeframe).
+regras de (perfil, modalidade, timeframe, ativo).
 
 Roda na **mesma VM do scraper**, e não no k3s, pela mesma razão dele: a
 integração do MT5 é binária de Windows. O `analyzer` é quem gera os sinais,
@@ -108,6 +108,25 @@ curl -X PUT https://acoes-api.dondon.services/auto-ordem \
   -H "X-API-Key: <a chave>" -H "Content-Type: application/json" \
   -d '{"perfil":"fine_tuned_v2","modalidade":"Confluência",
        "timeframe":"M15","risco_maximo":200,"ativo":true}'
+```
+
+A identidade da regra é `(perfil, modalidade, timeframe, symbol)` — o ativo faz
+parte da chave. Sem `symbol` (ou com `""`) a regra vale para **qualquer** ativo,
+que é o comportamento histórico; com `"symbol":"VALE3"` ela só opera aquele
+papel, e pode coexistir com outra regra no mesmo recorte para outro ativo.
+
+`horario_inicio`/`horario_fim` (HH:MM, fuso do pregão) limitam em que horas do
+dia a regra pode enviar. Nulos = sem restrição além do gate de pregão; dá para
+mandar só um dos dois. Uma faixa com início maior que o fim cruza a meia-noite:
+`{"horario_inicio":"22:30","horario_fim":"10:00"}` envia de 22:30 até as 10:00.
+
+```bash
+curl -X PUT https://acoes-api.dondon.services/auto-ordem \
+  -H "X-API-Key: <a chave>" -H "Content-Type: application/json" \
+  -d '{"perfil":"fine_tuned_v2","modalidade":"Confluência",
+       "timeframe":"M15","symbol":"VALE3",
+       "horario_inicio":"10:15","horario_fim":"17:30",
+       "risco_maximo":200,"ativo":true}'
 ```
 
 `risco_maximo` é em **reais**, não em quantidade. A quantidade sai da

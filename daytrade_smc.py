@@ -36,6 +36,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields, replace
+from datetime import datetime, time
 from enum import Enum
 from pathlib import Path
 from urllib.parse import quote
@@ -3387,9 +3388,18 @@ def fetch_auto_ordem(incluir_inativas: bool = False) -> dict:
 
 def save_auto_ordem(perfil: str, modalidade: str, timeframe: str,
                     risco_maximo: float, ativo: bool = True,
-                    exigir_mtf: bool = False) -> dict:
+                    exigir_mtf: bool = False, symbol: str = "",
+                    horario_inicio=None, horario_fim=None) -> dict:
     """Cria, atualiza ou DESLIGA (`ativo=False`) uma regra de ordem
     automática.
+
+    A identidade da regra é (perfil, modalidade, timeframe, symbol):
+    `symbol` vazio = qualquer ativo, preenchido = só aquele papel. É o que
+    permite ter duas regras no mesmo recorte para ativos diferentes.
+
+    `horario_inicio`/`horario_fim` restringem a janela do dia em que a regra
+    pode enviar ordem. Aceitam `datetime.time` ou string 'HH:MM[:SS]'; nulos
+    não restringem nada além do pregão.
 
     Ligar uma regra é o ato que faz o executor passar a mandar ordem naquele
     recorte — quem chama daqui é responsável por isso ser deliberado.
@@ -3398,11 +3408,21 @@ def save_auto_ordem(perfil: str, modalidade: str, timeframe: str,
     sem confirmação multi-timeframe — controlador de risco por regra."""
     import requests
 
+    def _hora(valor):
+        if valor is None:
+            return None
+        if isinstance(valor, time):
+            return valor.isoformat()
+        return str(valor)
+
     response = requests.put(
         f"{_api_base_url()}/auto-ordem",
         json={"perfil": perfil, "modalidade": modalidade,
-              "timeframe": timeframe, "risco_maximo": risco_maximo,
-              "ativo": ativo, "exigir_mtf": exigir_mtf},
+              "timeframe": timeframe, "symbol": symbol or "",
+              "risco_maximo": risco_maximo, "ativo": ativo,
+              "exigir_mtf": exigir_mtf,
+              "horario_inicio": _hora(horario_inicio),
+              "horario_fim": _hora(horario_fim)},
         headers=_api_headers(),
         timeout=_API_TIMEOUT_SECONDS,
     )
@@ -3410,8 +3430,12 @@ def save_auto_ordem(perfil: str, modalidade: str, timeframe: str,
     return response.json()
 
 
-def delete_auto_ordem(perfil: str, modalidade: str, timeframe: str) -> dict:
+def delete_auto_ordem(perfil: str, modalidade: str, timeframe: str,
+                      symbol: str = "") -> dict:
     """Apaga DE VEZ uma regra de ordem automática.
+
+    A chave completa é (perfil, modalidade, timeframe, symbol) — `symbol`
+    vazio apaga a regra de 'qualquer ativo' daquele recorte.
 
     Diferente de desligar (`save_auto_ordem(..., ativo=False)`): desligar
     preserva a regra e o histórico de configuração; apagar remove a linha.
@@ -3422,7 +3446,8 @@ def delete_auto_ordem(perfil: str, modalidade: str, timeframe: str) -> dict:
 
     response = requests.delete(
         f"{_api_base_url()}/auto-ordem",
-        params={"perfil": perfil, "modalidade": modalidade, "timeframe": timeframe},
+        params={"perfil": perfil, "modalidade": modalidade, "timeframe": timeframe,
+                "symbol": symbol or ""},
         headers=_api_headers(),
         timeout=_API_TIMEOUT_SECONDS,
     )

@@ -302,20 +302,56 @@ CREATE TABLE IF NOT EXISTS auto_ordem (
     perfil        TEXT NOT NULL,
     modalidade    TEXT NOT NULL,
     timeframe     TEXT NOT NULL,
+    symbol        TEXT NOT NULL DEFAULT '',
     risco_maximo  NUMERIC NOT NULL,
     ativo         BOOLEAN NOT NULL DEFAULT true,
     exigir_mtf    BOOLEAN NOT NULL DEFAULT false,
+    horario_inicio TIME,
+    horario_fim    TIME,
     criado_em     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (perfil, modalidade, timeframe),
+    PRIMARY KEY (perfil, modalidade, timeframe, symbol),
     CONSTRAINT auto_ordem_risco_chk CHECK (risco_maximo > 0)
 );
 
--- Coluna nova em instalações existentes. O schema roda inteiro a cada
+-- Colunas novas em instalações existentes. O schema roda inteiro a cada
 -- sync (migrate.py), então é CONTIGUO ao CREATE TABLE e idempotente.
--- `exigir_mtf=true` faz o executor recusar ENVIO para sinais sem
--- confirmação multi-timeframe (mtf_confirmado=false) — os 90 dias medem
--- esses sinais consistentemente piores em todas as modalidades.
+--
+-- `symbol` faz parte da CHAVE da regra (vazio = qualquer ativo): sem ele,
+-- não daria pra ter duas regras no mesmo recorte (perfil/modalidade/timeframe)
+-- para ativos diferentes — a identidade da regra é justamente o escopo de
+-- quem ela pode operar. As regras antigas nascem com '' (qualquer ativo),
+-- que é exatamente o que elas sempre foram.
+--
+-- `horario_inicio`/`horario_fim` (TIME, fuso do pregão) limitam EM QUE
+-- HORAS do dia o executor pode enviar ordem daquela regra. Nulos = sem
+-- restrição, além do próprio gate de pregão. `exigir_mtf=true` faz o
+-- executor recusar ENVIO para sinais sem confirmação multi-timeframe
+-- (mtf_confirmado=false) — os 90 dias medem esses sinais consistentemente
+-- piores em todas as modalidades.
+ALTER TABLE auto_ordem ADD COLUMN IF NOT EXISTS symbol TEXT NOT NULL DEFAULT '';
+ALTER TABLE auto_ordem ADD COLUMN IF NOT EXISTS horario_inicio TIME;
+ALTER TABLE auto_ordem ADD COLUMN IF NOT EXISTS horario_fim TIME;
 ALTER TABLE auto_ordem ADD COLUMN IF NOT EXISTS exigir_mtf BOOLEAN NOT NULL DEFAULT false;
+
+-- Troca o PRIMARY KEY de 3 para 4 colunas quando a instalação já existia
+-- (a tabela nova acima já nasce com o PK certo). Idempotente: se `symbol`
+-- já estiver na chave primária, não faz nada.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM pg_index i
+          JOIN pg_attribute a ON a.attrelid = i.indrelid
+                            AND a.attnum = ANY (i.indkey::int2[])
+         WHERE i.indrelid = 'auto_ordem'::regclass
+           AND i.indisprimary
+           AND a.attname = 'symbol'
+    ) THEN
+        RETURN;
+    END IF;
+    ALTER TABLE auto_ordem DROP CONSTRAINT auto_ordem_pkey;
+    ALTER TABLE auto_ordem ADD PRIMARY KEY (perfil, modalidade, timeframe, symbol);
+END $$;
 
 -- ------------------------------------------------------------------
 -- Auditoria de ordens enviadas. É também o mecanismo de "não manda duas

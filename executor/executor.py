@@ -13,7 +13,8 @@ entrega por `make`.
 
 O que faz, a cada ciclo:
 
-  1. lê as regras ativas (`GET /auto-ordem`) — (perfil, modalidade, timeframe)
+  1. lê as regras ativas (`GET /auto-ordem`) — (perfil, modalidade, timeframe,
+     ativo) + faixa de horário autorizada
   2. para cada regra, lê os sinais recentes daquele recorte (`GET /signals`)
   3. descarta o que não deve virar ordem (ver as guardas abaixo)
   4. RESERVA o sinal (`POST /ordens`) — se vier `duplicado`, para aqui
@@ -54,6 +55,13 @@ As guardas, e o que cada uma evita:
     `execucao.py`. Subir o serviço não é o mesmo que autorizar ordem.
   - **tipo de conta**: quem recusa é `execucao.py`, que só opera no tipo
     configurado em `MODO_CONTA_EXIGIDO` (DEMO por padrão).
+  - **ativo da regra**: uma regra com `symbol` só casa sinais daquele papel;
+    `symbol` vazio = qualquer ativo (comportamento histórico). Escopo é
+    identidade: duas regras no mesmo recorte para ativos diferentes são duas
+    regras.
+  - **faixa de horário da regra** (`horario_inicio`/`horario_fim`): a regra
+    só envia dentro da janela configurada, no fuso do pregão. Nula = pregão
+    inteiro. É um filtro a mais sobre o gate de mercado aberto/fechado.
 
 Uso:
     python executor.py
@@ -67,7 +75,7 @@ import logging
 import os
 import sys
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time as horario, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -153,6 +161,45 @@ def _regras() -> list[dict]:
     r = requests.get(f"{API_URL}/auto-ordem", headers=_api_headers(), timeout=TIMEOUT)
     r.raise_for_status()
     return r.json().get("regras", [])
+
+
+def _regra_no_horario(regra: dict, agora: datetime | None = None) -> bool:
+    """A regra está dentro da faixa de horário em que pode enviar ordem?
+
+    `horario_inicio`/`horario_fim` vêm da regra como 'HH:MM:SS' no fuso do
+    pregão — o mesmo `MERCADO_TIMEZONE` do `_mercado_aberto`. Nulos não
+    restringem nada além do próprio gate de mercado aberto/fechado: esta
+    janela é um filtro EXTRA por regra.
+
+    Um dos dois pode vir sozinho (só início = "a partir de", só fim = "até").
+    Faixa que cruza a meia-noite (início > fim) é suportada.
+
+    Valor de horário que não parseia é tratado como FORA da janela: num
+    sistema que envia ordem, configuração suspeita para o envio, não passa
+    por ele."""
+    agora = agora or datetime.now(ZoneInfo(MERCADO_TIMEZONE))
+    ini, fim = regra.get("horario_inicio"), regra.get("horario_fim")
+    if not ini and not fim:
+        return True
+    try:
+        ini = horario.fromisoformat(ini) if ini else None
+        fim = horario.fromisoformat(fim) if fim else None
+    except ValueError:
+        log.warning(
+            "Faixa de horário INVÁLIDA na regra %s/%s/%s/%s (%s-%s) — "
+            "tratada como fora do horário, nenhuma ordem desta regra sai.",
+            regra.get("perfil"), regra.get("modalidade"), regra.get("timeframe"),
+            regra.get("symbol") or "qualquer ativo", ini, fim,
+        )
+        return False
+    hora = agora.time()
+    if ini and fim:
+        if ini <= fim:
+            return ini <= hora <= fim
+        return hora >= ini or hora <= fim
+    if ini:
+        return hora >= ini
+    return hora <= fim
 
 
 def _reservar(sinal: dict, risco: float, teste: bool = False) -> tuple[dict, bool]:
@@ -430,6 +477,10 @@ def _fechamento_da_vela(sinal: dict) -> datetime:
 def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
     """Sinais desta regra que ainda são candidatos a virar ordem.
 
+    `symbol` restringe a regra a um ativo: vazio = qualquer ativo. Filtrado
+    aqui, e não no `GET /signals`, pelo mesmo motivo do frescor e do MTF —
+    a regra diz o que ela quer, este arquivo aplica.
+
     `exigir_mtf` é o controlador de risco da regra: quando `true`, só o sinal
     com `mtf_confirmado=true` passa. Os 90 dias medem sinais confirmados
     consistentemente melhores em todas as modalidades — mas a decisão de
@@ -445,6 +496,8 @@ def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
         if not s.get("entrada") or not s.get("stop"):
             continue
         if s.get("direcao") not in ("COMPRA", "VENDA"):
+            continue
+        if regra.get("symbol") and s.get("symbol") != regra.get("symbol"):
             continue
         if regra.get("exigir_mtf") and not s.get("mtf_confirmado"):
             continue
@@ -537,11 +590,17 @@ def _um_ciclo() -> None:
     limite = datetime.now(UTC) - timedelta(minutes=FRESCOR_MAXIMO_MINUTOS)
     for regra in _regras():
         try:
+            if not _regra_no_horario(regra):
+                log.debug("regra %s/%s/%s/%s fora da janela — pulando.",
+                          regra.get("perfil"), regra.get("modalidade"),
+                          regra.get("timeframe"), regra.get("symbol") or "qualquer ativo")
+                continue
             for sinal in _elegiveis(regra, limite):
                 _processar(sinal, regra)
         except Exception as exc:  # noqa: BLE001 — uma regra ruim não derruba as outras
-            log.warning("regra %s/%s/%s falhou: %s", regra.get("perfil"),
-                        regra.get("modalidade"), regra.get("timeframe"), exc)
+            log.warning("regra %s/%s/%s/%s falhou: %s", regra.get("perfil"),
+                        regra.get("modalidade"), regra.get("timeframe"),
+                        regra.get("symbol") or "qualquer ativo", exc)
 
 
 def main() -> None:

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time
 
 from pydantic import BaseModel
 
@@ -311,11 +311,23 @@ class AutoAcompanhamentoResponse(BaseModel):
 
 
 class AutoOrdemIn(BaseModel):
-    """Regra de ordem automática: perfil + modalidade + timeframe → ordem.
+    """Regra de ordem automática: perfil + modalidade + timeframe + ativo → ordem.
 
     `timeframe` faz parte da chave, e não é rigor à toa: sem ele a regra
     casaria com o mesmo sinal em M15, H1, H4 e D1 e abriria quatro posições
     no mesmo ativo achando que abriu uma.
+
+    `symbol` também faz parte da chave. Vazio (`""`) significa "qualquer
+    ativo" — o comportamento histórico. Preenchido, restringe a regra àquele
+    papel, e é o que permite ter duas regras no mesmo recorte para ativos
+    diferentes (VALE3 e PETR4 no mesmo perfil/modalidade/timeframe, cada um
+    com seu risco).
+
+    `horario_inicio`/`horario_fim` (TIME, fuso do pregão) dizem em que faixa
+    do dia o executor pode enviar ordem desta regra. Nulos = sem restrição
+    além do próprio gate de pregão. Um dos dois pode vir sozinho: só
+    `horario_inicio` = "a partir desta hora", só `horario_fim` = "até esta
+    hora". Faixa que cruza a meia-noite (início > fim) é suportada.
 
     `risco_maximo` é em REAIS. A quantidade sai da distância até o stop do
     próprio sinal, então toda operação arrisca o mesmo valor independente da
@@ -330,9 +342,12 @@ class AutoOrdemIn(BaseModel):
     perfil: str
     modalidade: str
     timeframe: str
+    symbol: str = ""
     risco_maximo: float
     ativo: bool = True
     exigir_mtf: bool = False
+    horario_inicio: time | None = None
+    horario_fim: time | None = None
 
 
 class AutoOrdemOut(AutoOrdemIn):

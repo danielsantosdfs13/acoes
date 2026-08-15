@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -1248,9 +1249,13 @@ def _alternar_regra(regra: dict, chave: str) -> None:
         daytrade_smc.save_auto_ordem(
             regra["perfil"], regra["modalidade"], regra["timeframe"],
             float(regra["risco_maximo"]), ativo=ligar,
-            # Alternar o interruptor não pode apagar o filtro MTF salvo: sem
-            # repassá-lo, o PUT (upsert completo) gravaria exigir_mtf=false.
+            # Alternar o interruptor não pode apagar o resto da regra: sem
+            # repassá-los, o PUT (upsert completo) gravaria exigir_mtf=false,
+            # symbol='' e janela de horário vazia.
             exigir_mtf=bool(regra.get("exigir_mtf")),
+            symbol=regra.get("symbol") or "",
+            horario_inicio=regra.get("horario_inicio"),
+            horario_fim=regra.get("horario_fim"),
         )
     except Exception as exc:
         st.session_state[chave] = not ligar        # devolve o widget ao estado real
@@ -1261,25 +1266,29 @@ def _alternar_regra(regra: dict, chave: str) -> None:
 
 
 def _salvar_regra(regra: dict, novo: dict) -> None:
-    """Grava a edição de uma regra: recorte (perfil/modalidade/timeframe) e
-    risco. O `ativo` segue sendo decidido pelo toggle, fora daqui.
+    """Grava a edição de uma regra: recorte (perfil/modalidade/timeframe/ativo),
+    risco, filtro MTF e janela de horário. O `ativo` segue sendo decidido pelo
+    toggle, fora daqui.
 
     Trocar o recorte é criar regra nova e DESLIGAR a antiga: a chave
-    (perfil, modalidade, timeframe) é a identidade da regra, e o PUT faz
-    upsert por ela. Apagar a antiga esconderia o histórico de configuração;
-    desligar preserva — mesmo padrão do soft-delete de perfil."""
-    antiga = (regra["perfil"], regra["modalidade"], regra["timeframe"])
-    nova = (novo["perfil"], novo["modalidade"], novo["timeframe"])
+    (perfil, modalidade, timeframe, symbol) é a identidade da regra, e o PUT
+    faz upsert por ela. Apagar a antiga esconderia o histórico de
+    configuração; desligar preserva — mesmo padrão do soft-delete de perfil."""
+    antiga = (regra["perfil"], regra["modalidade"], regra["timeframe"],
+              regra.get("symbol") or "")
+    nova = (novo["perfil"], novo["modalidade"], novo["timeframe"],
+            novo["symbol"] or "")
 
     # Como nova != antiga, qualquer regra com a chave `nova` é outra regra —
     # sobrescrevê-la em silêncio apagaria a identidade dela.
     if nova != antiga and any(
-        (r["perfil"], r["modalidade"], r["timeframe"]) == nova
+        (r["perfil"], r["modalidade"], r["timeframe"], r.get("symbol") or "") == nova
         for r in _cached_auto_ordem().get("regras", [])
     ):
+        ativo_rot = novo["symbol"] or "qualquer ativo"
         st.session_state["ordens_erro"] = (
-            f"Já existe uma regra para {nova[0]} · {nova[1]} · {nova[2]} — "
-            "apague-a antes ou escolha outro recorte."
+            f"Já existe uma regra para {nova[0]} · {nova[1]} · {nova[2]} · "
+            f"{ativo_rot} — apague-a antes ou escolha outro recorte."
         )
         return
 
@@ -1288,11 +1297,17 @@ def _salvar_regra(regra: dict, novo: dict) -> None:
             novo["perfil"], novo["modalidade"], novo["timeframe"],
             novo["risco_maximo"], ativo=bool(regra["ativo"]),
             exigir_mtf=bool(novo["exigir_mtf"]),
+            symbol=novo["symbol"] or "",
+            horario_inicio=novo["horario_inicio"],
+            horario_fim=novo["horario_fim"],
         )
         if nova != antiga:
             daytrade_smc.save_auto_ordem(
-                *antiga, float(regra["risco_maximo"]), ativo=False,
+                *antiga[:3], float(regra["risco_maximo"]), ativo=False,
                 exigir_mtf=bool(regra.get("exigir_mtf")),
+                symbol=antiga[3],
+                horario_inicio=regra.get("horario_inicio"),
+                horario_fim=regra.get("horario_fim"),
             )
     except Exception as exc:
         st.session_state["ordens_erro"] = f"Não foi possível salvar a regra: {exc}"
@@ -1310,6 +1325,7 @@ def _apagar_regra(regra: dict) -> None:
     try:
         daytrade_smc.delete_auto_ordem(
             regra["perfil"], regra["modalidade"], regra["timeframe"],
+            symbol=regra.get("symbol") or "",
         )
     except Exception as exc:
         st.session_state["ordens_erro"] = f"Não foi possível apagar a regra: {exc}"
@@ -1381,6 +1397,40 @@ def _render_manutencao() -> None:
             _limpar_ordens(incluir_abertas)
 
 
+def _linha_por_regra(por_regra: dict, regra: dict) -> dict | None:
+    """A linha de desempenho desta regra, casando o rótulo que o backend monta.
+
+    O rótulo é 'perfil · modalidade · timeframe · ativo', com o ativo do papel
+    NEGOCIADO. Uma regra de 'qualquer ativo' (symbol vazio) pode ter negociado
+    vários papéis, então soma as linhas do recorte dela; uma regra por ativo
+    casa exato."""
+    prefixo = f"{regra['perfil']} · {regra['modalidade']} · {regra['timeframe']}"
+    if regra.get("symbol"):
+        return por_regra.get(f"{prefixo} · {regra['symbol']}")
+    linhas = [l for recorte, l in por_regra.items()
+              if recorte.startswith(prefixo + " · ")]
+    if not linhas:
+        return None
+    if len(linhas) == 1:
+        return linhas[0]
+    fechadas = sum(l["fechadas"] for l in linhas)
+    ganhos = sum(l["ganhos"] for l in linhas)
+    perdas = sum(l["perdas"] for l in linhas)
+    resultado = sum(l["resultado_reais"] for l in linhas)
+    return {
+        "recorte": prefixo,
+        "n": sum(l["n"] for l in linhas),
+        "fechadas": fechadas,
+        "abertas": sum(l["abertas"] for l in linhas),
+        "ganhos": ganhos,
+        "perdas": perdas,
+        "taxa_acerto": (ganhos / (ganhos + perdas)) if (ganhos + perdas) else None,
+        "resultado_reais": resultado,
+        "resultado_r_medio": (resultado / fechadas) if fechadas else None,
+        "aberto_reais": sum(l["aberto_reais"] for l in linhas),
+    }
+
+
 def _render_regras(stats_por_regra: list[dict]) -> None:
     """As regras de ordem automática, com o desempenho de cada uma ao lado.
 
@@ -1405,8 +1455,8 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
     if not regras:
         st.info(
             "Nenhuma regra cadastrada: o executor varre e dorme, sem mandar nada. "
-            "Uma regra diz *para este perfil, modalidade e timeframe, envie ordem "
-            "arriscando no máximo R$ X* — crie pelo agente ou pela API "
+            "Uma regra diz *para este perfil, modalidade, timeframe e ativo, envie "
+            "ordem arriscando no máximo R$ X* — crie pelo agente ou pela API "
             "(`PUT /auto-ordem`). Aqui dá pra ligar, desligar, editar e apagar as "
             "que existem, não criar do zero."
         )
@@ -1422,12 +1472,27 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
     por_regra = {l["recorte"]: l for l in stats_por_regra}
 
     for regra in regras:
-        chave_regra = f"{regra['perfil']} · {regra['modalidade']} · {regra['timeframe']}"
+        ativo_rot = regra.get("symbol") or "qualquer ativo"
+        janela = ""
+        if regra.get("horario_inicio") or regra.get("horario_fim"):
+            ini = (regra.get("horario_inicio") or "")[:5]
+            fim = (regra.get("horario_fim") or "")[:5]
+            if ini and fim:
+                janela = f" · {ini}–{fim}"
+            elif ini:
+                janela = f" · a partir de {ini}"
+            else:
+                janela = f" · até {fim}"
+        chave_regra = (f"{regra['perfil']} · {regra['modalidade']} · "
+                       f"{regra['timeframe']} · {ativo_rot}")
         with st.container(border=True):
             esq, meio, dir_ = st.columns([3, 3, 2])
-            esq.markdown(f"**{regra['perfil']}**  \n{regra['modalidade']} · {regra['timeframe']}")
+            esq.markdown(
+                f"**{regra['perfil']}**  \n{regra['modalidade']} · "
+                f"{regra['timeframe']} · **{ativo_rot}**{janela}"
+            )
 
-            linha = por_regra.get(chave_regra)
+            linha = _linha_por_regra(por_regra, regra)
             if linha and linha["fechadas"]:
                 taxa = "—" if linha["taxa_acerto"] is None else f"{linha['taxa_acerto'] * 100:.0f}%"
                 meio.markdown(
@@ -1447,17 +1512,32 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
                 key=chave, on_change=_alternar_regra, args=(regra, chave),
                 disabled=not regra["ativo"] and not confirmada,
                 help="Enquanto ligada, o executor manda ordem para todo sinal "
-                     "deste recorte.",
+                     "deste recorte e ativo.",
             )
             if not regra["ativo"] and not confirmada:
                 dir_.checkbox("Confirmar religar", key=f"confirma_{chave}")
 
             with st.expander("Editar regra", expanded=False):
                 st.caption(
-                    "Mudar o recorte cria uma regra nova e desliga a antiga — o "
-                    "histórico dela (ordens e desempenho) continua na base."
+                    "Mudar o recorte (inclusive o ativo) cria uma regra nova e "
+                    "desliga a antiga — o histórico dela (ordens e desempenho) "
+                    "continua na base."
                 )
-                c_p, c_m, c_t, c_r = st.columns([2, 3, 2, 2])
+                c_s, c_p, c_m, c_t, c_r = st.columns([2, 2, 3, 2, 2])
+
+                chave_symbol = f"regra_symbol_{chave_regra}"
+                simbolo_atual = regra.get("symbol") or "Qualquer ativo"
+                st.session_state.setdefault(chave_symbol, simbolo_atual)
+                simbolos = ["Qualquer ativo"] + sorted(
+                    set(st.session_state.get("watchlist", []))
+                    | ({simbolo_atual} if simbolo_atual != "Qualquer ativo" else set())
+                )
+                simbolo_novo = c_s.selectbox(
+                    "Ativo", options=simbolos, key=chave_symbol,
+                    help="Restringe a regra a um papel. 'Qualquer ativo' é o "
+                         "comportamento histórico.",
+                )
+                symbol_novo = "" if simbolo_novo == "Qualquer ativo" else simbolo_novo
 
                 chave_perfil = f"regra_perfil_{chave_regra}"
                 st.session_state.setdefault(chave_perfil, regra["perfil"])
@@ -1507,6 +1587,41 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
                          "dos sinais M15 não tem confirmação.",
                 )
 
+                chave_janela = f"regra_janela_{chave_regra}"
+                tem_janela = bool(regra.get("horario_inicio") or regra.get("horario_fim"))
+                st.session_state.setdefault(chave_janela, tem_janela)
+                limitar = st.checkbox(
+                    "Limitar janela de envio", key=chave_janela,
+                    help="Só envia ordem dentro desta faixa, no horário de Brasília "
+                         "(a mesma janela em que o executor mede o pregão). Vazio = "
+                         "pregão inteiro.",
+                )
+                horario_inicio_novo = horario_fim_novo = None
+                if limitar:
+                    c_i, c_f = st.columns(2)
+                    chave_ini = f"regra_horario_inicio_{chave_regra}"
+                    chave_fim = f"regra_horario_fim_{chave_regra}"
+                    st.session_state.setdefault(
+                        chave_ini,
+                        datetime.strptime(regra["horario_inicio"], "%H:%M:%S").time()
+                        if regra.get("horario_inicio")
+                        else datetime.strptime("09:00", "%H:%M").time(),
+                    )
+                    st.session_state.setdefault(
+                        chave_fim,
+                        datetime.strptime(regra["horario_fim"], "%H:%M:%S").time()
+                        if regra.get("horario_fim")
+                        else datetime.strptime("18:00", "%H:%M").time(),
+                    )
+                    horario_inicio_novo = c_i.time_input(
+                        "Início", key=chave_ini, step=60,
+                    )
+                    horario_fim_novo = c_f.time_input(
+                        "Fim", key=chave_fim, step=60,
+                        help="Se a faixa cruzar a meia-noite (ex.: 18:00–09:00), "
+                             "basta o início ser depois do fim.",
+                    )
+
                 c_bt_salvar, c_bt_apagar, c_conf_apagar = st.columns([1, 1, 2])
                 if c_bt_salvar.button(
                     "Salvar alterações", use_container_width=True,
@@ -1516,8 +1631,11 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
                         "perfil": perfil_novo,
                         "modalidade": modalidade_nova,
                         "timeframe": timeframe_novo,
+                        "symbol": symbol_novo,
                         "risco_maximo": risco_novo,
                         "exigir_mtf": mtf_novo,
+                        "horario_inicio": horario_inicio_novo,
+                        "horario_fim": horario_fim_novo,
                     })
                 if c_bt_apagar.button(
                     "Apagar regra", use_container_width=True,

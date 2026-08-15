@@ -1275,7 +1275,11 @@ def webhook_acoes(body: WebhookPayload, conn: Connection = Depends(get_conn)) ->
     summary="Regras de ordem automática ativas",
     description=(
         "Lista as regras de ordem automática: cada uma diz 'para este perfil, "
-        "modalidade e timeframe, envie ordem, arriscando no máximo R$ X'. "
+        "modalidade, timeframe e ativo, envie ordem, arriscando no máximo R$ X'. "
+        "`symbol` vazio significa QUALQUER ativo; preenchido, a regra só opera "
+        "aquele papel. `horario_inicio`/`horario_fim` (HH:MM:SS, fuso de Brasília) "
+        "restringem em que horas do dia a regra pode enviar ordem — nulos não "
+        "restringem nada além do próprio pregão.\n"
         "`risco_maximo` é em REAIS — a quantidade é calculada na hora, a partir "
         "da distância entre entrada e stop do sinal, então toda operação arrisca "
         "o mesmo valor. Quem executa é o serviço na VM Windows (o MetaTrader 5 é "
@@ -1298,16 +1302,16 @@ def list_auto_ordem(
     # tipo de mudança que parece cosmética e volta a operar sozinha.
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT perfil, modalidade, timeframe, risco_maximo, ativo, "
-            "exigir_mtf, criado_em "
+            "SELECT perfil, modalidade, timeframe, symbol, risco_maximo, ativo, "
+            "exigir_mtf, horario_inicio, horario_fim, criado_em "
             "FROM auto_ordem WHERE (ativo OR %s) ORDER BY ativo DESC, criado_em DESC",
             (incluir_inativas,),
         )
         rows = cur.fetchall()
     return AutoOrdemResponse(regras=[
-        AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2],
-                     risco_maximo=float(r[3]), ativo=r[4], exigir_mtf=r[5],
-                     criado_em=r[6])
+        AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2], symbol=r[3],
+                     risco_maximo=float(r[4]), ativo=r[5], exigir_mtf=r[6],
+                     horario_inicio=r[7], horario_fim=r[8], criado_em=r[9])
         for r in rows
     ])
 
@@ -1319,8 +1323,14 @@ def list_auto_ordem(
     operation_id="configurar_auto_ordem",
     summary="Cria ou atualiza uma regra de ordem automática",
     description=(
-        "Cria ou atualiza a regra de (perfil, modalidade, timeframe). Use "
-        "`ativo=false` para desligar sem apagar o histórico.\n\n"
+        "Cria ou atualiza a regra de (perfil, modalidade, timeframe, symbol). "
+        "`symbol` vazio (ou omitido) = qualquer ativo; preenchido, a regra só "
+        "opera aquele papel. Use `ativo=false` para desligar sem apagar o "
+        "histórico.\n\n"
+        "`horario_inicio`/`horario_fim` (HH:MM:SS) limitam a janela do dia em que "
+        "a regra pode enviar ordem; pode mandar só um deles (início = 'a partir "
+        "de', fim = 'até'). Se a faixa a ser configurada cruza a meia-noite, "
+        "ponha início > fim.\n\n"
         "Antes de ligar uma regra, confira com `assertividade_sinais` se aquele "
         "recorte tem amostra suficiente — `resolvidos` baixo (menos de ~10) não "
         "sustenta decisão de operar. E lembre que `timeframe` é obrigatório de "
@@ -1333,26 +1343,31 @@ def configurar_auto_ordem(
 ) -> AutoOrdemOut:
     if body.risco_maximo <= 0:
         raise HTTPException(status_code=400, detail="risco_maximo tem que ser maior que zero.")
+    symbol = (body.symbol or "").strip().upper()
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO auto_ordem (perfil, modalidade, timeframe, risco_maximo,
-                                    ativo, exigir_mtf)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (perfil, modalidade, timeframe) DO UPDATE
+            INSERT INTO auto_ordem (perfil, modalidade, timeframe, symbol,
+                                    risco_maximo, ativo, exigir_mtf,
+                                    horario_inicio, horario_fim)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (perfil, modalidade, timeframe, symbol) DO UPDATE
                SET risco_maximo = EXCLUDED.risco_maximo, ativo = EXCLUDED.ativo,
-                   exigir_mtf = EXCLUDED.exigir_mtf
-            RETURNING perfil, modalidade, timeframe, risco_maximo, ativo,
-                      exigir_mtf, criado_em
+                   exigir_mtf = EXCLUDED.exigir_mtf,
+                   horario_inicio = EXCLUDED.horario_inicio,
+                   horario_fim = EXCLUDED.horario_fim
+            RETURNING perfil, modalidade, timeframe, symbol, risco_maximo, ativo,
+                      exigir_mtf, horario_inicio, horario_fim, criado_em
             """,
-            (body.perfil, body.modalidade, body.timeframe.upper(),
-             body.risco_maximo, body.ativo, body.exigir_mtf),
+            (body.perfil, body.modalidade, body.timeframe.upper(), symbol,
+             body.risco_maximo, body.ativo, body.exigir_mtf,
+             body.horario_inicio, body.horario_fim),
         )
         r = cur.fetchone()
     conn.commit()
-    return AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2],
-                        risco_maximo=float(r[3]), ativo=r[4], exigir_mtf=r[5],
-                        criado_em=r[6])
+    return AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2], symbol=r[3],
+                        risco_maximo=float(r[4]), ativo=r[5], exigir_mtf=r[6],
+                        horario_inicio=r[7], horario_fim=r[8], criado_em=r[9])
 
 
 @app.delete(
@@ -1362,11 +1377,12 @@ def configurar_auto_ordem(
     operation_id="remover_auto_ordem",
     summary="Apaga uma regra de ordem automática",
     description=(
-        "Apaga DE VEZ a regra de (perfil, modalidade, timeframe). É diferente de "
-        "desligar (`configurar_auto_ordem` com `ativo=false`): desligar preserva a "
-        "regra e o histórico de configuração, apagar remove a linha. As ordens que "
-        "a regra já gerou CONTINUAM na base — vêm do sinal, não da regra — então "
-        "apagar a regra não apaga o que ela mediu.\n\n"
+        "Apaga DE VEZ a regra de (perfil, modalidade, timeframe, symbol). "
+        "`symbol` vazio significa a regra de 'qualquer ativo' daquele recorte. "
+        "É diferente de desligar (`configurar_auto_ordem` com `ativo=false`): "
+        "desligar preserva a regra e o histórico de configuração, apagar remove "
+        "a linha. As ordens que a regra já gerou CONTINUAM na base — vêm do "
+        "sinal, não da regra — então apagar a regra não apaga o que ela mediu.\n\n"
         "Devolve a lista de regras restantes, como `listar_auto_ordem` com "
         "`incluir_inativas=true`."
     ),
@@ -1375,30 +1391,33 @@ def delete_auto_ordem(
     perfil: str = Query(..., description="Perfil da regra."),
     modalidade: str = Query(..., description="Modalidade da regra."),
     timeframe: str = Query(..., description="Timeframe da regra."),
+    symbol: str = Query("", description="Ativo da regra (vazio = qualquer ativo)."),
     conn: Connection = Depends(get_conn),
 ) -> AutoOrdemResponse:
+    symbol = (symbol or "").strip().upper()
     with conn.cursor() as cur:
         cur.execute(
             "DELETE FROM auto_ordem "
-            "WHERE perfil = %s AND modalidade = %s AND timeframe = %s",
-            (perfil, modalidade, timeframe.upper()),
+            "WHERE perfil = %s AND modalidade = %s AND timeframe = %s AND symbol = %s",
+            (perfil, modalidade, timeframe.upper(), symbol),
         )
         if cur.rowcount == 0:
             raise HTTPException(
                 status_code=404,
-                detail=f"Nenhuma regra ({perfil}, {modalidade}, {timeframe}) encontrada.",
+                detail=f"Nenhuma regra ({perfil}, {modalidade}, {timeframe}, "
+                       f"{symbol or 'qualquer ativo'}) encontrada.",
             )
         cur.execute(
-            "SELECT perfil, modalidade, timeframe, risco_maximo, ativo, "
-            "exigir_mtf, criado_em "
+            "SELECT perfil, modalidade, timeframe, symbol, risco_maximo, ativo, "
+            "exigir_mtf, horario_inicio, horario_fim, criado_em "
             "FROM auto_ordem ORDER BY ativo DESC, criado_em DESC"
         )
         rows = cur.fetchall()
     conn.commit()
     return AutoOrdemResponse(regras=[
-        AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2],
-                     risco_maximo=float(r[3]), ativo=r[4], exigir_mtf=r[5],
-                     criado_em=r[6])
+        AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2], symbol=r[3],
+                     risco_maximo=float(r[4]), ativo=r[5], exigir_mtf=r[6],
+                     horario_inicio=r[7], horario_fim=r[8], criado_em=r[9])
         for r in rows
     ])
 
@@ -1411,9 +1430,11 @@ _ORDEM_CAMPOS_ORDEM = (
     "conciliado_em", "desvio_entrada_r", "stop_atual", "stop_movido_em",
 )
 # Vêm do SINAL, por join. É o que diz QUAL REGRA produziu a ordem: as regras
-# de `auto_ordem` têm chave (perfil, modalidade, timeframe), e nenhum desses
-# três está na tabela `ordens`. Sem eles, "qual das minhas regras está dando
-# dinheiro?" não tem resposta possível do lado do cliente.
+# de `auto_ordem` têm chave (perfil, modalidade, timeframe, symbol), e nenhum
+# desses três está na tabela `ordens` — o `symbol` da ordem é o papel NEGOCIADO,
+# que coincide com o da regra quando a regra é por ativo. Sem eles, "qual das
+# minhas regras está dando dinheiro?" não tem resposta possível do lado do
+# cliente.
 _ORDEM_CAMPOS_SINAL = ("perfil", "modalidade", "timeframe", "candle_time", "score",
                        "resultado", "r_realizado")
 _ORDEM_CAMPOS = _ORDEM_CAMPOS_ORDEM + _ORDEM_CAMPOS_SINAL
@@ -1653,7 +1674,8 @@ WITH base AS (
     SELECT o.tipo_conta, o.symbol, o.direcao, o.motivo_saida, o.fechado_em,
            o.resultado_reais, o.status,
            coalesce(s.perfil, '?') || ' · ' || coalesce(s.modalidade, '?')
-               || ' · ' || coalesce(s.timeframe, '?')            AS regra,
+               || ' · ' || coalesce(s.timeframe, '?')
+               || ' · ' || coalesce(o.symbol, '?')   AS regra,
            -- Mesmo risco efetivo do `_ordem_from_row`: o exposto DE FATO,
            -- depois do arredondamento ao lote. É o denominador que põe
            -- ativos de preços diferentes na mesma escala.
@@ -1801,8 +1823,8 @@ def _ordem_stats_rows(cur, recorte: str, params: dict) -> list[OrdemStatsRow]:
     summary="Desempenho financeiro das ordens enviadas",
     description=(
         "Quanto as ordens realmente renderam, quebrado por regra (perfil · "
-        "modalidade · timeframe), ativo, motivo de saída, direção e conta. É a "
-        "tool pra 'quais das minhas regras de ordem automática estão dando "
+        "modalidade · timeframe · ativo), ativo, motivo de saída, direção e conta. "
+        "É a tool pra 'quais das minhas regras de ordem automática estão dando "
         "dinheiro?'.\n\n"
         "O resultado NÃO é modelado: vem do MetaTrader 5, líquido de corretagem "
         "e swap, então já inclui slippage, fechamento parcial e fechamento "
@@ -1925,7 +1947,8 @@ def get_ordem_stats(
         "corretora recusou) ou RECUSADA (as travas locais barraram antes de "
         "sair).\n\n"
         "Cada ordem já vem com a REGRA que a produziu (`perfil`, `modalidade`, "
-        "`timeframe`) — é por ela que se compara uma regra com outra.\n\n"
+        "`timeframe`, e o `symbol` negociado) — é por ela que se compara uma "
+        "regra com outra.\n\n"
         "O desfecho vem do MetaTrader 5: `resultado_reais` é o lucro em reais "
         "líquido de corretagem, `motivo_saida` diz se saiu no STOP, no ALVO ou "
         "à mão (MANUAL), e `resultado_r` põe isso em múltiplos do risco. "
