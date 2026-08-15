@@ -1248,6 +1248,9 @@ def _alternar_regra(regra: dict, chave: str) -> None:
         daytrade_smc.save_auto_ordem(
             regra["perfil"], regra["modalidade"], regra["timeframe"],
             float(regra["risco_maximo"]), ativo=ligar,
+            # Alternar o interruptor não pode apagar o filtro MTF salvo: sem
+            # repassá-lo, o PUT (upsert completo) gravaria exigir_mtf=false.
+            exigir_mtf=bool(regra.get("exigir_mtf")),
         )
     except Exception as exc:
         st.session_state[chave] = not ligar        # devolve o widget ao estado real
@@ -1284,10 +1287,12 @@ def _salvar_regra(regra: dict, novo: dict) -> None:
         daytrade_smc.save_auto_ordem(
             novo["perfil"], novo["modalidade"], novo["timeframe"],
             novo["risco_maximo"], ativo=bool(regra["ativo"]),
+            exigir_mtf=bool(novo["exigir_mtf"]),
         )
         if nova != antiga:
             daytrade_smc.save_auto_ordem(
                 *antiga, float(regra["risco_maximo"]), ativo=False,
+                exigir_mtf=bool(regra.get("exigir_mtf")),
             )
     except Exception as exc:
         st.session_state["ordens_erro"] = f"Não foi possível salvar a regra: {exc}"
@@ -1490,6 +1495,18 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
                     "Risco (R$)", min_value=1.0, step=5.0, key=chave_risco,
                 )
 
+                chave_mtf = f"regra_mtf_{chave_regra}"
+                st.session_state.setdefault(chave_mtf, bool(regra.get("exigir_mtf")))
+                mtf_novo = st.checkbox(
+                    "Só enviar com confirmação multi-timeframe (MTF)",
+                    key=chave_mtf,
+                    help="Quando ligado, o executor recusa ENVIO de sinais sem "
+                         "`mtf_confirmado=true`. Os 90 dias medem sinais confirmados "
+                         "consistentemente melhores em todas as modalidades — mas o "
+                         "filtro reduz muito o número de ordens, já que a maioria "
+                         "dos sinais M15 não tem confirmação.",
+                )
+
                 c_bt_salvar, c_bt_apagar, c_conf_apagar = st.columns([1, 1, 2])
                 if c_bt_salvar.button(
                     "Salvar alterações", use_container_width=True,
@@ -1500,6 +1517,7 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
                         "modalidade": modalidade_nova,
                         "timeframe": timeframe_novo,
                         "risco_maximo": risco_novo,
+                        "exigir_mtf": mtf_novo,
                     })
                 if c_bt_apagar.button(
                     "Apagar regra", use_container_width=True,

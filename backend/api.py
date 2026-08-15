@@ -1298,14 +1298,16 @@ def list_auto_ordem(
     # tipo de mudança que parece cosmética e volta a operar sozinha.
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT perfil, modalidade, timeframe, risco_maximo, ativo, criado_em "
+            "SELECT perfil, modalidade, timeframe, risco_maximo, ativo, "
+            "exigir_mtf, criado_em "
             "FROM auto_ordem WHERE (ativo OR %s) ORDER BY ativo DESC, criado_em DESC",
             (incluir_inativas,),
         )
         rows = cur.fetchall()
     return AutoOrdemResponse(regras=[
         AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2],
-                     risco_maximo=float(r[3]), ativo=r[4], criado_em=r[5])
+                     risco_maximo=float(r[3]), ativo=r[4], exigir_mtf=r[5],
+                     criado_em=r[6])
         for r in rows
     ])
 
@@ -1334,19 +1336,23 @@ def configurar_auto_ordem(
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO auto_ordem (perfil, modalidade, timeframe, risco_maximo, ativo)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO auto_ordem (perfil, modalidade, timeframe, risco_maximo,
+                                    ativo, exigir_mtf)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (perfil, modalidade, timeframe) DO UPDATE
-               SET risco_maximo = EXCLUDED.risco_maximo, ativo = EXCLUDED.ativo
-            RETURNING perfil, modalidade, timeframe, risco_maximo, ativo, criado_em
+               SET risco_maximo = EXCLUDED.risco_maximo, ativo = EXCLUDED.ativo,
+                   exigir_mtf = EXCLUDED.exigir_mtf
+            RETURNING perfil, modalidade, timeframe, risco_maximo, ativo,
+                      exigir_mtf, criado_em
             """,
             (body.perfil, body.modalidade, body.timeframe.upper(),
-             body.risco_maximo, body.ativo),
+             body.risco_maximo, body.ativo, body.exigir_mtf),
         )
         r = cur.fetchone()
     conn.commit()
     return AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2],
-                        risco_maximo=float(r[3]), ativo=r[4], criado_em=r[5])
+                        risco_maximo=float(r[3]), ativo=r[4], exigir_mtf=r[5],
+                        criado_em=r[6])
 
 
 @app.delete(
@@ -1383,14 +1389,16 @@ def delete_auto_ordem(
                 detail=f"Nenhuma regra ({perfil}, {modalidade}, {timeframe}) encontrada.",
             )
         cur.execute(
-            "SELECT perfil, modalidade, timeframe, risco_maximo, ativo, criado_em "
+            "SELECT perfil, modalidade, timeframe, risco_maximo, ativo, "
+            "exigir_mtf, criado_em "
             "FROM auto_ordem ORDER BY ativo DESC, criado_em DESC"
         )
         rows = cur.fetchall()
     conn.commit()
     return AutoOrdemResponse(regras=[
         AutoOrdemOut(perfil=r[0], modalidade=r[1], timeframe=r[2],
-                     risco_maximo=float(r[3]), ativo=r[4], criado_em=r[5])
+                     risco_maximo=float(r[3]), ativo=r[4], exigir_mtf=r[5],
+                     criado_em=r[6])
         for r in rows
     ])
 

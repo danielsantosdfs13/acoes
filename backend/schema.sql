@@ -304,10 +304,18 @@ CREATE TABLE IF NOT EXISTS auto_ordem (
     timeframe     TEXT NOT NULL,
     risco_maximo  NUMERIC NOT NULL,
     ativo         BOOLEAN NOT NULL DEFAULT true,
+    exigir_mtf    BOOLEAN NOT NULL DEFAULT false,
     criado_em     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (perfil, modalidade, timeframe),
     CONSTRAINT auto_ordem_risco_chk CHECK (risco_maximo > 0)
 );
+
+-- Coluna nova em instalações existentes. O schema roda inteiro a cada
+-- sync (migrate.py), então é CONTIGUO ao CREATE TABLE e idempotente.
+-- `exigir_mtf=true` faz o executor recusar ENVIO para sinais sem
+-- confirmação multi-timeframe (mtf_confirmado=false) — os 90 dias medem
+-- esses sinais consistentemente piores em todas as modalidades.
+ALTER TABLE auto_ordem ADD COLUMN IF NOT EXISTS exigir_mtf BOOLEAN NOT NULL DEFAULT false;
 
 -- ------------------------------------------------------------------
 -- Auditoria de ordens enviadas. É também o mecanismo de "não manda duas

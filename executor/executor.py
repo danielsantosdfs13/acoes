@@ -428,7 +428,14 @@ def _fechamento_da_vela(sinal: dict) -> datetime:
 
 
 def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
-    """Sinais desta regra que ainda são candidatos a virar ordem."""
+    """Sinais desta regra que ainda são candidatos a virar ordem.
+
+    `exigir_mtf` é o controlador de risco da regra: quando `true`, só o sinal
+    com `mtf_confirmado=true` passa. Os 90 dias medem sinais confirmados
+    consistentemente melhores em todas as modalidades — mas a decisão de
+    aplicar o filtro é da regra, não deste arquivo, porque o executor só
+    obedece o que o GET /auto-ordem devolve (e o default de `exigir_mtf` é
+    `false`, preservando o comportamento histórico)."""
     resposta = fetch_signals(
         perfil=regra["perfil"], modalidade=regra["modalidade"],
         timeframe=regra["timeframe"], origem="worker", dias=1, limite=200,
@@ -438,6 +445,8 @@ def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
         if not s.get("entrada") or not s.get("stop"):
             continue
         if s.get("direcao") not in ("COMPRA", "VENDA"):
+            continue
+        if regra.get("exigir_mtf") and not s.get("mtf_confirmado"):
             continue
         if _fechamento_da_vela(s) < limite_idade:
             continue

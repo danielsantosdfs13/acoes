@@ -320,12 +320,19 @@ class AutoOrdemIn(BaseModel):
     `risco_maximo` é em REAIS. A quantidade sai da distância até o stop do
     próprio sinal, então toda operação arrisca o mesmo valor independente da
     volatilidade do papel — que é o oposto do que uma quantidade fixa faz.
+
+    `exigir_mtf=true` faz o executor recusar envio de sinais sem confirmação
+    multi-timeframe (`mtf_confirmado=false`). É um controlador de risco por
+    regra: os 90 dias medem sinais confirmados consistentemente melhores em
+    todas as modalidades (expectativa +0.04 a +0.09R), e `false` é o padrão
+    porque é o comportamento histórico — ligar é a decisão.
     """
     perfil: str
     modalidade: str
     timeframe: str
     risco_maximo: float
     ativo: bool = True
+    exigir_mtf: bool = False
 
 
 class AutoOrdemOut(AutoOrdemIn):

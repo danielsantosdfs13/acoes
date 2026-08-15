@@ -3386,20 +3386,23 @@ def fetch_auto_ordem(incluir_inativas: bool = False) -> dict:
 
 
 def save_auto_ordem(perfil: str, modalidade: str, timeframe: str,
-                    risco_maximo: float, ativo: bool = True) -> dict:
+                    risco_maximo: float, ativo: bool = True,
+                    exigir_mtf: bool = False) -> dict:
     """Cria, atualiza ou DESLIGA (`ativo=False`) uma regra de ordem
     automática.
 
     Ligar uma regra é o ato que faz o executor passar a mandar ordem naquele
     recorte — quem chama daqui é responsável por isso ser deliberado.
     `risco_maximo` é em REAIS: a quantidade sai da distância até o stop do
-    sinal, na hora do envio."""
+    sinal, na hora do envio. `exigir_mtf=true` faz o executor recusar sinais
+    sem confirmação multi-timeframe — controlador de risco por regra."""
     import requests
 
     response = requests.put(
         f"{_api_base_url()}/auto-ordem",
         json={"perfil": perfil, "modalidade": modalidade,
-              "timeframe": timeframe, "risco_maximo": risco_maximo, "ativo": ativo},
+              "timeframe": timeframe, "risco_maximo": risco_maximo,
+              "ativo": ativo, "exigir_mtf": exigir_mtf},
         headers=_api_headers(),
         timeout=_API_TIMEOUT_SECONDS,
     )
