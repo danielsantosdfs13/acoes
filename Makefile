@@ -123,7 +123,8 @@ SCRAPER_REQS_HASH := $(shell cat $(SCRAPER_REQS) | md5sum | cut -c1-32)
 RELEASE_TAGS = BACKEND_TAG='$(BACKEND_TAG)' STREAMLIT_TAG='$(STREAMLIT_TAG)'
 
 .PHONY: help build-backend build-streamlit import-all db-init manifests publish sync release \
-        scraper-check scraper-files scraper-push scraper-deps scraper-status release-scraper
+        scraper-check scraper-files scraper-push scraper-deps scraper-status release-scraper \
+        release-ea
 
 help:
 	@echo "k3s (ArgoCD):"
@@ -298,6 +299,28 @@ scraper-status:
 	@echo "=== versao aqui ==="
 	@echo "  VERSION=$(SCRAPER_VERSION)"
 	@echo "  REQS_HASH=$(SCRAPER_REQS_HASH)"
+
+# ===========================================================================
+# EA DayTradeSMC — entrega para a VM Windows, compilação no MetaEditor
+# ===========================================================================
+# Copia para C:\acoes\mt5 na VM. De lá, o conteúdo vai para a pasta Experts
+# do MetaTrader (File → Open Data Folder → MQL5\Experts\DayTradeSMC\).
+# Compilação é no MetaEditor (F7), não aqui — o MQL5 não tem compilador CLI
+# portátil, e o metaeditor64.exe precisa da instalação completa.
+VM_EA_DIR  ?= C:/acoes/mt5
+EA_FILES   := mt5/DayTradeSMC.mq5 mt5/DayTradeSMC_Estrutura.mqh \
+              mt5/DayTradeSMC_Sinais.mqh mt5/DayTradeSMC_VWAP.mqh
+
+release-ea: scraper-check
+	@$(SSH_VM) "if not exist $(subst /,\\,$(VM_EA_DIR)) mkdir $(subst /,\\,$(VM_EA_DIR))"
+	@echo ">> copiando EA DayTradeSMC para $(VM_HOST):$(VM_EA_DIR)"
+	@$(SCP_VM) $(EA_FILES) $(VM_HOST):$(VM_EA_DIR)/
+	@echo ">> EA em $(VM_HOST):$(VM_EA_DIR)"
+	@echo "   Proximo passo na VM:"
+	@echo "   1. Copie $(VM_EA_DIR) para MQL5\\Experts\\DayTradeSMC\\"
+	@echo "      (no MT5: File -> Open Data Folder -> MQL5\\Experts\\)"
+	@echo "   2. MetaEditor (F4) -> abra DayTradeSMC.mq5 -> compile (F7)"
+	@echo "   3. Strategy Tester (Ctrl+R) -> Expert: DayTradeSMC"
 
 release-scraper:
 	@$(MAKE) --no-print-directory scraper-check
