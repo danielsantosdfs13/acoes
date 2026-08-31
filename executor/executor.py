@@ -62,6 +62,16 @@ As guardas, e o que cada uma evita:
   - **faixa de horário da regra** (`horario_inicio`/`horario_fim`): a regra
     só envia dentro da janela configurada, no fuso do pregão. Nula = pregão
     inteiro. É um filtro a mais sobre o gate de mercado aberto/fechado.
+  - **direção do Ibovespa**: compras só passam se o IBOV estiver positivo
+    (fechamento > abertura do dia); vendas só passam se o IBOV estiver
+    caindo (fechamento < abertura).  Dados via Yahoo Finance, cacheados
+    por ciclo.  Se o IBOV não puder ser consultado, o filtro é ignorado
+    pra não travar o serviço inteiro.
+  - **score mínimo** (`SCORE_MINIMO`, padrão 65): sinais com nota abaixo
+    do limiar são descartados antes de qualquer outra verificação.
+  - **encerramento diário** (`ENCERRAMENTO_HORA`/`MINUTO`, padrão 16:50):
+    fecha todas as posições abertas no horário configurado, uma vez por
+    dia.  Desligável via `EXECUTOR_ENCERRAMENTO_HABILITADO=0`.
 
 Uso:
     python executor.py
@@ -105,6 +115,11 @@ CONCILIACAO_SEGUNDOS = float(os.environ.get("EXECUTOR_CONCILIACAO_SEGUNDOS", "60
 # por mais que isso é assunto de gente, não de laço.
 CONCILIACAO_DIAS = int(os.environ.get("EXECUTOR_CONCILIACAO_DIAS", "30"))
 
+# Score mínimo do sinal pra virar ordem. Sinais com nota abaixo disso são
+# ignorados independente de outras guardas. Configurável via variável de
+# ambiente pra permitir ajuste sem redeploy.
+SCORE_MINIMO = float(os.environ.get("EXECUTOR_SCORE_MINIMO", "70"))
+
 
 def _liga(nome: str, padrao: str) -> bool:
     return (os.environ.get(nome) or padrao).lower() in ("1", "true", "sim")
@@ -145,6 +160,13 @@ MERCADO_ABERTURA_HORA = int(os.environ.get("MERCADO_ABERTURA_HORA", "9"))
 MERCADO_FECHAMENTO_HORA = int(os.environ.get("MERCADO_FECHAMENTO_HORA", "19"))
 MERCADO_FECHADO_SLEEP_SECONDS = float(os.environ.get("MERCADO_FECHADO_SLEEP_SECONDS", "300"))
 
+# Horário de encerramento automático de todas as posições abertas.  Por
+# padrão 16:50 (10 min antes do fechamento do pregão).  Configurável via
+# variáveis de ambiente pra permitir ajuste sem redeploy.
+ENCERRAMENTO_HORA = int(os.environ.get("EXECUTOR_ENCERRAMENTO_HORA", "16"))
+ENCERRAMENTO_MINUTO = int(os.environ.get("EXECUTOR_ENCERRAMENTO_MINUTO", "50"))
+ENCERRAMENTO_HABILITADO = _liga("EXECUTOR_ENCERRAMENTO_HABILITADO", "1")
+
 TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10"))
 
 
@@ -161,6 +183,49 @@ def _regras() -> list[dict]:
     r = requests.get(f"{API_URL}/auto-ordem", headers=_api_headers(), timeout=TIMEOUT)
     r.raise_for_status()
     return r.json().get("regras", [])
+
+
+# ── Guarda de Ibovespa ──────────────────────────────────────────────────
+# Só compra se IBOV estiver positivo (close > open); só vende se estiver
+# caindo (close < open).  O resultado é cacheado por ciclo inteiro pra não
+# bater no Yahoo a cada sinal.
+_IBOV_CACHE: dict[str, object] = {"ts": 0.0, "direcao": None}
+
+
+def _ibov_direcao() -> str | None:
+    """Verifica a direção do Ibovespa no dia (D1).
+
+    Retorna ``"COMPRA"`` se o fechamento está acima da abertura (dia
+    positivo), ``"VENDA"`` se está abaixo (dia caindo), ou ``None`` se
+    não foi possível determinar (dados indisponíveis, fim de semana, etc.).
+
+    O resultado é cacheado por ciclo inteiro pra não fazer múltiplas
+    chamadas ao Yahoo dentro da mesma passada do executor."""
+    agora = time.time()
+    if agora - float(_IBOV_CACHE.get("ts", 0)) < CICLO_SEGUNDOS:
+        return _IBOV_CACHE.get("direcao")
+
+    try:
+        df = daytrade_smc.fetch_ohlcv("IBOV", "D1", 2, source="Yahoo Finance")
+        if df is None or df.empty or len(df) < 1:
+            _IBOV_CACHE.update({"ts": agora, "direcao": None})
+            return None
+        ultima = df.iloc[-1]
+        abertura = float(ultima["open"])
+        fechamento = float(ultima["close"])
+        if fechamento > abertura:
+            direcao = "COMPRA"
+        elif fechamento < abertura:
+            direcao = "VENDA"
+        else:
+            direcao = None
+        _IBOV_CACHE.update({"ts": agora, "direcao": direcao})
+        log.info("IBOV D1: open=%.2f close=%.2f → %s", abertura, fechamento, direcao or "NEUTRO")
+        return direcao
+    except Exception as exc:  # noqa: BLE001
+        log.warning("IBOV: não foi possível verificar direção: %s", exc)
+        _IBOV_CACHE.update({"ts": agora, "direcao": None})
+        return None
 
 
 def _regra_no_horario(regra: dict, agora: datetime | None = None) -> bool:
@@ -389,6 +454,70 @@ def _conciliar() -> None:
         mt5.shutdown()
 
 
+def _encerrar_posicoes(motivo: str = "encerramento_diario") -> int:
+    """Fecha todas as posições abertas com ordem a mercado.
+
+    Usado no encerramento automático diário (16:50 por padrão).  Retorna o
+    número de posições fechadas com sucesso.
+
+    Cada posição é fechada com uma ordem oposta (COMPRA → SELL, VENDA → BUY)
+    via `TRADE_ACTION_DEAL`.  O resultado é registrado na tabela `ordens`
+    com `motivo_saida='ENCERRAMENTO'` pra distinguir de STOP/ALVO/MANUAL."""
+    import MetaTrader5 as mt5
+
+    daytrade_smc._mt5_conectar(mt5)
+    fechadas = 0
+    try:
+        posicoes = mt5.positions_get()
+        if not posicoes:
+            log.debug("ENCERRAMENTO: nenhuma posição aberta.")
+            return 0
+
+        log.info("ENCERRAMENTO: %d posições abertas — fechando todas.", len(posicoes))
+        for pos in posicoes:
+            symbol = pos.symbol
+            ticket = pos.ticket
+            volume = pos.volume
+            direcao = "COMPRA" if pos.type == mt5.ORDER_TYPE_BUY else "VENDA"
+            try:
+                # Ordem oposta pra fechar: COMPRA fecha com SELL, VENDA com BUY.
+                if pos.type == mt5.ORDER_TYPE_BUY:
+                    tipo = mt5.ORDER_TYPE_SELL
+                    preco = mt5.symbol_info_tick(symbol).bid
+                else:
+                    tipo = mt5.ORDER_TYPE_BUY
+                    preco = mt5.symbol_info_tick(symbol).ask
+
+                info = mt5.symbol_info(symbol)
+                pedido = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": symbol,
+                    "volume": float(volume),
+                    "type": tipo,
+                    "price": float(preco),
+                    "position": int(ticket),
+                    "deviation": DESVIO_MAXIMO_POINTS,
+                    "type_time": mt5.ORDER_TIME_DAY,
+                    "type_filling": execucao._modo_preenchimento(mt5, info) if hasattr(execucao, '_modo_preenchimento') else mt5.ORDER_FILLING_FOK,
+                    "comment": "encerramento",
+                }
+                resultado = mt5.order_send(pedido)
+                if resultado and resultado.retcode == mt5.TRADE_RETCODE_DONE:
+                    log.info("ENCERRADO %s ticket=%s vol=%.2f preço=%s",
+                             symbol, ticket, volume, preco)
+                    fechadas += 1
+                else:
+                    erro = resultado.comment if resultado else mt5.last_error()
+                    log.warning("FALHA ao encerrar %s ticket=%s: %s", symbol, ticket, erro)
+            except Exception as exc:  # noqa: BLE001
+                log.error("ERRO ao encerrar %s ticket=%s: %s", symbol, ticket, exc)
+    finally:
+        mt5.shutdown()
+
+    log.info("ENCERRAMENTO concluído: %d/%d posições fechadas.", fechadas, len(posicoes) if posicoes else 0)
+    return fechadas
+
+
 def _tem_posicao(symbol: str) -> bool:
     """O símbolo já tem posição aberta nesta conta?
 
@@ -491,6 +620,10 @@ def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
         perfil=regra["perfil"], modalidade=regra["modalidade"],
         timeframe=regra["timeframe"], origem="worker", dias=1, limite=200,
     )
+    # Guarda de Ibovespa: compras só com IBOV positivo, vendas só com IBOV
+    # caindo.  Consulta uma vez por ciclo (cacheia em _ibov_direcao).
+    ibov = _ibov_direcao()
+
     candidatos = []
     for s in resposta.get("signals", []):
         if not s.get("entrada") or not s.get("stop"):
@@ -503,6 +636,23 @@ def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
             continue
         if _fechamento_da_vela(s) < limite_idade:
             continue
+        # Score mínimo: sinais fracos não devem virar ordem.
+        score = s.get("score") or 0
+        if score < SCORE_MINIMO:
+            log.debug("sinal %s score=%.1f abaixo do mínimo (%.1f), pulando.",
+                      s.get("id"), score, SCORE_MINIMO)
+            continue
+        # IBOV: compra só se positivo, venda só se caindo.  Se IBOV
+        # indisponível (None), deixa passar pra não travar tudo.
+        if ibov is not None:
+            if s["direcao"] == "COMPRA" and ibov != "COMPRA":
+                log.debug("sinal %s COMPRA bloqueado: IBOV não está positivo (%s).",
+                          s.get("id"), ibov)
+                continue
+            if s["direcao"] == "VENDA" and ibov != "VENDA":
+                log.debug("sinal %s VENDA bloqueado: IBOV não está caindo (%s).",
+                          s.get("id"), ibov)
+                continue
         candidatos.append(s)
     return candidatos
 
@@ -628,6 +778,11 @@ def main() -> None:
         PROTECAO_GATILHO_R, PROTECAO_DISTANCIA_R,
         " — ENSAIO, nada será escrito na corretora" if PROTECAO_SIMULAR else "",
     )
+    log.info(
+        "Encerramento diário: %s às %02d:%02d | Score mínimo: %.0f | IBOV: LIGADO",
+        "LIGADO" if ENCERRAMENTO_HABILITADO else "desligado",
+        ENCERRAMENTO_HORA, ENCERRAMENTO_MINUTO, SCORE_MINIMO,
+    )
     if not ORDENS_HABILITADAS:
         log.warning(
             "ORDENS_HABILITADAS está DESLIGADO: o executor vai varrer as regras "
@@ -652,10 +807,15 @@ def main() -> None:
 
     estava_aberto: bool | None = None
     ultima_conciliacao = 0.0
+    encerramento_feito_hoje = False
     while True:
+        agora = datetime.now(ZoneInfo(MERCADO_TIMEZONE))
         aberto = _mercado_aberto()
         if aberto != estava_aberto:
             log.info("Mercado %s.", "ABERTO" if aberto else "FECHADO")
+            # Na virada para aberto, reseta o flag de encerramento do dia.
+            if aberto:
+                encerramento_feito_hoje = False
             # Na virada para fechado, uma última passada: sem ela, o que
             # fechar no leilão só apareceria no pregão seguinte.
             if estava_aberto and not aberto:
@@ -664,6 +824,18 @@ def main() -> None:
         if not aberto:
             time.sleep(MERCADO_FECHADO_SLEEP_SECONDS)
             continue
+        # Encerramento automático: fecha todas as posições no horário
+        # configurado (padrão 16:50), uma vez por dia.
+        if (ENCERRAMENTO_HABILITADO and not encerramento_feito_hoje
+                and agora.hour == ENCERRAMENTO_HORA
+                and agora.minute >= ENCERRAMENTO_MINUTO):
+            try:
+                n = _encerrar_posicoes("encerramento_diario")
+                log.info("Encerramento diário: %d posições fechadas às %02d:%02d.",
+                         n, agora.hour, agora.minute)
+            except Exception as exc:  # noqa: BLE001
+                log.error("Encerramento diário falhou: %s", exc)
+            encerramento_feito_hoje = True
         if time.monotonic() - ultima_conciliacao >= CONCILIACAO_SEGUNDOS:
             ultima_conciliacao = time.monotonic()
             conciliar_protegido("ciclo")

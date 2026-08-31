@@ -1096,7 +1096,8 @@ def _curva_acumulada(por_dia: list[dict]) -> list[float]:
     return curva
 
 
-def _grafico_dia_a_dia(por_dia: list[dict]) -> go.Figure:
+def _grafico_dia_a_dia(por_dia: list[dict],
+                       ignorar_fds_feriados: bool = True) -> go.Figure:
     """O resultado de cada dia (barras) sobre a curva de capital (linha).
 
     **Um eixo só, e os dois em R$**: a linha é a soma corrida da própria
@@ -1112,26 +1113,44 @@ def _grafico_dia_a_dia(por_dia: list[dict]) -> go.Figure:
     A cor da barra é redundante com a posição dela em relação ao zero (verde
     acima, vermelho abaixo). É de propósito: verde/vermelho é justamente o
     par que o daltonismo mais comum embaralha, e quem não distingue as duas
-    cores lê o mesmo fato no lado da barra."""
+    cores lê o mesmo fato no lado da barra.
+
+    `ignorar_fds_feriados` decide o eixo X: quando ligado (default), cada dia
+    com ordem ocupa um espaço igual, sem o vão que o calendário abre entre
+    sexta e segunda (ou em volta de um feriado) e estica a curva para parecer
+    que não houve pregão. Quando desligado, o eixo volta ao tempo real."""
     dias = [pd.Timestamp(linha["recorte"]) for linha in por_dia]
     valores = [linha["resultado_reais"] for linha in por_dia]
     acumulado = _curva_acumulada(por_dia)
 
+    # `por_dia` só traz dias com ordem, então o vão de FDS/feriado nunca tem
+    # barra — o problema é só o eixo tiempo esticando a linha sobre ele.
+    if ignorar_fds_feriados:
+        xs = [d.strftime("%d/%m") for d in dias]
+        xtemplate = "<b>%{x}</b><br>"
+        width = 0.6
+        xaxis = dict(showgrid=False, type="category")
+    else:
+        xs = dias
+        xtemplate = "<b>%{x|%d/%m}</b><br>"
+        width = 0.6 * 86_400_000
+        xaxis = dict(showgrid=False)
+
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=dias, y=valores, name="Resultado do dia",
+        x=xs, y=valores, name="Resultado do dia",
         marker_color=[PALETA["compra"] if v >= 0 else PALETA["venda"] for v in valores],
         # ~0,6 dia em milissegundos: sem largura explícita, uma série de
         # poucos dias vira blocos de uma semana de largura cada.
-        width=0.6 * 86_400_000,
+        width=width,
         customdata=[[linha["fechadas"], linha["ganhos"], linha["perdas"]]
                     for linha in por_dia],
-        hovertemplate=("<b>%{x|%d/%m}</b><br>Resultado: R$ %{y:+.2f}<br>"
+        hovertemplate=(xtemplate + "Resultado: R$ %{y:+.2f}<br>"
                        "%{customdata[0]} fechada(s) · %{customdata[1]} ganho(s) · "
                        "%{customdata[2]} perda(s)<extra></extra>"),
     ))
     fig.add_trace(go.Scatter(
-        x=dias, y=acumulado, name="Acumulado", mode="lines+markers",
+        x=xs, y=acumulado, name="Acumulado", mode="lines+markers",
         line=dict(color=PALETA["ema_9"], width=2),
         marker=dict(size=8, color=PALETA["ema_9"]),
         hovertemplate="Acumulado: R$ %{y:+.2f}<extra></extra>",
@@ -1140,7 +1159,7 @@ def _grafico_dia_a_dia(por_dia: list[dict]) -> go.Figure:
     # anotar todos devolveria a tabela que já está logo abaixo.
     if acumulado:
         fig.add_annotation(
-            x=dias[-1], y=acumulado[-1], text=f"R$ {acumulado[-1]:+.2f}",
+            x=xs[-1], y=acumulado[-1], text=f"R$ {acumulado[-1]:+.2f}",
             showarrow=False, xanchor="left", xshift=8,
             font=dict(color=PALETA["texto"], size=11),
         )
@@ -1153,7 +1172,7 @@ def _grafico_dia_a_dia(por_dia: list[dict]) -> go.Figure:
         font=dict(family="IBM Plex Mono, monospace", size=11, color=PALETA["neutro"]),
         hovermode="x unified",
         yaxis=dict(title="R$", zeroline=False, gridcolor="#1b2430"),
-        xaxis=dict(showgrid=False),
+        xaxis=xaxis,
     )
     return fig
 
@@ -1189,7 +1208,21 @@ def _render_dia_a_dia(por_dia: list[dict]) -> None:
         help="Resultado realizado ÷ dias COM ordem enviada. Dia sem ordem não "
              "entra na conta — ele não é um zero, é uma ausência.",
     )
-    st.plotly_chart(_grafico_dia_a_dia(por_dia), use_container_width=True)
+    # Default é IGNORAR: fins de semana e feriados não são "dias que perderam" —
+    # são dias sem pregão, e o vão deles no eixo de tempo estica a linha da
+    # curva e faz a escada parecer mais comprida do que é. Quem quiser ver o
+    # tempo real desmarca.
+    ignorar_fds = st.toggle(
+        "Ignorar fins de semana e feriados",
+        value=True, key="ordens_ignorar_fds",
+        help="Com o eixo compactado, cada dia com ordem ocupa o mesmo espaço e o "
+             "fim de semana/feriado não abre buraco na curva. Desligue para o eixo "
+             "mostrar o tempo real.",
+    )
+    st.plotly_chart(
+        _grafico_dia_a_dia(por_dia, ignorar_fds_feriados=ignorar_fds),
+        use_container_width=True,
+    )
     st.caption(
         "Barra é o dia, linha é o acumulado — os dois em reais, no mesmo eixo. Só o "
         "**realizado** entra: posição ainda aberta fica de fora até fechar. O dia é o "
@@ -1335,6 +1368,195 @@ def _apagar_regra(regra: dict) -> None:
     st.rerun()
 
 
+def _criar_regra(novo: dict) -> None:
+    """Cria UMA regra nova, partindo do zero ou do clone de uma existente.
+
+    O recorte (perfil · modalidade · timeframe · ativo) é a identidade da
+    regra, e o PUT faz upsert por ela — então criar um recorte que já existe
+    sobrescreveria uma regra viva. A guarda aqui é a mesma da edição: se a
+    chave já existe, recusa.
+
+    A regra nasce DESLIGADA (`ativo=False`): ligar é o ato que faz o executor
+    passar a mandar ordem de verdade, e isso fica a cargo do toggle com
+    confirmação — criar não pode ser um atalho que contorna a assimetria."""
+    chave = (novo["perfil"], novo["modalidade"], novo["timeframe"],
+             novo["symbol"] or "")
+    if chave in {
+        (r["perfil"], r["modalidade"], r["timeframe"], r.get("symbol") or "")
+        for r in _cached_auto_ordem().get("regras", [])
+    }:
+        ativo_rot = novo["symbol"] or "qualquer ativo"
+        st.session_state["ordens_erro"] = (
+            f"Já existe uma regra para {novo['perfil']} · {novo['modalidade']} · "
+            f"{novo['timeframe']} · {ativo_rot} — a chave é a identidade e o PUT "
+            f"sobrescreveria a regra viva. Edite-a em 'Editar regra' ou apague-a "
+            f"antes de criar outra igual."
+        )
+        return
+
+    try:
+        daytrade_smc.save_auto_ordem(
+            novo["perfil"], novo["modalidade"], novo["timeframe"],
+            novo["risco_maximo"], ativo=False,
+            exigir_mtf=bool(novo["exigir_mtf"]),
+            symbol=novo["symbol"] or "",
+            horario_inicio=novo["horario_inicio"],
+            horario_fim=novo["horario_fim"],
+        )
+    except Exception as exc:
+        st.session_state["ordens_erro"] = f"Não foi possível criar a regra: {exc}"
+        return
+    _cached_auto_ordem.clear()
+    st.session_state["ordens_erro"] = None
+    st.rerun()
+
+
+def _render_form_nova_regra() -> None:
+    """Cria regra do zero, ou CLONADA de uma das existentes.
+
+    O clone não copia o `ativo` (a cópia nasce desligada, como qualquer outra
+    regra nova — ligar é decisão, e pede confirmação). Pré-preenche o recorte,
+    risco, filtro MTF e janela de horário da regra de origem para o usuário só
+    ajustar o que quer diferente, em vez de redigitar os cinco campos."""
+    modelo = st.session_state.pop("regra_clone_modelo", None)
+    with st.expander("＋ Criar regra", expanded=modelo is not None):
+        if modelo is not None:
+            st.caption(
+                "Clone: recorte, risco e filtros já vêm da regra abaixo — altere "
+                "só o que quiser diferente. A cópia nasce **desligada**."
+            )
+
+        # Sementear os widgets com o modelo do clone: eles são recriados a cada
+        # run com keys fixas, então gravar no session state ANTES da instanciação
+        # é exatamente o padrão 'pending key + rerun' do repo. O `setdefault`
+        # de cada campo abaixo respeita o que já foi semeado aqui.
+        if modelo is not None:
+            st.session_state["nova_regra_symbol"] = (
+                "Qualquer ativo" if modelo.get("symbol") == ""
+                else modelo.get("symbol") or "Qualquer ativo"
+            )
+            st.session_state["nova_regra_perfil"] = modelo["perfil"]
+            st.session_state["nova_regra_modalidade"] = modelo["modalidade"]
+            st.session_state["nova_regra_timeframe"] = modelo["timeframe"]
+            st.session_state["nova_regra_risco"] = float(modelo["risco_maximo"])
+            st.session_state["nova_regra_mtf"] = bool(modelo.get("exigir_mtf"))
+            tem_janela = bool(modelo.get("horario_inicio")
+                              or modelo.get("horario_fim"))
+            st.session_state["nova_regra_janela"] = tem_janela
+            if tem_janela:
+                st.session_state["nova_regra_horario_inicio"] = (
+                    datetime.strptime(modelo["horario_inicio"], "%H:%M:%S").time()
+                    if modelo.get("horario_inicio")
+                    else datetime.strptime("09:00", "%H:%M").time()
+                )
+                st.session_state["nova_regra_horario_fim"] = (
+                    datetime.strptime(modelo["horario_fim"], "%H:%M:%S").time()
+                    if modelo.get("horario_fim")
+                    else datetime.strptime("18:00", "%H:%M").time()
+                )
+
+        c_s, c_p, c_m, c_t, c_r = st.columns([2, 2, 3, 2, 2])
+
+        st.session_state.setdefault("nova_regra_symbol", "Qualquer ativo")
+        novo_symbol = c_s.selectbox(
+            "Ativo",
+            options=["Qualquer ativo"] + sorted(
+                set(st.session_state.get("watchlist", []))
+                | ({st.session_state["nova_regra_symbol"]}
+                   if st.session_state["nova_regra_symbol"] != "Qualquer ativo"
+                   else set())
+            ),
+            key="nova_regra_symbol",
+            help="Restringe a regra a um papel. 'Qualquer ativo' é o "
+                 "comportamento histórico.",
+        )
+        symbol_novo = "" if novo_symbol == "Qualquer ativo" else novo_symbol
+
+        st.session_state.setdefault("nova_regra_perfil", "padrão")
+        perfil_novo = c_p.selectbox(
+            "Perfil", options=sorted(set(st.session_state.perfis)
+                                     | {st.session_state["nova_regra_perfil"]}),
+            key="nova_regra_perfil",
+        )
+
+        st.session_state.setdefault("nova_regra_modalidade", MODALITIES[0])
+        modalidade_nova = c_m.selectbox(
+            "Modalidade", options=list(MODALITIES), key="nova_regra_modalidade",
+        )
+
+        st.session_state.setdefault("nova_regra_timeframe", "M15")
+        timeframe_novo = c_t.selectbox(
+            "Timeframe", options=list(_TIMEFRAMES_DE_REGRA),
+            key="nova_regra_timeframe",
+        )
+
+        risco_novo = c_r.number_input(
+            "Risco (R$)", min_value=1.0, step=5.0, value=50.0,
+            key="nova_regra_risco",
+        )
+
+        st.session_state.setdefault("nova_regra_mtf", False)
+        mtf_novo = st.checkbox(
+            "Só enviar com confirmação multi-timeframe (MTF)",
+            key="nova_regra_mtf",
+            help="Quando ligado, o executor recusa ENVIO de sinais sem "
+                 "`mtf_confirmado=true`. Os 90 dias medem sinais confirmados "
+                 "consistentemente melhores em todas as modalidades — mas o "
+                 "filtro reduz muito o número de ordens, já que a maioria dos "
+                 "sinais M15 não tem confirmação.",
+        )
+
+        horario_inicio_novo = horario_fim_novo = None
+        if st.checkbox("Limitar janela de envio", key="nova_regra_janela"):
+            c_i, c_f = st.columns(2)
+            st.session_state.setdefault(
+                "nova_regra_horario_inicio",
+                datetime.strptime("09:00", "%H:%M").time(),
+            )
+            st.session_state.setdefault(
+                "nova_regra_horario_fim",
+                datetime.strptime("18:00", "%H:%M").time(),
+            )
+            horario_inicio_novo = c_i.time_input(
+                "Início", key="nova_regra_horario_inicio", step=60,
+            )
+            horario_fim_novo = c_f.time_input(
+                "Fim", key="nova_regra_horario_fim", step=60,
+                help="Se a faixa cruzar a meia-noite (ex.: 18:00–09:00), "
+                     "basta o início ser depois do fim.",
+            )
+
+        if st.button("Criar regra", type="primary", use_container_width=True,
+                     key="nova_regra_criar"):
+            _criar_regra({
+                "perfil": perfil_novo, "modalidade": modalidade_nova,
+                "timeframe": timeframe_novo, "symbol": symbol_novo,
+                "risco_maximo": risco_novo, "exigir_mtf": mtf_novo,
+                "horario_inicio": horario_inicio_novo,
+                "horario_fim": horario_fim_novo,
+            })
+
+
+def _iniciar_clone(regra: dict) -> None:
+    """Manda a regra de origem para o formulário de criação (clone).
+
+    Pending key + rerun, padrão do repo: os widgets do formulário de criação
+    já existem na aba quando este botão é clicado, e o Streamlit não deixa
+    mutar a chave de um widget depois que ele foi instanciado na mesma run.
+    O `st.rerun()` seguinte recria o form — agora com os valores semeado."""
+    st.session_state["regra_clone_modelo"] = {
+        "perfil": regra["perfil"],
+        "modalidade": regra["modalidade"],
+        "timeframe": regra["timeframe"],
+        "symbol": regra.get("symbol") or "",
+        "risco_maximo": float(regra["risco_maximo"]),
+        "exigir_mtf": bool(regra.get("exigir_mtf")),
+        "horario_inicio": regra.get("horario_inicio"),
+        "horario_fim": regra.get("horario_fim"),
+    }
+    st.rerun()
+
+
 def _limpar_ordens(incluir_abertas: bool) -> None:
     """Zera a tabela `ordens` — reset de desenvolvimento, não filtra nada.
 
@@ -1456,10 +1678,9 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
         st.info(
             "Nenhuma regra cadastrada: o executor varre e dorme, sem mandar nada. "
             "Uma regra diz *para este perfil, modalidade, timeframe e ativo, envie "
-            "ordem arriscando no máximo R$ X* — crie pelo agente ou pela API "
-            "(`PUT /auto-ordem`). Aqui dá pra ligar, desligar, editar e apagar as "
-            "que existem, não criar do zero."
+            "ordem arriscando no máximo R$ X* — crie abaixo."
         )
+        _render_form_nova_regra()
         return
 
     ligadas = sum(1 for r in regras if r["ativo"])
@@ -1467,6 +1688,8 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
         f"{ligadas} de {len(regras)} ligada(s). Enquanto houver regra ligada e o "
         "pregão estiver aberto, o executor manda ordem sozinho."
     )
+
+    _render_form_nova_regra()
 
     # Desempenho por regra, chaveado pelo mesmo rótulo que o backend monta.
     por_regra = {l["recorte"]: l for l in stats_por_regra}
@@ -1516,6 +1739,14 @@ def _render_regras(stats_por_regra: list[dict]) -> None:
             )
             if not regra["ativo"] and not confirmada:
                 dir_.checkbox("Confirmar religar", key=f"confirma_{chave}")
+
+            if st.button(
+                "Clonar", key=f"regra_clonar_{chave_regra}",
+                help="Copia recorte, risco e filtros desta regra para o "
+                     "formulário '＋ Criar regra'. A cópia nasce desligada — "
+                     "altere o que quiser e ligue quando estiver pronta.",
+            ):
+                _iniciar_clone(regra)
 
             with st.expander("Editar regra", expanded=False):
                 st.caption(
@@ -2615,6 +2846,70 @@ def _do_feedback(signal_id: int, acao: str) -> None:
         st.error(f"Erro: {e}")
 
 
+_SCORE_MINIMO_NOTIFICACAO = 80
+
+
+def _notificar_sinais_altos(operaveis: "pd.DataFrame") -> None:
+    """Dispara notificação no browser e toast in-app para sinais com score alto.
+
+    Mantém um conjunto em session_state com os IDs já notificados pra não
+    repetir alerta a cada rerun do auto-refresh.  O browser Notification API
+    precisa de permissão do usuário — o primeiro clique no site libera; sem
+    isso, só o toast aparece."""
+    if operaveis.empty:
+        return
+
+    # Chave para rastrear sinais já notificados nesta sessão.
+    chave = "_sinais_notificados"
+    if chave not in st.session_state:
+        st.session_state[chave] = set()
+
+    altos = operaveis[operaveis["Score Geral"].fillna(0) >= _SCORE_MINIMO_NOTIFICACAO]
+    for _, row in altos.iterrows():
+        symbol = row.get("Ativo", "?")
+        score = row.get("Score Geral", 0)
+        direcao = row.get("Direção", "?")
+        entrada = row.get("Entrada")
+        stop = row.get("Stop")
+        alvo = row.get("Alvo 1")
+
+        # Gera um ID estável por (symbol, score, direção) pra não notificar
+        # o mesmo sinal duas vezes no mesmo ciclo.
+        sid = f"{symbol}_{score:.0f}_{direcao}"
+        if sid in st.session_state[chave]:
+            continue
+        st.session_state[chave].add(sid)
+
+        # Toast in-app (sempre funciona).
+        icone = "🟢" if direcao == "COMPRA" else "🔴"
+        msg = f"{icone} {symbol} {direcao} · Score {score:.0f}"
+        if entrada:
+            msg += f" · Entrada R$ {entrada:.2f}"
+        st.toast(msg, icon="🌟" if score >= 80 else "📊")
+
+        # Browser Notification (precisa de permissão do usuário).
+        notif_html = f"""
+        <script>
+        (function() {{
+            if ("Notification" in window && Notification.permission === "granted") {{
+                new Notification("🎯 Oportunidade: {symbol}", {{
+                    body: "{direcao} · Score {score:.0f}/100"
+                          + (", Entrada R$ {entrada:.2f}" if {entrada is not None} else "")
+                          + (", Stop R$ {stop:.2f}" if {stop is not None} else "")
+                          + (", Alvo R$ {alvo:.2f}" if {alvo is not None} else ""),
+                    icon: "https://cdn-icons-png.flaticon.com/512/3135/3135783.png",
+                    tag: "{sid}",
+                    requireInteraction: false,
+                }});
+            }} else if ("Notification" in window && Notification.permission !== "denied") {{
+                Notification.requestPermission();
+            }}
+        }})();
+        </script>
+        """
+        st.components.v1.html(notif_html, height=0)
+
+
 def render_dashboard(source: str, count: int, risk_budget: float | None, params: AnalysisParams,
                       perfis: list[str], style: str) -> None:
     """Tela principal: top oportunidades de relance, organizadas por perfil.
@@ -2651,6 +2946,9 @@ def render_dashboard(source: str, count: int, risk_budget: float | None, params:
             "ou veja a watchlist inteira no **Scanner**."
         )
         return
+
+    # Notifica no browser e via toast pra sinais com score >= 80.
+    _notificar_sinais_altos(operáveis)
 
     for _, row in operáveis.head(5).iterrows():
         _render_oportunidade_card(row, symbol=row["Ativo"], risk_budget=risk_budget,
