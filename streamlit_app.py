@@ -2630,20 +2630,34 @@ def render_dashboard(source: str, count: int, risk_budget: float | None, params:
     (09:30–18:00, dias úteis)."""
 
     # ── Notificações push (sempre ativas) ──
-    # Pede permissão do navegador na primeira visita
-    st.components.v1.html("""
+    # Pede permissão do navegador na primeira visita.
+    # Usa st.markdown (página principal), NÃO st.components.v1.html (iframe):
+    # navegadores bloqueiam Notification.requestPermission() de iframes.
+    st.markdown("""
     <script>
     if ("Notification" in window && Notification.permission === "default") {
         Notification.requestPermission();
     }
     </script>
-    """, height=0)
+    """, unsafe_allow_html=True)
 
     # Auto-refresh de 3 em 3 minutos — só durante o pregão (09:30–18:00)
     from zoneinfo import ZoneInfo
     agora = datetime.now(ZoneInfo("America/Sao_Paulo"))
-    if agora.weekday() < 5 and (9, 30) <= (agora.hour, agora.minute) < (18, 0):
+    dentro_pregao = agora.weekday() < 5 and (9, 30) <= (agora.hour, agora.minute) < (18, 0)
+    dentro_notif = 10 <= agora.hour < 17 or (agora.hour == 16 and agora.minute <= 45)
+    if dentro_pregao:
         st.markdown('<meta http-equiv="refresh" content="180">', unsafe_allow_html=True)
+    else:
+        st.warning(
+            f"⏸️ **Fora do pregão** — auto-refresh desativado. "
+            f"Hora atual: {agora:%H:%M} (Brasília). Pregão: 09:30–18:00, dias úteis."
+        )
+    if not dentro_notif:
+        st.caption(
+            "🔔 Notificações push pausadas (janela: 10:00–16:45). "
+            f"Hora atual: {agora:%H:%M}."
+        )
 
     # `st.segmented_control`, NÃO `st.tabs`.
     perfil_filtro = None
@@ -2714,7 +2728,7 @@ def _notificar_score_alto(operaveis) -> None:
             msg += f" · R$ {entrada:.2f}"
         st.toast(msg, icon="🌟")
 
-        # Browser Notification
+        # Browser Notification — via st.markdown (página principal), não iframe
         notif_html = f"""
         <script>
         (function() {{
@@ -2730,7 +2744,7 @@ def _notificar_score_alto(operaveis) -> None:
         }})();
         </script>
         """
-        st.components.v1.html(notif_html, height=0)
+        st.markdown(notif_html, unsafe_allow_html=True)
 
 
 def _render_oportunidade_card(row: pd.Series, symbol: str, risk_budget: float | None,
