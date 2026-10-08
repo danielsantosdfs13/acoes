@@ -43,6 +43,28 @@ E roda mesmo com `ORDENS_HABILITADAS` desligado: ler o desfecho do que já saiu
 não manda nada, e é justamente o que se quer poder fazer *depois* de desligar
 o envio.
 
+## Encerramento diário
+
+Toda posição ainda aberta às `EXECUTOR_ENCERRAMENTO_HORA`/`_MINUTO` (16:30 por
+padrão, uma vez por dia, desligável via `EXECUTOR_ENCERRAMENTO_HABILITADO=0`)
+é fechada a mercado com uma ordem oposta — é o que evita um sinal M15 de day
+trade carregar posição de um dia para o outro.
+
+Diferente da reconciliação genérica acima, o fechamento diário **não** confia
+no `DEAL_REASON_*` da corretora para descobrir o motivo: uma ordem fechada
+pelo próprio script sairia como `MANUAL` ou `EXPERT`, indistinguível de
+alguém fechando à mão pelo terminal — e misturaria o encerramento por horário
+com fechamentos que não foram medição nenhuma. Em vez disso,
+`_encerrar_posicoes` busca as ordens rastreadas (`GET /ordens?aberta=true`,
+igual à reconciliação) e grava o fechamento com `motivo_saida='FECHAMENTO_DIA'`
+diretamente. Posições abertas na mesma conta sem uma ordem correspondente
+(por exemplo, à mão) são fechadas do mesmo jeito, mas nada é gravado no
+banco.
+
+O gatilho compara minutos-desde-meia-noite, não a hora exata — um serviço
+reiniciado depois do horário (17:05, por exemplo) ainda dispara o
+encerramento pendente daquele dia, em vez de esperar o pregão seguinte.
+
 > ⚠️ **Fuso.** O MT5 devolve horário no relógio do servidor codificado como se
 > fosse UTC. `execucao.hora_do_mt5` reinterpreta, igual `_fetch_ohlcv_mt5`. Ler
 > direto como UTC não quebra nada visível — as datas continuam plausíveis, só

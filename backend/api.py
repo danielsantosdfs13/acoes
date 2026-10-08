@@ -1351,10 +1351,9 @@ def configurar_auto_ordem(
                                     risco_maximo, ativo, exigir_mtf,
                                     horario_inicio, horario_fim)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (perfil, modalidade, timeframe, symbol) DO UPDATE
+            ON CONFLICT (perfil, modalidade, timeframe, symbol, horario_inicio) DO UPDATE
                SET risco_maximo = EXCLUDED.risco_maximo, ativo = EXCLUDED.ativo,
                    exigir_mtf = EXCLUDED.exigir_mtf,
-                   horario_inicio = EXCLUDED.horario_inicio,
                    horario_fim = EXCLUDED.horario_fim
             RETURNING perfil, modalidade, timeframe, symbol, risco_maximo, ativo,
                       exigir_mtf, horario_inicio, horario_fim, criado_em
@@ -1842,7 +1841,9 @@ def _ordem_stats_rows(cur, recorte: str, params: dict) -> list[OrdemStatsRow]:
         "- Com menos de ~10 fechadas o percentual não significa nada; diga que a "
         "amostra é insuficiente em vez de citar o número.\n"
         "- `motivo_saida='MANUAL'` é posição fechada à mão: aquela regra não foi "
-        "medida, foi pilotada, e não sustenta conclusão sobre a regra.\n"
+        "medida, foi pilotada, e não sustenta conclusão sobre a regra. "
+        "`FECHAMENTO_DIA` é o encerramento automático diário (16:30 por padrão) — "
+        "essa, sim, é medição: a regra não chegou ao stop/alvo dentro do dia.\n"
         "- `recusadas` e `falhadas` ficam fora das taxas (nada delas chegou ao "
         "mercado), mas um número alto ali é problema de configuração, não de "
         "estratégia — vale mencionar.\n"
@@ -1950,8 +1951,9 @@ def get_ordem_stats(
         "`timeframe`, e o `symbol` negociado) — é por ela que se compara uma "
         "regra com outra.\n\n"
         "O desfecho vem do MetaTrader 5: `resultado_reais` é o lucro em reais "
-        "líquido de corretagem, `motivo_saida` diz se saiu no STOP, no ALVO ou "
-        "à mão (MANUAL), e `resultado_r` põe isso em múltiplos do risco. "
+        "líquido de corretagem, `motivo_saida` diz se saiu no STOP, no ALVO, à "
+        "mão (MANUAL) ou pelo encerramento automático diário (FECHAMENTO_DIA, "
+        "16:30 por padrão), e `resultado_r` põe isso em múltiplos do risco. "
         "⚠️ Enquanto `fechado_em` for nulo a posição está ABERTA e "
         "`resultado_reais` é o não realizado do momento — não é dinheiro ainda. "
         "Use `aberta=true` pra ver só as em curso.\n\n"

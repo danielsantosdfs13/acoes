@@ -353,6 +353,26 @@ BEGIN
     ALTER TABLE auto_ordem ADD PRIMARY KEY (perfil, modalidade, timeframe, symbol);
 END $$;
 
+-- Adiciona horario_inicio/horario_fim à PRIMARY KEY pra suportar múltiplas
+-- janelas por regra (manhã e tarde).  Idempotente: se horario_inicio já
+-- estiver na chave, não faz nada.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM pg_index i
+          JOIN pg_attribute a ON a.attrelid = i.indrelid
+                            AND a.attnum = ANY (i.indkey::int2[])
+         WHERE i.indrelid = 'auto_ordem'::regclass
+           AND i.indisprimary
+           AND a.attname = 'horario_inicio'
+    ) THEN
+        RETURN;
+    END IF;
+    ALTER TABLE auto_ordem DROP CONSTRAINT auto_ordem_pkey;
+    ALTER TABLE auto_ordem ADD PRIMARY KEY (perfil, modalidade, timeframe, symbol, horario_inicio);
+END $$;
+
 -- ------------------------------------------------------------------
 -- Auditoria de ordens enviadas. É também o mecanismo de "não manda duas
 -- vezes": `signal_id` é ÚNICO, e o executor RESERVA a linha antes de
@@ -424,10 +444,14 @@ ALTER TABLE ordens ADD COLUMN IF NOT EXISTS fechado_em      TIMESTAMPTZ;
 ALTER TABLE ordens ADD COLUMN IF NOT EXISTS preco_saida     DOUBLE PRECISION;
 ALTER TABLE ordens ADD COLUMN IF NOT EXISTS volume_saida    NUMERIC;
 ALTER TABLE ordens ADD COLUMN IF NOT EXISTS resultado_reais NUMERIC;
--- STOP | ALVO | MANUAL | EXPERT | MARGEM | OUTRO — traduzido do
--- `DEAL_REASON_*` do deal de saída. Distinguir MANUAL é o ponto: uma regra
--- cujo resultado veio de fechamento à mão não está sendo medida, está sendo
--- pilotada, e misturar as duas coisas corrompe a comparação entre regras.
+-- STOP | ALVO | MANUAL | EXPERT | MARGEM | OUTRO | FECHAMENTO_DIA —
+-- traduzido do `DEAL_REASON_*` do deal de saída, exceto FECHAMENTO_DIA, que
+-- o encerramento automático diário (`executor._encerrar_posicoes`) grava
+-- direto — um fechamento disparado pelo próprio script sairia do
+-- `DEAL_REASON_*` como MANUAL ou EXPERT, indistinguível de alguém fechando
+-- à mão. Distinguir MANUAL é o ponto: uma regra cujo resultado veio de
+-- fechamento à mão não está sendo medida, está sendo pilotada, e misturar
+-- as duas coisas corrompe a comparação entre regras.
 ALTER TABLE ordens ADD COLUMN IF NOT EXISTS motivo_saida    TEXT;
 ALTER TABLE ordens ADD COLUMN IF NOT EXISTS conciliado_em   TIMESTAMPTZ;
 

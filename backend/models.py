@@ -409,7 +409,7 @@ class OrdemFechamento(BaseModel):
     fechado_em: datetime | None = None
     preco_saida: float | None = None
     volume_saida: float | None = None
-    motivo_saida: str | None = None   # STOP | ALVO | MANUAL | EXPERT | MARGEM | OUTRO
+    motivo_saida: str | None = None   # STOP | ALVO | MANUAL | EXPERT | MARGEM | OUTRO | FECHAMENTO_DIA
     # O stop VIVO na corretora nesta passada (o trailing move, e a mão também).
     # Vem junto do fechamento, e não em rota própria, porque é a mesma ida por
     # ordem por minuto que a reconciliação já faz. Nulo NÃO apaga o guardado —

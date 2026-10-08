@@ -420,6 +420,72 @@ class AnalysisParams:
     # upstream `TARGET_SHRINK`. Não toca nos alvos alternativos
     # (Fibonacci/estrutura/expectativa), que continuam na medida completa.
     encolher_alvos: float = 0.85
+    # Limites máximos de distância em % do preço de entrada.
+    # Stop e gain não podem ultrapassar estes limiares.
+    stop_maximo_pct: float = 0.5
+    gain_maximo_pct: float = 0.5
+
+    # --- Setup TPO/VWAP (2026-09-30) ------------------------------------
+    # Fluxo: 1ª vela → VWAP → direção → qualidade → TPO → entrada → stop →
+    #        alvo → R/R → score → execução
+    # Horário de abertura e duração da 1ª vela
+    market_open_hour: int = 10        # hora de abertura do pregão (Brasília)
+    market_open_minute: int = 0
+    first_candle_minutes: int = 2     # duração da 1ª vela em minutos
+
+    # VWAP: distância mínima pra classificar BULLISH/BEARISH
+    vwap_min_distance_pct: float = 0.1  # % mínima pra considerar direção
+
+    # Filtros da 1ª vela (proteção contra doji, wicks excessivos)
+    min_body_pct: float = 30.0       # corpo mínimo em % do range
+    max_wick_pct: float = 40.0       # sombra máxima em % do range
+    min_range_atr: float = 0.3       # range mínimo em múltiplos de ATR
+    max_range_atr: float = 3.0       # range máximo em múltiplos de ATR
+
+    # Entrada: BREAKOUT | PULLBACK | RETEST (padrão RETEST)
+    entry_mode: str = "RETEST"
+
+    # Anti-perseguição: distância máxima da VWAP e do nível de entrada
+    max_distance_from_vwap_pct: float = 0.5   # % máxima da VWAP
+    max_distance_from_entry_pct: float = 0.3   # % máxima do nível de entrada
+
+    # Stop estrutural: TPO_LEVEL | FIRST_CANDLE | LOWEST
+    stop_basis: str = "TPO_LEVEL"
+    stop_buffer_atr: float = 0.3      # folga do stop em múltiplos de ATR
+    min_risk_atr: float = 0.5         # rejeita stop dentro do ruído
+
+    # Alvo: FIXED_RR ou STRUCTURE
+    target_mode: str = "FIXED_RR"
+    preferred_rr: float = 1.5         # R/R preferido
+    minimum_rr: float = 1.0           # R/R mínimo aceitável
+
+    # Score com pesos configuráveis (soma = 1.0)
+    weight_vwap: float = 0.25
+    weight_first_candle: float = 0.15
+    weight_tpo: float = 0.20
+    weight_volume: float = 0.10
+    weight_entry_location: float = 0.15
+    weight_risk_reward: float = 0.15
+    minimum_signal_score: float = 60.0  # score mínimo pra executar
+
+    # Trava de ativo no dia (1 entrada por ativo)
+    lock_asset_for_day: bool = True
+
+    # --- Setup CHATGPT (2026-10-06) ---------------------------------------
+    # Day trade B3: EMA 200 + EMA 21 + VWAP + Volume + ATR
+    # Contexto 60min, entrada 15min
+    chatgpt_volume_min_ratio: float = 1.2      # volume mínimo vs média 20
+    chatgpt_volume_media_periodo: int = 20     # período da média de volume
+    chatgpt_atr_stop_buffer: float = 0.20      # folga do stop em ATR
+    chatgpt_time_stop_candles: int = 4         # candles de 15min pra sair
+    chatgpt_rr_alvo: float = 1.25              # R/R alvo principal
+    chatgpt_filtrar_lateral: bool = True       # evitar lateralização
+    chatgpt_filtrar_divergencia: bool = True   # não operar divergências
+    chatgpt_usar_filtro_ibov: bool = False     # filtro IBOV (opcional)
+    chatgpt_horario_inicio_manha: str = "10:00"
+    chatgpt_horario_fim_manha: str = "12:00"
+    chatgpt_horario_inicio_tarde: str = "14:00"
+    chatgpt_horario_fim_tarde: str = "16:00"
 
     def to_items(self) -> tuple[tuple[str, object], ...]:
         """Forma canônica e hasheável, ordenada por nome do campo.
@@ -1097,6 +1163,155 @@ def slope_pct(series: pd.Series, lookback: int = 5) -> float:
     old = float(clean.iloc[-1 - lookback])
     new = float(clean.iloc[-1])
     return (new - old) / abs(old) * 100 if old else 0.0
+
+
+# ── TPO (Time Price Opportunity) ─────────────────────────────────────────
+def compute_tpo(df: pd.DataFrame, session_date=None) -> dict:
+    """Calcula o perfil TPO da sessão: POC, VAH, VAL.
+
+    POC (Point of Control): preço com maior volume negociado.
+    VAH (Value Area High): topo da área de valor (70% do volume).
+    VAL (Value Area Low): base da área de valor (70% do volume).
+
+    Usa os candles da sessão (data local) pra montar o histograma de
+    preço × volume. Se `session_date` for None, usa a última sessão."""
+    local_index = df.index.tz_convert(LOCAL_TZ)
+    session = pd.Series(local_index.date, index=df.index)
+
+    if session_date is not None:
+        mask = session == session_date
+    else:
+        mask = session == session.iloc[-1]
+
+    sessao = df[mask]
+    if sessao.empty:
+        return {"poc": None, "vah": None, "val": None, "contexto": "NEUTRO"}
+
+    # Histograma de preço × volume
+    preco_min = float(sessao["low"].min())
+    preco_max = float(sessao["high"].max())
+    if preco_max <= preco_min:
+        return {"poc": preco_min, "vah": preco_max, "val": preco_min, "contexto": "NEUTRO"}
+
+    # Divide em faixas de preço
+    n_faixas = 50
+    largura = (preco_max - preco_min) / n_faixas
+    faixas = {}
+    for _, row in sessao.iterrows():
+        preco_tp = (row["high"] + row["low"] + row["close"]) / 3
+        idx = min(int((preco_tp - preco_min) / largura), n_faixas - 1)
+        faixas[idx] = faixas.get(idx, 0) + row["volume"]
+
+    if not faixas:
+        return {"poc": preco_min, "vah": preco_max, "val": preco_min, "contexto": "NEUTRO"}
+
+    # POC: faixa com maior volume
+    poc_idx = max(faixas, key=faixas.get)
+    poc = preco_min + poc_idx * largura + largura / 2
+
+    # ÁREA DE VALOR: 70% do volume ao redor do POC
+    total_volume = sum(faixas.values())
+    volume_alvo = total_volume * 0.70
+    volume_acumulado = faixas[poc_idx]
+    val_idx = poc_idx
+    vah_idx = poc_idx
+
+    while volume_acumulado < volume_alvo:
+        abaixo = val_idx - 1 if val_idx > 0 else None
+        acima = vah_idx + 1 if vah_idx < n_faixas - 1 else None
+        vol_abaixo = faixas.get(abaixo, 0) if abaixo is not None else 0
+        vol_acima = faixas.get(acima, 0) if acima is not None else 0
+
+        if vol_abaixo >= vol_acima and abaixo is not None:
+            val_idx = abaixo
+            volume_acumulado += vol_abaixo
+        elif acima is not None:
+            vah_idx = acima
+            volume_acumulado += vol_acima
+        else:
+            break
+
+    val = preco_min + val_idx * largura
+    vah = preco_min + vah_idx * largura + largura
+
+    # Contexto: preço relativo à área de valor
+    preco_atual = float(sessao["close"].iloc[-1])
+    if preco_atual > vah:
+        contexto = "ACIMA_VAH"
+    elif preco_atual < val:
+        contexto = "ABAIXO_VAL"
+    else:
+        contexto = "DENTRO_VALOR"
+
+    return {"poc": poc, "vah": vah, "val": val, "contexto": contexto}
+
+
+# ── Análise da 1ª vela ──────────────────────────────────────────────────
+def analyze_first_candle(df: pd.DataFrame, params: AnalysisParams) -> dict:
+    """Analisa a 1ª vela da sessão com filtros de qualidade.
+
+    Retorna: {open, high, low, close, range, body_pct, wick_pct,
+              range_atr_ratio, quality, direction, valid}"""
+    local_index = df.index.tz_convert(LOCAL_TZ)
+    session = pd.Series(local_index.date, index=df.index)
+    hoje = session.iloc[-1]
+    sessao = df[session == hoje]
+
+    if sessao.empty:
+        return {"valid": False, "reason": "sem dados da sessão"}
+
+    # 1ª vela da sessão
+    primeira = sessao.iloc[0]
+    open_p = float(primeira["open"])
+    high_p = float(primeira["high"])
+    low_p = float(primeira["low"])
+    close_p = float(primeira["close"])
+
+    range_p = high_p - low_p
+    if range_p <= 0:
+        return {"valid": False, "reason": "range zero na 1ª vela"}
+
+    body = abs(close_p - open_p)
+    body_pct = body / range_p * 100
+
+    # Sombra superior e inferior
+    upper_wick = high_p - max(open_p, close_p)
+    lower_wick = min(open_p, close_p) - low_p
+    max_wick = max(upper_wick, lower_wick)
+    wick_pct = max_wick / range_p * 100
+
+    # Range vs ATR
+    atr = float(sessao["high"].sub(sessao["low"]).mean())
+    range_atr_ratio = range_p / atr if atr > 0 else 0
+
+    # Filtros de qualidade
+    if body_pct < params.min_body_pct:
+        return {"valid": False, "reason": f"doji: corpo {body_pct:.0f}% < {params.min_body_pct}%"}
+    if wick_pct > params.max_wick_pct:
+        return {"valid": False, "reason": f"sombra excessiva: {wick_pct:.0f}% > {params.max_wick_pct}%"}
+    if range_atr_ratio < params.min_range_atr:
+        return {"valid": False, "reason": f"range baixo: {range_atr_ratio:.2f} < {params.min_range_atr}"}
+    if range_atr_ratio > params.max_range_atr:
+        return {"valid": False, "reason": f"range excessivo: {range_atr_ratio:.2f} > {params.max_range_atr}"}
+
+    # Direção da vela
+    if close_p > open_p:
+        direction = "BULLISH"
+    elif close_p < open_p:
+        direction = "BEARISH"
+    else:
+        direction = "NEUTRAL"
+
+    quality = "GOOD" if body_pct >= params.min_body_pct * 1.5 else "OK"
+
+    return {
+        "valid": True,
+        "open": open_p, "high": high_p, "low": low_p, "close": close_p,
+        "range": range_p, "body_pct": body_pct, "wick_pct": wick_pct,
+        "range_atr_ratio": range_atr_ratio,
+        "direction": direction, "quality": quality,
+        "atr": atr,
+    }
 
 
 def detect_swings(
@@ -1982,6 +2197,374 @@ def confluence_signal(
     )
 
 
+# ── Setup TPO/VWAP ───────────────────────────────────────────────────────
+def tpo_vwap_signal(context: MarketContext) -> Signal:
+    """Setup TPO/VWAP: VWAP define direção, TPO define localização.
+
+    Fluxo: 1ª vela → VWAP → direção → qualidade → TPO → entrada → stop →
+           alvo → R/R → score → execução.
+
+    Retorna NEUTRO se qualquer etapa do fluxo falhar."""
+    params = context.params
+    df = context.df
+    price = float(df["close"].iloc[-1])
+
+    # ── 1. Análise da 1ª vela ──
+    primeira = analyze_first_candle(df, params)
+    if not primeira.get("valid"):
+        return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                      f"NO_TRADE: {primeira.get('reason', '1ª vela inválida')}",
+                      [], ["1ª vela não passou nos filtros"], [])
+
+    # ── 2. VWAP: direção ──
+    vwap = context.vwap
+    if vwap <= 0:
+        return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: VWAP indisponível", [], ["sem VWAP"], [])
+
+    vwap_dist = abs(context.vwap_distance_pct)
+    if vwap_dist < params.vwap_min_distance_pct:
+        return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: preço muito perto da VWAP",
+                      [], [f"distância {vwap_dist:.2f}% < {params.vwap_min_distance_pct}%"], [])
+
+    # Direção pela VWAP
+    if context.vwap_distance_pct > 0:
+        vwap_direction = Direction.BUY
+        vwap_label = "ACIMA da VWAP"
+    else:
+        vwap_direction = Direction.SELL
+        vwap_label = "ABAIXO da VWAP"
+
+    # ── 3. TPO: localização ──
+    tpo = compute_tpo(df)
+    if tpo["poc"] is None:
+        return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: TPO indisponível", [], ["sem dados TPO"], [])
+
+    # Contexto TPO
+    tpo_contexto = tpo["contexto"]
+    if tpo_contexto == "ACIMA_VAH":
+        tpo_label = "Acima da VAH (zona de distribuição)"
+        if vwap_direction == Direction.SELL:
+            tpo_score = 0.3  # preço acima da VAAP + VWAP vendendo = reversão
+        else:
+            tpo_score = 0.7  # confirma tendência
+    elif tpo_contexto == "ABAIXO_VAL":
+        tpo_label = "Abaixo da VAL (zona de acumulação)"
+        if vwap_direction == Direction.BUY:
+            tpo_score = 0.3
+        else:
+            tpo_score = 0.7
+    else:
+        tpo_label = "Dentro da área de valor"
+        tpo_score = 0.5
+
+    # ── 4. Anti-perseguição ──
+    if context.vwap_distance_pct > params.max_distance_from_vwap_pct:
+        if vwap_direction == Direction.BUY and context.vwap_distance_pct > 0:
+            return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                          "NO_TRADE: preço longe demais da VWAP",
+                          [], [f"distância {context.vwap_distance_pct:.2f}% > {params.max_distance_from_vwap_pct}%"], [])
+        if vwap_direction == Direction.SELL and context.vwap_distance_pct < 0:
+            return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                          "NO_TRADE: preço longe demais da VWAP",
+                          [], [f"distância {abs(context.vwap_distance_pct):.2f}% > {params.max_distance_from_vwap_pct}%"], [])
+
+    # ── 5. Direção final ──
+    # VWAP define a direção; 1ª vela confirma
+    if primeira["direction"] == "NEUTRAL":
+        direction = Direction.NEUTRAL
+    elif primeira["direction"] == "BULLISH" and vwap_direction == Direction.BUY:
+        direction = Direction.BUY
+    elif primeira["direction"] == "BEARISH" and vwap_direction == Direction.SELL:
+        direction = Direction.SELL
+    else:
+        # 1ª vela contradiz a VWAP → NO_TRADE
+        return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: 1ª vela contradiz a VWAP",
+                      [], [f"vela={primeira['direction']}, vwap={vwap_label}"], [])
+
+    if direction == Direction.NEUTRAL:
+        return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: sem direção clara",
+                      [], ["vela neutra ou VWAP neutra"], [])
+
+    # ── 6. Stop estrutural ──
+    if params.stop_basis == "FIRST_CANDLE":
+        if direction == Direction.BUY:
+            stop = primeira["low"] - params.stop_buffer_atr * primeira["atr"]
+            stop_label = "1ª vela low"
+        else:
+            stop = primeira["high"] + params.stop_buffer_atr * primeira["atr"]
+            stop_label = "1ª vela high"
+    elif params.stop_basis == "TPO_LEVEL":
+        if direction == Direction.BUY:
+            stop = tpo["val"] - params.stop_buffer_atr * primeira["atr"]
+            stop_label = "VAL"
+        else:
+            stop = tpo["vah"] + params.stop_buffer_atr * primeira["atr"]
+            stop_label = "VAH"
+    else:  # LOWEST
+        if direction == Direction.BUY:
+            stop = float(df["low"].tail(10).min()) - params.stop_buffer_atr * primeira["atr"]
+            stop_label = "mínima 10 candles"
+        else:
+            stop = float(df["high"].tail(10).max()) + params.stop_buffer_atr * primeira["atr"]
+            stop_label = "máxima 10 candles"
+
+    # Rejeitar stop dentro do ruído
+    risk = abs(price - stop)
+    risk_atr = risk / primeira["atr"] if primeira["atr"] > 0 else 0
+    if risk_atr < params.min_risk_atr:
+        return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: stop dentro do ruído",
+                      [], [f"risco {risk_atr:.2f} ATR < {params.min_risk_atr}"], [])
+
+    # ── 7. Alvo ──
+    if params.target_mode == "FIXED_RR":
+        rr = params.preferred_rr
+        if direction == Direction.BUY:
+            target = price + risk * rr
+        else:
+            target = price - risk * rr
+        target_label = f"FIXED_RR {rr:.1f}"
+    else:  # STRUCTURE
+        if direction == Direction.BUY:
+            highs = [s.price for s in context.swings if s.kind == "HIGH" and s.price > price]
+            target = min(highs) if highs else price + risk * params.preferred_rr
+        else:
+            lows = [s.price for s in context.swings if s.kind == "LOW" and s.price < price]
+            target = max(lows) if lows else price - risk * params.preferred_rr
+        target_label = "STRUCTURE"
+
+    reward = abs(target - price)
+    actual_rr = reward / risk if risk > 0 else 0
+
+    if actual_rr < params.minimum_rr:
+        return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: R/R abaixo do mínimo",
+                      [], [f"R/R {actual_rr:.2f} < {params.minimum_rr}"], [])
+
+    # ── 8. Score ──
+    vwap_score = 1.0 if abs(context.vwap_distance_pct) >= params.vwap_min_distance_pct * 2 else 0.5
+    candle_score = 1.0 if primeira["quality"] == "GOOD" else 0.6
+    volume_score = 1.0 if context.rvol >= 1.0 else 0.4
+    entry_score = tpo_score
+    rr_score = min(1.0, actual_rr / params.preferred_rr)
+
+    score = (
+        vwap_score * params.weight_vwap +
+        candle_score * params.weight_first_candle +
+        tpo_score * params.weight_tpo +
+        volume_score * params.weight_volume +
+        entry_score * params.weight_entry_location +
+        rr_score * params.weight_risk_reward
+    ) * 100
+
+    score = round(min(100.0, score), 1)
+
+    if score < params.minimum_signal_score:
+        return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                      f"NO_TRADE: score {score:.0f} < {params.minimum_signal_score:.0f}",
+                      [], [f"score insuficiente"], [])
+
+    # ── 9. Montar reasons e alerts ──
+    reasons = [
+        f"VWAP: {vwap_label} (dist {context.vwap_distance_pct:.2f}%)",
+        f"1ª vela: {primeira['direction']} (corpo {primeira['body_pct']:.0f}%, qualidade {primeira['quality']})",
+        f"TPO: {tpo_label} (POC {tpo['poc']:.2f})",
+        f"Entrada: {params.entry_mode} | Stop: {stop_label} | Alvo: {target_label}",
+        f"R/R: {actual_rr:.2f} | Score: {score:.0f}",
+    ]
+
+    alerts = []
+    if context.rvol < 0.8:
+        alerts.append("VOLUME BAIXO")
+    if vwap_dist > params.max_distance_from_vwap_pct * 0.8:
+        alerts.append("PREÇO DISTANTE DA VWAP")
+
+    setup_name = f"TPO/VWAP [{params.entry_mode}]"
+
+    return Signal(
+        "TPO/VWAP",
+        direction,
+        score,
+        min(100.0, score * 1.2),
+        setup_name,
+        reasons,
+        alerts,
+    )
+
+
+# ── Setup CHATGPT ────────────────────────────────────────────────────────
+def chatgpt_signal(context: MarketContext) -> Signal:
+    """Setup CHATGPT: EMA 200 + EMA 21 + VWAP + Volume + ATR.
+
+    Fluxo:
+    1. Filtro de tendência (EMA 200 + EMA 21)
+    2. Filtro de lateralização
+    3. Volume mínimo (≥ 1.2× média 20)
+    4. Direção pela VWAP
+    5. Entry por pullback/reteste
+    6. Stop estrutural + folga ATR
+    7. Alvo fixo (1.25R)
+    8. Score composto"""
+    params = context.params
+    df = context.df
+    price = float(df["close"].iloc[-1])
+
+    # ── 1. Filtro de tendência (EMA 200 + EMA 21) ──
+    # MarketContext.emas é um DataFrame com colunas ema_9, ema_21, ema_50, ema_200
+    try:
+        ema200 = float(context.emas["ema_200"].iloc[-1])
+        ema21 = float(context.emas["ema_21"].iloc[-1])
+    except (KeyError, IndexError, TypeError):
+        return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: EMAs indisponíveis", [], ["sem dados EMA"], [])
+
+    # Tendência de alta: preço > EMA200, EMA21 > EMA200
+    tendencia_alta = price > ema200 and ema21 > ema200
+    # Tendência de baixa: preço < EMA200, EMA21 < EMA200
+    tendencia_baixa = price < ema200 and ema21 < ema200
+
+    if not tendencia_alta and not tendencia_baixa:
+        return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: sem tendência definida",
+                      [], [f"preço={price:.2f}, EMA21={ema21:.2f}, EMA200={ema200:.2f}"], [])
+
+    # ── 2. Filtro de lateralização ──
+    if params.chatgpt_filtrar_lateral:
+        # EMA21 horizontal: variação < 0.1% em 10 candles
+        try:
+            ema21_series = context.emas["ema_21"].tail(10)
+            if len(ema21_series) >= 2:
+                ema21_var = abs(float(ema21_series.iloc[-1]) - float(ema21_series.iloc[0])) / float(ema21_series.iloc[0]) * 100
+                if ema21_var < 0.1:
+                    return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                                  "NO_TRADE: lateralização (EMA21 horizontal)",
+                                  [], [f"EMA21 variação {ema21_var:.3f}% < 0.1%"], [])
+        except (KeyError, IndexError, TypeError):
+            pass  # sem dados de EMA, pula o filtro
+
+    # ── 3. Filtro de volume ──
+    volume_atual = float(df["volume"].iloc[-1])
+    volume_media = float(df["volume"].tail(params.chatgpt_volume_media_periodo).mean())
+    if volume_media <= 0:
+        return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: volume médio zero", [], ["sem dados volume"], [])
+
+    volume_ratio = volume_atual / volume_media
+    if volume_ratio < params.chatgpt_volume_min_ratio:
+        return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: volume abaixo do mínimo",
+                      [], [f"volume {volume_ratio:.2f}× < {params.chatgpt_volume_min_ratio}×"], [])
+
+    # ── 4. Direção ──
+    if tendencia_alta:
+        direction = Direction.BUY
+        tendencia_label = "ALTA"
+    else:
+        direction = Direction.SELL
+        tendencia_label = "BAIXA"
+
+    # ── 5. Filtro de distância da VWAP ──
+    vwap = context.vwap
+    if vwap <= 0:
+        return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: VWAP indisponível", [], ["sem VWAP"], [])
+
+    vwap_dist = context.vwap_distance_pct
+    if direction == Direction.BUY and vwap_dist < 0:
+        return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: preço abaixo da VWAP em tendência de alta",
+                      [], [f"distância VWAP {vwap_dist:.2f}%"], [])
+    if direction == Direction.SELL and vwap_dist > 0:
+        return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: preço acima da VWAP em tendência de baixa",
+                      [], [f"distância VWAP {vwap_dist:.2f}%"], [])
+
+    # ── 6. Stop estrutural ──
+    atr = context.atr
+    if atr <= 0:
+        return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: ATR indisponível", [], ["sem ATR"], [])
+
+    if direction == Direction.BUY:
+        # Stop abaixo do fundo do pullback + folga ATR
+        lows_recentes = df["low"].tail(10)
+        stop_base = float(lows_recentes.min())
+        stop = stop_base - params.chatgpt_atr_stop_buffer * atr
+        stop_label = "fundo pullback"
+    else:
+        # Stop acima do topo do pullback + folga ATR
+        highs_recentes = df["high"].tail(10)
+        stop_base = float(highs_recentes.max())
+        stop = stop_base + params.chatgpt_atr_stop_buffer * atr
+        stop_label = "topo pullback"
+
+    risk = abs(price - stop)
+    if risk <= 0:
+        return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: stop inválido", [], ["risco zero"], [])
+
+    # ── 7. Alvo ──
+    rr = params.chatgpt_rr_alvo
+    if direction == Direction.BUY:
+        target = price + risk * rr
+    else:
+        target = price - risk * rr
+
+    reward = abs(target - price)
+    actual_rr = reward / risk if risk > 0 else 0
+
+    # ── 8. Score ──
+    # Tendência (EMA)
+    tendencia_score = 1.0 if (tendencia_alta and ema21 > ema200) or (tendencia_baixa and ema21 < ema200) else 0.5
+    # VWAP
+    vwap_score = 1.0 if abs(vwap_dist) >= 0.2 else 0.6
+    # Volume
+    volume_score = min(1.0, volume_ratio / params.chatgpt_volume_min_ratio)
+    # R/R
+    rr_score = min(1.0, actual_rr / params.chatgpt_rr_alvo)
+
+    score = (
+        tendencia_score * 0.35 +
+        vwap_score * 0.25 +
+        volume_score * 0.25 +
+        rr_score * 0.15
+    ) * 100
+    score = round(min(100.0, score), 1)
+
+    # ── 9. Reasons e alerts ──
+    reasons = [
+        f"Tendência: {tendencia_label} (EMA21={'>' if tendencia_alta else '<'} EMA200)",
+        f"Preço: {price:.2f} | EMA21: {ema21:.2f} | EMA200: {ema200:.2f}",
+        f"VWAP: {vwap:.2f} (dist {vwap_dist:.2f}%)",
+        f"Volume: {volume_ratio:.2f}× média 20 (mín {params.chatgpt_volume_min_ratio}×)",
+        f"Stop: {stop_label} + {params.chatgpt_atr_stop_buffer}×ATR",
+        f"Alvo: {rr:.2f}R | Score: {score:.0f}",
+    ]
+
+    alerts = []
+    if volume_ratio < params.chatgpt_volume_min_ratio * 1.2:
+        alerts.append("VOLUME MARGINAL")
+    if abs(vwap_dist) > 1.0:
+        alerts.append("PREÇO DISTANTE DA VWAP")
+
+    setup_name = f"CHATGPT [{tendencia_label}]"
+
+    return Signal(
+        "CHATGPT",
+        direction,
+        score,
+        min(100.0, score * 1.1),
+        setup_name,
+        reasons,
+        alerts,
+    )
+
+
 def round_tick(price: float, mode: str, tick: float = 0.01) -> float:
     scaled = price / tick
     if mode == "floor":
@@ -2157,6 +2740,11 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
         if entry - stop < minimum_distance:
             stop = entry - minimum_distance
             basis += minimo_label
+        # Limite máximo de stop: 0,5% do preço de entrada
+        max_stop_dist = entry * params.stop_maximo_pct / 100
+        if entry - stop > max_stop_dist:
+            stop = entry - max_stop_dist
+            basis += f"+máx_{params.stop_maximo_pct:g}%"
         stop = round_tick(stop, "floor")
         risk = entry - stop
         if risk <= 0:
@@ -2164,10 +2752,21 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
             return
         target_1 = round_tick(entry + risk * params.rr_alvo_1 * params.encolher_alvos, "ceil")
         target_2 = round_tick(entry + risk * params.rr_alvo_2 * params.encolher_alvos, "ceil")
+        # Limite máximo de gain: 0,5% do preço de entrada
+        max_gain_dist = entry * params.gain_maximo_pct / 100
+        if target_1 - entry > max_gain_dist:
+            target_1 = entry + max_gain_dist
+        if target_2 - entry > max_gain_dist:
+            target_2 = entry + max_gain_dist
     else:
         if stop - entry < minimum_distance:
             stop = entry + minimum_distance
             basis += minimo_label
+        # Limite máximo de stop: 0,5% do preço de entrada
+        max_stop_dist = entry * params.stop_maximo_pct / 100
+        if stop - entry > max_stop_dist:
+            stop = entry + max_stop_dist
+            basis += f"+máx_{params.stop_maximo_pct:g}%"
         stop = round_tick(stop, "ceil")
         risk = stop - entry
         if risk <= 0:
@@ -2175,6 +2774,12 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
             return
         target_1 = round_tick(entry - risk * params.rr_alvo_1 * params.encolher_alvos, "floor")
         target_2 = round_tick(entry - risk * params.rr_alvo_2 * params.encolher_alvos, "floor")
+        # Limite máximo de gain: 0,5% do preço de entrada
+        max_gain_dist = entry * params.gain_maximo_pct / 100
+        if entry - target_1 > max_gain_dist:
+            target_1 = entry - max_gain_dist
+        if entry - target_2 > max_gain_dist:
+            target_2 = entry - max_gain_dist
 
     alternatives = alternative_targets(
         context,
@@ -2250,7 +2855,11 @@ def analyze(
     # confirmar/contrariar/definir a direção depois. É por isso que o IFR
     # é calculado ANTES e passado — não anexado à lista `isolated`.
     confluence = confluence_signal(context, isolated, rsi)
-    signals = [confluence, *isolated, rsi]
+    # Setup TPO/VWAP: fluxo independente com VWAP + TPO + 1ª vela
+    tpo_vwap = tpo_vwap_signal(context)
+    # Setup CHATGPT: EMA 200 + EMA 21 + VWAP + Volume + ATR
+    chatgpt = chatgpt_signal(context)
+    signals = [confluence, *isolated, rsi, tpo_vwap, chatgpt]
 
     for signal in signals:
         attach_risk(signal, context)
@@ -2275,7 +2884,7 @@ class MultiTimeframeResult:
     confirmed_direction: Direction
 
 
-MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR")
+MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR", "TPO/VWAP", "CHATGPT")
 ALL_MODALITIES_OPTION = "Todas as modalidades"
 MODALITY_CHOICES = (ALL_MODALITIES_OPTION, *MODALITIES)
 
