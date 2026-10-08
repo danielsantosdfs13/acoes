@@ -2619,7 +2619,7 @@ def render_dashboard(source: str, count: int, risk_budget: float | None, params:
                       perfis: list[str], style: str) -> None:
     """Tela principal: top oportunidades de relance, organizadas por perfil.
 
-    Notificações push ativas permanentemente para sinais com score ≥ 85,
+    Notificações push ativas permanentemente para sinais com score ≥ 82,
     das 10:00 às 16:45. Auto-refresh a cada 3 minutos apenas no pregão
     (09:30–18:00, dias úteis)."""
 
@@ -2665,7 +2665,7 @@ def render_dashboard(source: str, count: int, risk_budget: float | None, params:
         )
         return
 
-    # ── Notificações push para score ≥ 85 (10:00–16:45) ──
+    # ── Notificações push para score ≥ 82 (10:00–16:45) ──
     _notificar_score_alto(operáveis)
 
     for _, row in operáveis.head(5).iterrows():
@@ -2674,21 +2674,21 @@ def render_dashboard(source: str, count: int, risk_budget: float | None, params:
 
 
 def _notificar_score_alto(operaveis) -> None:
-    """Notificação push para sinais com score ≥ 85, das 10:00 às 16:45."""
+    """Notificação push para sinais com score ≥ 82, das 10:00 às 16:45."""
     if operaveis.empty:
         return
 
-    # Só notifica dentro do horário de operação
-    from datetime import datetime
-    agora = datetime.now()
+    # Só notifica dentro do horário de operação (fuso de Brasília)
+    from zoneinfo import ZoneInfo
+    agora = datetime.now(ZoneInfo("America/Sao_Paulo"))
     if agora.hour < 10 or (agora.hour == 16 and agora.minute > 45) or agora.hour > 16:
         return
 
-    chave = "_sinais_notificados_85"
+    chave = "_sinais_notificados_82"
     if chave not in st.session_state:
         st.session_state[chave] = set()
 
-    altos = operaveis[operaveis["Score Geral"].fillna(0) >= 85]
+    altos = operaveis[operaveis["Score Geral"].fillna(0) >= 82]
     for _, row in altos.iterrows():
         symbol = row.get("Ativo", "?")
         score = row.get("Score Geral", 0)
