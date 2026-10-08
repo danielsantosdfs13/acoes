@@ -2133,6 +2133,12 @@ if "source_select" not in st.session_state:
 if "symbol_select" not in st.session_state:
     st.session_state.symbol_select = st.session_state.watchlist[0]
 
+# Risco persiste entre reruns e refreshes da página. Sem esta inicialização,
+# o widget `risk_budget_input` volta a 0.0 a cada reload porque o default
+# do number_input é 0.0 — e o valor digitado se perde.
+if "risk_budget_input" not in st.session_state:
+    st.session_state.risk_budget_input = 0.0
+
 # Se alguma tela pediu pra "pular" pra um ativo, aplica ANTES do selectbox
 # nascer. A troca de TELA não acontece mais aqui: quem chama `_ir_para` já
 # fez `st.switch_page`, então esta chave carrega só o símbolo.
@@ -3627,8 +3633,10 @@ with st.sidebar:
 
     # Risco subiu da antiga seção "Parâmetros": é ele que transforma um sinal
     # em quantidade de ações, então aparece em todo card do Oportunidades.
+    # O valor persiste em session_state ("risk_budget_input") — ver inicialização
+    # no topo do arquivo. Sem isso, o número digitado se perde a cada refresh.
     risk_budget = st.number_input(
-        "Risco máximo (R$)", min_value=0.0, value=0.0, step=50.0, key="risk_budget_input",
+        "Risco máximo (R$)", min_value=0.0, step=50.0, key="risk_budget_input",
         help="Quanto você aceita perder se o stop for acionado. Zero = não calcular quantidade.",
     )
     risk_budget = risk_budget if risk_budget > 0 else None
