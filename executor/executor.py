@@ -148,9 +148,10 @@ MERCADO_FECHADO_SLEEP_SECONDS = float(os.environ.get("MERCADO_FECHADO_SLEEP_SECO
 TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10"))
 
 # Score mínimo por janela de operação.
-# Todas as janelas: 79 pontos
+# Manhã (10:00–12:00): 79 pontos — janela principal, operação normal.
+# Tarde (14:00+): 91 pontos — apenas sinais fortes (score > 90).
 SCORE_MINIMO_MANHA = float(os.environ.get("EXECUTOR_SCORE_MINIMO_MANHA", "79"))
-SCORE_MINIMO_TARDE = float(os.environ.get("EXECUTOR_SCORE_MINIMO_TARDE", "79"))
+SCORE_MINIMO_TARDE = float(os.environ.get("EXECUTOR_SCORE_MINIMO_TARDE", "91"))
 
 
 def _mercado_aberto(agora: datetime | None = None) -> bool:
@@ -508,14 +509,15 @@ def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
             continue
         if _fechamento_da_vela(s) < limite_idade:
             continue
-        # Score mínimo por janela: tarde é mais seletiva (75) que manhã (70)
+        # Score mínimo por janela: tarde (14h+) exige >90, manhã é mais ampla
         agora_hora = datetime.now(ZoneInfo(MERCADO_TIMEZONE)).hour
-        score_min = SCORE_MINIMO_TARDE if 14 <= agora_hora < 16 else SCORE_MINIMO_MANHA
+        tarde = agora_hora >= 14
+        score_min = SCORE_MINIMO_TARDE if tarde else SCORE_MINIMO_MANHA
         score = s.get("score") or 0
         if score < score_min:
             log.debug("sinal %s score=%.1f < %.1f (janela %s), pulando.",
                       s.get("id"), score, score_min,
-                      "tarde" if 14 <= agora_hora < 16 else "manhã")
+                      "tarde" if tarde else "manhã")
             continue
         candidatos.append(s)
     return candidatos
