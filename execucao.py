@@ -550,6 +550,161 @@ def enviar_ordem_mercado(
         mt5.shutdown()
 
 
+def enviar_ordem_limitada(
+    symbol: str,
+    direcao: str,
+    preco_limite: float,
+    volume: float | None = None,
+    stop: float | None = None,
+    alvo: float | None = None,
+    comentario: str = "",
+    simular: bool = False,
+    risco_maximo: float | None = None,
+    atr: float | None = None,
+    rr: float | None = None,
+    validade_candles: int = 3,
+) -> dict:
+    """Envia uma ordem LIMITADA com stop e alvo anexados (Fase 2).
+
+    A ordem limitada fica no book até executar ou expirar. Se o preço
+    abrir BEYOND o limite (melhor para o trader), executa na abertura.
+
+    `preco_limite` é o preço da limitada:
+    - COMPRA: close_sinal - recuo_atr × ATR
+    - VENDA: close_sinal + recuo_atr × ATR
+
+    `validade_candles` é quantos candles a ordem fica no book antes de
+    expirar (via `mt5.order_delete`).
+
+    Devolve dict igual a `enviar_ordem_mercado`, com campo extra:
+    - `status`: ENVIADA | EXPIRADA | RECUSADA
+    """
+    import MetaTrader5 as mt5  # import tardio — DLL de Windows
+
+    if direcao not in ("COMPRA", "VENDA"):
+        raise OrdemRecusada(f"Direção inválida: {direcao!r}. Use 'COMPRA' ou 'VENDA'.")
+
+    if (volume is None) == (risco_maximo is None):
+        raise OrdemRecusada(
+            "Passe `volume` OU `risco_maximo`, nunca os dois nem nenhum."
+        )
+
+    if not ORDENS_HABILITADAS and not simular:
+        raise OrdemRecusada(
+            "Envio de ordens desligado (ORDENS_HABILITADAS=False)."
+        )
+
+    conta = _mt5_conectar(mt5)
+    try:
+        tipo = _conferir_tipo_conta(conta)
+
+        if not mt5.symbol_select(symbol, True):
+            raise OrdemRecusada(f"Símbolo {symbol} não existe nesta conta ({mt5.last_error()}).")
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            raise OrdemRecusada(f"Sem informação do símbolo {symbol} ({mt5.last_error()}).")
+
+        tick = _esperar_cotacao(mt5, symbol)
+        comprar = direcao == "COMPRA"
+        preco_atual = tick.ask if comprar else tick.bid
+
+        # Conferir stop mínimo contra o preço ATUAL (não o limite)
+        _conferir_stop_minimo(preco_atual, stop, atr)
+
+        # Se o preço atual já está BEYOND o limite, executa a mercado
+        # (preço melhor para o trader)
+        executar_mercado = False
+        if comprar and preco_atual <= preco_limite:
+            executar_mercado = True
+        elif not comprar and preco_atual >= preco_limite:
+            executar_mercado = True
+
+        # Alvo recalculado
+        alvo_recolocado = _alvo_por_rr(info, direcao, preco_atual, stop, rr)
+        if alvo_recolocado is not None:
+            alvo = alvo_recolocado
+
+        _conferir_coerencia(direcao, preco_atual, stop, alvo)
+
+        if risco_maximo is not None:
+            volume = _volume_por_risco(info, risco_maximo, preco_atual, stop)
+        volume = _normalizar_volume(info, volume)
+
+        risco_efetivo = volume * abs(preco_atual - stop) if stop is not None else None
+
+        if executar_mercado:
+            # Ordem a mercado (preço melhor)
+            pedido = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": float(volume),
+                "type": mt5.ORDER_TYPE_BUY if comprar else mt5.ORDER_TYPE_SELL,
+                "price": float(preco_atual),
+                "deviation": DESVIO_MAXIMO_POINTS,
+                "type_time": mt5.ORDER_TIME_DAY,
+                "type_filling": _modo_preenchimento(mt5, info),
+                "comment": (comentario or "acoes-limit")[:20],
+            }
+            log.info(
+                "%s: preço atual %g além do limite %g — executando a MERCADO",
+                symbol, preco_atual, preco_limite,
+            )
+        else:
+            # Ordem limitada no book
+            pedido = {
+                "action": mt5.TRADE_ACTION_PENDING,
+                "symbol": symbol,
+                "volume": float(volume),
+                "type": mt5.ORDER_TYPE_BUY_LIMIT if comprar else mt5.ORDER_TYPE_SELL_LIMIT,
+                "price": float(preco_limite),
+                "type_time": mt5.ORDER_TIME_DAY,
+                "type_filling": _modo_preenchimento(mt5, info),
+                "comment": (comentario or "acoes-limit")[:20],
+            }
+
+        if stop:
+            pedido["sl"] = float(stop)
+        if alvo:
+            pedido["tp"] = float(alvo)
+
+        checagem = mt5.order_check(pedido)
+        if checagem is None:
+            raise OrdemRecusada(f"order_check falhou: {mt5.last_error()}")
+        if checagem.retcode != mt5.TRADE_RETCODE_DONE:
+            raise OrdemRecusada(
+                f"order_check recusou: retcode={checagem.retcode} {checagem.comment}"
+            )
+
+        resultado = mt5.order_send(pedido)
+        if resultado is None:
+            raise OrdemRecusada(f"order_send falhou: {mt5.last_error()}")
+        if resultado.retcode != mt5.TRADE_RETCODE_DONE:
+            raise OrdemRecusada(
+                f"Corretora recusou: retcode={resultado.retcode} {resultado.comment}"
+            )
+
+        ok = resultado.retcode == mt5.TRADE_RETCODE_DONE
+        base = {
+            "conta": conta.login, "servidor": conta.server, "tipo_conta": tipo,
+            "volume": volume, "preco_pedido": preco_limite,
+            "stop": stop, "alvo": alvo, "risco_efetivo": risco_efetivo,
+        }
+        return {
+            **base,
+            "simulado": False,
+            "enviado": ok,
+            "ticket": resultado.order or None,
+            "preco_executado": resultado.price or None,
+            "volume_executado": resultado.volume or None,
+            "retcode": resultado.retcode,
+            "comentario": resultado.comment,
+            "status": "ENVIADA" if ok else "RECUSADA",
+            "executada_mercado": executar_mercado,
+        }
+    finally:
+        mt5.shutdown()
+
+
 # ==========================================================================
 # Proteção do stop de uma posição já aberta (2026-08-14)
 #

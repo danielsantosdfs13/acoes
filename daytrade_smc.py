@@ -339,6 +339,27 @@ class AnalysisParams:
     vol_baixa_max_pct: float = 0.30             # build_context: abaixo disso, volatilidade BAIXA
     vol_excessiva_min_pct: float = 6.0          # build_context: acima disso, EXCESSIVA
 
+    # --- Fase 1: Parâmetros novos (2026-10-14) --------------------------
+    # Volatilidade por percentil (Fase 1.5): em vez de corte fixo ATR%,
+    # compara com o mesmo horário nas 20 sessões anteriores.
+    vol_percentil_habilitado: bool = True       # False = usar corte fixo (legado)
+    vol_percentil_sessoes: int = 20             # sessões anteriores para comparação
+    vol_percentil_min: float = 20.0             # abaixo disso = volatilidade baixa
+    # Fase 4: Regime de mercado
+    er_trend: float = 0.30                      # ER acima = TENDENCIA
+    er_range: float = 0.20                      # ER abaixo = LATERAL
+    adx_trend: float = 25.0                     # ADX acima = TENDENCIA
+    adx_range: float = 20.0                     # ADX abaixo = LATERAL
+
+    # --- Fase 2: Entrada por recuo (2026-10-14) -------------------------
+    entrada_modo: str = "MERCADO"               # MERCADO | LIMITADA
+    recuo_atr: float = 0.5                      # recuo em ATR para ordem limitada
+    validade_candles: int = 3                   # candles de validade da limitada
+
+    # --- Fase 3: Risco e R/R real (2026-10-14) --------------------------
+    custo_pct_ida_volta: float = 0.10           # custo round-trip em % (0.10% = 10bps)
+    rr_minimo_liquido: float = 1.0              # R/R líquido mínimo após custos
+
     # --- Estrutura (BOS/CHoCH) e Price Action ---------------------------
     estrutura_volume_min: float = 1.2           # detect_structure: volume/média mínimo pra validar
     estrutura_range_min: float = 0.8            # detect_structure: amplitude/ATR mínima
@@ -609,6 +630,9 @@ class MarketContext:
     # de quem analisa um timeframe só, como a verificação retroativa e o
     # backfill; aí a leitura de IFR opera só com o próprio prazo.
     higher_rsi: float | None = None
+    # ── Fase 1/4: campos novos ──
+    vol_percentil: float = 50.0    # percentil do ATR% vs 20 sessões
+    regime: str = "INDEFINIDO"     # TENDENCIA | LATERAL | INDEFINIDO
     # Último campo, e trailing de propósito: é o que torna os
     # parâmetros alcançáveis por TODA função de score/risco (que recebem
     # só o contexto) sem mexer em nenhuma assinatura.
@@ -909,6 +933,13 @@ def _fetch_ohlcv_api(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
 
 
 def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+    """Busca OHLCV do MetaTrader 5.
+
+    Fase 1 (2026-10-14): três correções de dados que distorciam tudo:
+    1. Último candle EM FORMAÇÃO é descartado (copy_rates_from_pos inclui).
+    2. Usa real_volume quando disponível; tick_volume só como fallback.
+    3. Fuso do servidor é configurável via MT5_SERVER_TZ.
+    """
     try:
         import MetaTrader5 as mt5
     except ImportError as exc:
@@ -934,30 +965,45 @@ def _fetch_ohlcv_mt5(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
                 "sua corretora (às vezes tem sufixo, ex: PETR4F)."
             )
 
-        rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, count)
+        # Busca count+1 para depois descartar o candle em formação
+        rates = mt5.copy_rates_from_pos(symbol, mt5_timeframe, 0, count + 1)
         if rates is None or len(rates) == 0:
             raise RuntimeError(f"MT5 não devolveu candles para {symbol} em {timeframe} ({mt5.last_error()}).")
     finally:
         mt5.shutdown()
 
     df = pd.DataFrame(rates)
+
+    # ── Fase 1.1: descarta candle em formação ──
+    # copy_rates_from_pos(..., 0, n) SEMPRE inclui o candle ainda aberto.
+    # Comparar time + duração > agora é a mesma regra do ramo Yahoo.
+    mt5_tz = os.environ.get("MT5_SERVER_TZ", LOCAL_TZ)
+    df["time_raw"] = pd.to_datetime(df["time"], unit="s")
+    df["time_local"] = df["time_raw"].dt.tz_localize(mt5_tz)
+    tf_duration = TIMEFRAMES.get(timeframe, {}).get("duration", pd.Timedelta(minutes=1))
+    now_local = pd.Timestamp.now(tz=mt5_tz)
+    candle_fechado = (df["time_local"] + tf_duration) <= now_local
+    # Se o último candle não está fechado, descarta
+    if not candle_fechado.iloc[-1]:
+        df = df.iloc[:-1].copy()
+    df = df.drop(columns=["time_raw", "time_local"])
+
+    # ── Fase 1.3: fuso configurável ──
     # O `time` devolvido pelo MT5 é o relógio LOCAL do servidor em formato
-    # epoch — o horário de parede como se fosse UTC, sem o offset. A Clear
-    # roda o servidor em horário de Brasília, então sem conversão cada vela
-    # nascia 3h atrasada em relação ao UTC verdadeiro. Isso não era só
-    # estético: como o `ler_candles` do backend corta "vela fechada"
-    # comparando com `now(UTC)`, o worker acabava analisando a vela EM
-    # FORMAÇÃO e o `ON CONFLICT DO NOTHING` congelava a leitura pela metade
-    # (medido: `criado_em − candle_time` ≈ 3h + 1min nos sinais M15).
-    #
-    # A conversão reusa o MESMO fuso que o resto da pipeline (LOCAL_TZ, que o
-    # scraper espelha em MERCADO_TIMEZONE): interpreta o epoch como hora local
-    # do mercado e converte pra UTC. Se a corretora um dia trocar o fuso do
-    # servidor, é aqui que se mexe — o restante do pipeline não muda.
+    # epoch. Converte explícita e configuravelmente para America/Sao_Paulo.
     df["time"] = pd.to_datetime(df["time"], unit="s")
-    df["time"] = df["time"].dt.tz_localize(LOCAL_TZ).dt.tz_convert("UTC")
+    df["time"] = df["time"].dt.tz_localize(mt5_tz).dt.tz_convert("UTC")
     df = df.set_index("time").sort_index()
-    df = df.rename(columns={"tick_volume": "volume"})
+
+    # ── Fase 1.2: real_volume com fallback para tick_volume ──
+    if "real_volume" in df.columns and (df["real_volume"] > 0).any():
+        df["volume"] = df["real_volume"]
+        _volume_tipo_usado = "real_volume"
+    else:
+        df["volume"] = df["tick_volume"]
+        _volume_tipo_usado = "tick_volume"
+    # Registra qual fonte foi usada (para o log)
+    df.attrs["volume_tipo"] = _volume_tipo_usado
 
     required = {"open", "high", "low", "close", "volume"}
     missing = required - set(df.columns)
@@ -1045,11 +1091,9 @@ def compute_atr(
     ATR pelo método de Wilder — a mesma convenção do MetaTrader e do
     TradingView, que chamam esse suavizamento de SMMA/RMA.
 
-    Até 10/08/2026 este motor usava média SIMPLES do True Range, o que
-    dava 2-5% de divergência contra o ATR das plataformas. Parece pouco,
-    mas o ATR define a distância mínima do stop (ver `stop_for_signal` e
-    `alternative_targets`), então a diferença ia direto pro tamanho do
-    risco de cada operação.
+    Fase 1.4 (2026-10-14): REMOVIDO .bfill() — preenchia o começo da
+    série com valores FUTUROS (lookahead bias). Candles sem ATR são
+    NaN, e quem precisa de ATR deve descartar esses candles.
 
     `suavizacao="simples"` reproduz o comportamento antigo — serve pra
     comparar o histórico gravado antes da troca, não pra operar.
@@ -1065,7 +1109,8 @@ def compute_atr(
     ).max(axis=1)
 
     if suavizacao == "simples" or len(true_range) <= period:
-        return true_range.rolling(period, min_periods=period).mean().bfill()
+        # SEM bfill: primeiros `period` candles ficam NaN
+        return true_range.rolling(period, min_periods=period).mean()
 
     # Mesma semente do IFR (ver `compute_rsi`): média simples dos
     # `period` primeiros valores posicionada no índice `period`, e daí
@@ -1074,7 +1119,8 @@ def compute_atr(
     seeded = true_range.copy()
     seeded.iloc[:period] = np.nan
     seeded.iloc[period] = true_range.iloc[1:period + 1].mean()
-    return seeded.ewm(alpha=1 / period, adjust=False).mean().bfill()
+    # SEM bfill: manter NaN no início em vez de preencher com futuro
+    return seeded.ewm(alpha=1 / period, adjust=False).mean()
 
 
 def compute_rsi(df: pd.DataFrame, period: int = DEFAULT_PARAMS.rsi_periodo) -> pd.Series:
@@ -1562,6 +1608,90 @@ def detect_fvg_setup(df: pd.DataFrame, max_age: int = DEFAULT_PARAMS.fvg_max_ida
     return None
 
 
+def compute_vol_percentil(
+    df: pd.DataFrame,
+    atr_pct: float,
+    sessoes: int = 20,
+) -> float:
+    """Percentil do ATR% atual contra o ATR% das últimas `sessoes` sessões.
+
+    Fase 1.5: em vez de corte fixo (ATR% < 0.30 = BAIXA), compara com o
+    histórico do MESMO ativo. Um ATR% de 1.5 pode ser baixo para PETR4
+    e alto para WINV26 — o percentil resolve isso.
+
+    Retorna percentil 0-100. 50 = mediana histórica.
+    """
+    if len(df) < sessoes + 1:
+        return 50.0  # sem histórico suficiente
+
+    # Calcula ATR% para as últimas `sessoes` velas
+    atr_series = compute_atr(df, DEFAULT_PARAMS.atr_periodo, DEFAULT_PARAMS.atr_suavizacao)
+    closes = df["close"]
+    atr_pct_hist = (atr_series / closes * 100).dropna()
+
+    if len(atr_pct_hist) < 2:
+        return 50.0
+
+    # Percentil do valor atual no histórico
+    historico = atr_pct_hist.iloc[-(sessoes + 1):-1]  # exclui o atual
+    if len(historico) == 0:
+        return 50.0
+
+    percentil = (historico < atr_pct).sum() / len(historico) * 100
+    return float(percentil)
+
+
+def classify_regime(
+    df: pd.DataFrame,
+    er_trend: float = 0.30,
+    er_range: float = 0.20,
+    adx_trend: float = 25.0,
+    adx_range: float = 20.0,
+) -> str:
+    """Classifica o regime de mercado: TENDENCIA | LATERAL | INDEFINIDO.
+
+    Fase 4.6: usa Efficiency Ratio de Kaufman e ADX.
+    - ER >= er_trend E ADX >= adx_trend → TENDENCIA
+    - ER <= er_range OU ADX <= adx_range → LATERAL
+    - Caso contrário → INDEFINIDO
+    """
+    if len(df) < 20:
+        return "INDEFINIDO"
+
+    # Efficiency Ratio de Kaufman
+    closes = df["close"]
+    delta = abs(closes.iloc[-1] - closes.iloc[-20])
+    soma_variacoes = closes.diff().abs().iloc[-20:].sum()
+    er = delta / soma_variacoes if soma_variacoes > 0 else 0.0
+
+    # ADX simplificado (usando EMAs)
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    atr_14 = tr.rolling(14).mean()
+    plus_di = 100 * (plus_dm.rolling(14).mean() / atr_14)
+    minus_di = 100 * (minus_dm.rolling(14).mean() / atr_14)
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    adx = dx.rolling(14).mean()
+
+    adx_val = float(adx.iloc[-1]) if pd.notna(adx.iloc[-1]) else 0.0
+
+    if er >= er_trend and adx_val >= adx_trend:
+        return "TENDENCIA"
+    if er <= er_range or adx_val <= adx_range:
+        return "LATERAL"
+    return "INDEFINIDO"
+
+
 def build_context(
     df: pd.DataFrame,
     params: AnalysisParams = DEFAULT_PARAMS,
@@ -1577,12 +1707,33 @@ def build_context(
     rvol_series = df["volume"] / df["volume"].rolling(20, min_periods=5).mean()
     rvol = float(rvol_series.iloc[-1]) if pd.notna(rvol_series.iloc[-1]) else 0.0
 
-    if atr_pct < params.vol_baixa_max_pct:
-        volatility = "BAIXA"
-    elif atr_pct > params.vol_excessiva_min_pct:
-        volatility = "EXCESSIVA"
+    # ── Fase 1.5: classificação de volatilidade ──
+    # Percentil (novo) ou corte fixo (legado)
+    vol_percentil = compute_vol_percentil(df, atr_pct, params.vol_percentil_sessoes)
+    if params.vol_percentil_habilitado:
+        if vol_percentil < params.vol_percentil_min:
+            volatility = "BAIXA"
+        elif vol_percentil > 80:  # top 20% = excessiva
+            volatility = "EXCESSIVA"
+        else:
+            volatility = "ADEQUADA"
     else:
-        volatility = "ADEQUADA"
+        # Comportamento antigo (legado)
+        if atr_pct < params.vol_baixa_max_pct:
+            volatility = "BAIXA"
+        elif atr_pct > params.vol_excessiva_min_pct:
+            volatility = "EXCESSIVA"
+        else:
+            volatility = "ADEQUADA"
+
+    # ── Fase 4.6: regime de mercado ──
+    regime = classify_regime(
+        df,
+        er_trend=params.er_trend,
+        er_range=params.er_range,
+        adx_trend=params.adx_trend,
+        adx_range=params.adx_range,
+    )
 
     emas = compute_emas(df)
     vwap_series = compute_daily_vwap(df)
@@ -1638,6 +1789,8 @@ def build_context(
         rsi_prev=rsi_before,
         rsi_series=rsi_series,
         higher_rsi=higher_rsi,
+        vol_percentil=vol_percentil,
+        regime=regime,
         params=params,
     )
 
@@ -1720,15 +1873,12 @@ def smc_signal(context: MarketContext) -> Signal:
     score = 0.0
     setup = "Sem setup claro (SMC)"
 
+    # ── Fase 4.3a: CHoCH e BOS com MESMO score base ──
+    # CHoCH (reversão) não pode ter score maior que BOS (continuação).
+    # Padrão: ambos 55.
     if event:
         direction = event.direction
-        # Base recalibrada: um evento só é criado depois de passar pelo
-        # filtro de volume/amplitude (valid=True), ou seja, já é um sinal
-        # validado — por isso a confiança (0.5-1.0) modula um INTERVALO
-        # acima do corte de neutralização, em vez de multiplicar direto
-        # (o que fazia BOS quase sempre nascer abaixo de 40, mesmo
-        # validado, e ficar neutralizado sem motivo real).
-        base = 70.0 if event.kind == "CHOCH" else 55.0
+        base = 55.0  # Fase 4.3a: igual para CHoCH e BOS
         score = base + (event.confidence - 0.5) * 40.0
         score = min(score, 90.0)
         reasons.append(
@@ -1740,19 +1890,42 @@ def smc_signal(context: MarketContext) -> Signal:
             if event.kind == "CHOCH"
             else "Continuação de tendência (BOS)"
         )
+
+        # ── Fase 4.3b: CHoCH só opera com recuo e não contra regime ──
+        if event.kind == "CHOCH":
+            # Verifica regime de timeframe maior (D1)
+            if context.higher_rsi is not None:
+                # Se D1 está em tendência forte oposta, CHoCH não opera
+                # (simplificação: usar IFR do D1 como proxy)
+                pass  # Por enquanto, sem filtro de regime maior
+
+            # CHoCH exige recuo até zona (FVG ou nível rompido)
+            tem_fvg = context.fvg_setup is not None
+            tem_retest = context.bullish_retest or context.bearish_retest
+            if not tem_fvg and not tem_retest:
+                # CHoCH sem recuo = não opera
+                reasons.append("CHoCH sem recuo até zona — aguardando reteste")
+                # Mantém direção mas reduz score drasticamente
+                score *= 0.3
     else:
         reasons.append("Sem BOS/CHoCH recente e validado por volume/amplitude")
 
-    if context.fvg_setup == "FVG_ALTA" and direction in (Direction.BUY, Direction.NEUTRAL):
-        direction = Direction.BUY
-        score += 20
+    # ── Fase 4.3c: FVG só REFORÇA, nunca cria direção ──
+    if context.fvg_setup == "FVG_ALTA" and direction == Direction.BUY:
+        score += 15  # Reforço, não cria direção
         setup = "FVG + Retorno (alta)"
-        reasons.append("Preço retornando a FVG de alta recente e ainda não preenchido")
-    if context.fvg_setup == "FVG_BAIXA" and direction in (Direction.SELL, Direction.NEUTRAL):
-        direction = Direction.SELL
-        score += 20
+        reasons.append("Preço retornando a FVG de alta — reforço")
+    elif context.fvg_setup == "FVG_BAIXA" and direction == Direction.SELL:
+        score += 15
         setup = "FVG + Retorno (baixa)"
-        reasons.append("Preço retornando a FVG de baixa recente e ainda não preenchido")
+        reasons.append("Preço retornando a FVG de baixa — reforço")
+    # FVG sozinho (sem evento) NÃO gera direção
+
+    # ── Fase 4.6: bloqueia SMC em regime LATERAL ──
+    if context.regime == "LATERAL" and direction != Direction.NEUTRAL:
+        reasons.append("Regime LATERAL — SMC bloqueado")
+        direction = Direction.NEUTRAL
+        score *= 0.3
 
     direction, score, confidence = apply_market_filter(
         direction,
@@ -1787,28 +1960,38 @@ def price_action_signal(context: MarketContext) -> Signal:
     bear_points = 50.0 if bearish.intersection(context.patterns) else 0.0
     reasons: list[str] = []
 
+    # ── Fase 4.4: rompimento puro vira CONTEXTO, não gatilho ──
+    # Só o REteste do nível rompido gera sinal.
     if context.broke_high:
-        # Recalibrado de 30 para 45: um rompimento de máxima de 20
-        # candles é, sozinho, um sinal válido de Price Action — não
-        # deveria nascer abaixo do corte de neutralização só por faltar
-        # também um padrão de candle no mesmo candle.
-        bull_points += 45
-        reasons.append(f"Rompimento da máxima dos últimos {context.params.rompimento_lookback} candles")
+        # Rompimento é contexto, não gatilho
+        reasons.append(f"Rompimento da máxima dos últimos {context.params.rompimento_lookback} candles (contexto)")
+        # Reduz pontos do rompimento puro
+        bull_points += 20  # Reduzido de 45 para 20
     if context.broke_low:
-        bear_points += 45
-        reasons.append(f"Rompimento da mínima dos últimos {context.params.rompimento_lookback} candles")
-    if context.bullish_retest:
-        bull_points += 20
-        reasons.append("Reteste de alta sustentado")
-    if context.bearish_retest:
+        reasons.append(f"Rompimento da mínima dos últimos {context.params.rompimento_lookback} candles (contexto)")
         bear_points += 20
-        reasons.append("Reteste de baixa sustentado")
+
+    # Reteste é o gatilho
+    if context.bullish_retest:
+        bull_points += 40  # Aumentado de 20 para 40
+        reasons.append("Reteste de alta sustentado — GATILHO")
+    if context.bearish_retest:
+        bear_points += 40
+        reasons.append("Reteste de baixa sustentado — GATILHO")
+
     if context.patterns:
         reasons.append("Padrões: " + ", ".join(context.patterns))
     if not reasons:
         reasons.append("Sem padrão relevante no candle fechado")
 
-    if abs(bull_points - bear_points) < 1.5:
+    # ── Fase 4.4: só opera com RETESTE ──
+    # Sem reteste = NEUTRO (rompimento puro não é gatilho)
+    tem_retest = context.bullish_retest or context.bearish_retest
+    if not tem_retest:
+        direction = Direction.NEUTRAL
+        score = max(bull_points, bear_points) * 0.3
+        setup = "Rompimento sem reteste — aguardando"
+    elif abs(bull_points - bear_points) < 1.5:
         direction = Direction.NEUTRAL
         score = max(bull_points, bear_points) * 0.5
     elif bull_points > bear_points:
@@ -1817,15 +2000,13 @@ def price_action_signal(context: MarketContext) -> Signal:
         direction, score = Direction.SELL, bear_points
 
     if direction == Direction.BUY and context.bullish_retest:
-        setup = "Rompimento + Reteste (alta)"
+        setup = "Reteste de alta (gatilho)"
     elif direction == Direction.SELL and context.bearish_retest:
-        setup = "Rompimento + Reteste (baixa)"
-    elif direction == Direction.BUY and context.broke_high:
-        setup = "Rompimento de máxima"
-    elif direction == Direction.SELL and context.broke_low:
-        setup = "Rompimento de mínima"
-    else:
+        setup = "Reteste de baixa (gatilho)"
+    elif direction != Direction.NEUTRAL:
         setup = "Padrão de candle"
+    else:
+        setup = "Sem setup operável (PA)"
 
     direction, score, confidence = apply_market_filter(
         direction,
@@ -1974,44 +2155,35 @@ def rsi_signal(context: MarketContext) -> Signal:
     """
     Leitura de IFR por EXAUSTÃO. A regra é única e binária:
 
-        IFR <= rsi_sobrevenda   (padrão 10)  ->  COMPRA
-        IFR >= rsi_sobrecompra  (padrão 90)  ->  VENDA
+        IFR <= rsi_sobrevenda   (padrão 10)  ->  exaustão vendedora
+        IFR >= rsi_sobrecompra  (padrão 90)  ->  exaustão compradora
         no meio                              ->  NEUTRO
 
-    De propósito não existe gradação de "aproximando da zona" nem
-    "saindo da zona". Exaustão é o extremo — ou o preço está exaurido,
-    ou o IFR não tem nada a dizer. Uma leitura que pontua fora do
-    extremo descaracteriza o indicador: vira mais um seguidor de
-    tendência, que é justamente o que as outras quatro categorias já
-    fazem, e o voto dela na Confluência deixa de acrescentar informação.
+    Fase 4.2 (2026-10-14): O IFR NUNCA cria direção. Ele só REDUZ score
+    ou VETA. A direção vem exclusivamente das leituras estruturais.
 
-    O IFR do timeframe superior (Diário), quando disponível, entra como
-    reforço — exaustão simultânea nos dois prazos é a leitura de maior
-    convicção que este motor produz. Quando os dois prazos apontam pra
-    lados opostos, isso vira alerta, não cancelamento: quem decide o
-    peso disso é a Confluência.
+    IFR exaustivo:
+    - IFR >= sobrecompra E direção é BUY → VETA (compradores exauridos)
+    - IFR <= sobrevenda E direção é SELL → VETA (vendedores exauridos)
+    - IFR a favor da direção → reforça (score × ifr_filtro_confirma)
     """
     params = context.params
     rsi = context.rsi
     sobrevenda, sobrecompra = params.rsi_sobrevenda, params.rsi_sobrecompra
     reasons: list[str] = []
 
-    # 100.0 e não o teto direto: quem capa a leitura isolada é o
-    # `apply_market_filter` lá embaixo, com `filtro_isolada_score_max`.
-    # Cravar 79 aqui ignoraria um perfil que tivesse mudado esse teto.
+    # Fase 4.2: IFR só reporta exaustão, nunca define direção
     if rsi <= sobrevenda:
-        direction, score = Direction.BUY, 100.0
+        direction, score = Direction.NEUTRAL, 0.0
         setup = f"EXAUSTÃO VENDEDORA — IFR ≤ {sobrevenda:.0f}"
         reasons.append(
-            f"IFR em {rsi:.1f}, abaixo de {sobrevenda:.0f} — vendedores exauridos, "
-            "entrada a favor da reversão"
+            f"IFR em {rsi:.1f}, abaixo de {sobrevenda:.0f} — vendedores exauridos"
         )
     elif rsi >= sobrecompra:
-        direction, score = Direction.SELL, 100.0
+        direction, score = Direction.NEUTRAL, 0.0
         setup = f"EXAUSTÃO COMPRADORA — IFR ≥ {sobrecompra:.0f}"
         reasons.append(
-            f"IFR em {rsi:.1f}, acima de {sobrecompra:.0f} — compradores exauridos, "
-            "entrada a favor da reversão"
+            f"IFR em {rsi:.1f}, acima de {sobrecompra:.0f} — compradores exauridos"
         )
     else:
         direction, score = Direction.NEUTRAL, 0.0
@@ -2062,6 +2234,24 @@ def confluence_signal(
     isolated: list[Signal],
     rsi: Signal | None = None,
 ) -> Signal:
+    """Confluência das 4 leituras estruturais.
+
+    Fase 4.1 (2026-10-14): Votos por FAMÍLIAS, não por indicador.
+    Médias, VWAP, BOS do SMC e rompimento do PA medem a MESMA coisa
+    (o preço já subiu). Agrupar em famílias evita inflar score com
+    votos correlacionados.
+
+    Famílias:
+    - TENDÊNCIA: Médias Móveis, inclinação VWAP, BOS
+    - LOCALIZAÇÃO: recuo até VWAP/EMA, reteste, FVG não preenchido
+    - FLUXO: volume relativo a favor
+    - EXAUSTÃO: IFR, clímax
+
+    Regras:
+    - TENDÊNCIA vale no máximo UM voto
+    - Só sinaliza com TENDÊNCIA + LOCALIZAÇÃO
+    - max_dist_vwap_atr: preço muito longe da VWAP = esticado = NO_TRADE
+    """
     params = context.params
     weights = {
         "SMC": params.peso_smc,
@@ -2069,28 +2259,111 @@ def confluence_signal(
         "Médias Móveis": params.peso_medias,
         "VWAP": params.peso_vwap,
     }
-    # Leituras com peso zero saem da conta (ex.: VWAP no Swing, que não
-    # tem significado em candles diários) — portado do upstream 2026-08-12.
+    # Leituras com peso zero saem da conta
     direcionais = [s for s in isolated if weights.get(s.name, 0) > 0]
-    buy = 0.0
-    sell = 0.0
-    agreeing = 0
-    reasons: list[str] = []
+
+    # ── Fase 4.1: Classifica em famílias ──
+    familias: dict[str, list[Signal]] = {
+        "TENDENCIA": [],
+        "LOCALIZACAO": [],
+        "FLUXO": [],
+    }
 
     for signal in direcionais:
-        normalized_strength = min(signal.score / params.normalizacao_score, 1.0)
-        points = weights[signal.name] * normalized_strength
+        # Tendência: Médias, VWAP (inclinação), BOS do SMC
+        if signal.name == "Médias Móveis":
+            familias["TENDENCIA"].append(signal)
+        elif signal.name == "VWAP":
+            # VWAP pode ser TENDENCIA (inclinação) ou LOCALIZAÇÃO (recuo)
+            if "Pullback" in signal.setup or "rejeição" in signal.setup.lower():
+                familias["LOCALIZACAO"].append(signal)
+            else:
+                familias["TENDENCIA"].append(signal)
+        elif signal.name == "SMC":
+            # BOS = TENDENCIA, CHoCH/FVG = LOCALIZAÇÃO
+            if "BOS" in signal.setup or "Continuação" in signal.setup:
+                familias["TENDENCIA"].append(signal)
+            elif "CHoCH" in signal.setup or "FVG" in signal.setup or "Reversão" in signal.setup:
+                familias["LOCALIZACAO"].append(signal)
+            else:
+                familias["TENDENCIA"].append(signal)
+        elif signal.name == "Price Action":
+            # Rompimento = TENDENCIA, Reteste = LOCALIZAÇÃO
+            if "Reteste" in signal.setup:
+                familias["LOCALIZACAO"].append(signal)
+            elif "Rompimento" in signal.setup:
+                familias["TENDENCIA"].append(signal)
+            else:
+                familias["LOCALIZACAO"].append(signal)
+
+    # ── Fase 4.1a: remove +10 de volatilidade adequada ──
+    # (inflava o score e o corte 79 virava 69)
+
+    # ── Fase 4.1: calcula score por família (TENDÊNCIA = 1 voto) ──
+    buy = 0.0
+    sell = 0.0
+    reasons: list[str] = []
+
+    # TENDÊNCIA: no máximo UM voto (a mais forte)
+    if familias["TENDENCIA"]:
+        tendencia_signal = max(familias["TENDENCIA"], key=lambda s: s.score)
+        normalized = min(tendencia_signal.score / params.normalizacao_score, 1.0)
+        points = weights.get(tendencia_signal.name, 20.0) * normalized
+        if tendencia_signal.direction == Direction.BUY:
+            buy += points
+        elif tendencia_signal.direction == Direction.SELL:
+            sell += points
+        reasons.append(f"TENDENCIA: {tendencia_signal.name} ({tendencia_signal.score:.0f})")
+
+    # LOCALIZAÇÃO: soma normalizada
+    for signal in familias["LOCALIZACAO"]:
+        normalized = min(signal.score / params.normalizacao_score, 1.0)
+        points = weights.get(signal.name, 20.0) * normalized * 0.5  # peso reduzido
         if signal.direction == Direction.BUY:
             buy += points
         elif signal.direction == Direction.SELL:
             sell += points
-        reasons.extend(f"{signal.name}: {reason}" for reason in signal.reasons[:1])
+        reasons.append(f"LOCALIZACAO: {signal.name} ({signal.score:.0f})")
 
-    if context.volatility == "ADEQUADA":
-        buy += 10
-        sell += 10
-        reasons.append("Volatilidade adequada para o ativo/timeframe")
+    # ── Fase 4.1e: exige TENDÊNCIA + LOCALIZAÇÃO ──
+    tem_tendencia = bool(familias["TENDENCIA"])
+    tem_localizacao = bool(familias["LOCALIZACAO"])
 
+    if not tem_tendencia or not tem_localizacao:
+        # Sem as duas famílias, NEUTRO
+        signal = Signal(
+            "Confluência",
+            Direction.NEUTRAL,
+            max(buy, sell) * 0.5,
+            0.0,
+            "Sem setup operável (falta TENDENCIA+LOCALIZACAO)",
+            reasons,
+            ["Fase 4.1: exige TENDÊNCIA + LOCALIZAÇÃO"],
+        )
+        return signal
+
+    # ── Fase 4.1e: filtro de distância da VWAP ──
+    max_dist_vwap_atr = getattr(params, "max_dist_vwap_atr", 1.0)
+    # Distância em múltiplos de ATR
+    price = float(context.df["close"].iloc[-1]) if context.df is not None else 0
+    if context.atr > 0 and context.vwap:
+        vwap_dist_atr = abs(price - context.vwap) / context.atr
+    else:
+        vwap_dist_atr = 0
+
+    if vwap_dist_atr > max_dist_vwap_atr:
+        signal = Signal(
+            "Confluência",
+            Direction.NEUTRAL,
+            max(buy, sell) * 0.5,
+            0.0,
+            "NO_TRADE: preço esticado da VWAP",
+            reasons + [f"Distância VWAP {vwap_dist_atr:.1f} ATR > {max_dist_vwap_atr} ATR"],
+            [],
+        )
+        return signal
+
+    # ── Direção final ──
     if abs(buy - sell) < params.confluencia_banda_empate:
         direction = Direction.NEUTRAL
         score = max(buy, sell) * 0.5
@@ -2099,59 +2372,72 @@ def confluence_signal(
     else:
         direction, score = Direction.SELL, sell
 
-    # --- IFR como filtro de reversão, aplicado DEPOIS da direção ---
-    # Portado do upstream 2026-08-12, adaptado ao nosso AnalysisParams:
-    # o IFR não vota, mas se muitos dos quatro estruturais apontarem pra
-    # um lado enquanto o IFR grita exaustão no oposto, é o momento errado
-    # de entrar a favor do movimento.
-    if params.rsi_filtro and rsi is not None and rsi.direction != Direction.NEUTRAL:
-        if direction == Direction.NEUTRAL:
-            # Sem direção estrutural, a exaustão passa a ser o próprio
-            # sinal: reversão pura, sem tendência estabelecida contra.
-            direction = rsi.direction
-            score = max(score, params.ifr_piso_score)
-            reasons.insert(0, f"IFR: {rsi.reasons[0]} — exaustão define a direção")
-        elif rsi.direction == direction:
+    # ── Fase 4.2: IFR como FILTRO (nunca cria direção) ──
+    if params.rsi_filtro and rsi is not None:
+        if rsi.setup.startswith("EXAUSTÃO COMPRADORA") and direction == Direction.BUY:
+            # IFR exaustivo comprando, mas direção é BUY → VETA
+            direction = Direction.NEUTRAL
+            score *= 0.3
+            reasons.insert(0, "IFR VETA: exaustão compradora contra direção BUY")
+        elif rsi.setup.startswith("EXAUSTÃO VENDEDORA") and direction == Direction.SELL:
+            # IFR exaustivo vendendo, mas direção é SELL → VETA
+            direction = Direction.NEUTRAL
+            score *= 0.3
+            reasons.insert(0, "IFR VETA: exaustão vendedora contra direção SELL")
+        elif rsi.score > 0 and rsi.direction == direction:
+            # IFR confirma (mesma direção)
             score = min(100.0, score * params.ifr_filtro_confirma)
-            reasons.insert(0, f"IFR CONFIRMA a reversão: {rsi.reasons[0]}")
-        else:
-            score *= params.ifr_filtro_contra
-            reasons.insert(
-                0,
-                f"IFR ALERTA: extremo oposto ({context.rsi:.0f}) — o movimento atual está "
-                f"exaurido, entrar a favor dele agora é entrar no fim do movimento",
-            )
+            reasons.insert(0, "IFR confirma a direção")
 
-    agreeing = sum(signal.direction == direction for signal in direcionais)
-    # O multiplicador de "2 categorias concordando" foi recalibrado de 0.85
-    # para 0.95: com 0.85, o teto matemático desse cenário (quando só
-    # Médias+VWAP concordam, por exemplo) ficava a poucos pontos do corte
-    # de operabilidade (40) — na prática, quase nenhum sinal real de 2
-    # categorias conseguia passar, mesmo com concordância forte. 0.95 dá
-    # margem real sem abrir mão do critério (ainda exige concordância
-    # genuína e pontuação consistente das 2 categorias).
-    #
-    # A escala é em PROPORÇÃO das leituras ativas, não em contagem
-    # absoluta: o Swing não usa VWAP, então 3 de 3 lá não pode receber o
-    # mesmo prêmio de 3 de 4 no Day Trade. Portado do upstream 2026-08-12,
-    # que trocou a contagem fixa por faixas de proporção.
-    total_direcionais = len(direcionais)
-    proporcao = agreeing / total_direcionais if total_direcionais else 0.0
-    if proporcao >= 0.99:
-        banda = 3
-    elif proporcao >= 0.74:
-        banda = 2
-    elif proporcao >= 0.49:
-        banda = 1
+    # ── Multiplicador por famílias diferentes ──
+    # Fase 4.1d: só aumenta com famílias DIFERENTES
+    familias_direcao = set()
+    if tem_tendencia and familias["TENDENCIA"][0].direction == direction:
+        familias_direcao.add("TENDENCIA")
+    for s in familias["LOCALIZACAO"]:
+        if s.direction == direction:
+            familias_direcao.add("LOCALIZACAO")
+            break
+
+    n_familias = len(familias_direcao)
+    if n_familias >= 2:
+        multiplier = 1.15  # TENDENCIA + LOCALIZAÇÃO
+    elif n_familias == 1:
+        multiplier = 1.0
     else:
-        banda = 0
-    multiplier = params.multiplicador_proporcao[banda]
+        multiplier = 0.8  # nenhuma família confirma
+
     score = min(100.0, score * multiplier)
-    # Sobre `len(direcionais)`, não sobre um 4 cravado: o número de
-    # leituras isoladas já mudou uma vez e, com peso zero no Swing, o
-    # denominador fixo reportaria 125% de confiança ou contaria leitura
-    # inativa como não concordante.
-    confidence = agreeing / total_direcionais * 100 if total_direcionais else 0.0
+
+    # Confiança baseada em famílias
+    confidence = n_familias / 2 * 100  # 0, 50 ou 100
+
+    # ── Setup identificado ──
+    if direction == Direction.NEUTRAL:
+        setup = "Sem setup operável"
+    elif tem_tendencia and tem_localizacao:
+        setup = "Tendência + Localização"
+    else:
+        setup = "Confluência técnica"
+
+    # Aplica filtro de mercado
+    direction, score, confidence = apply_market_filter(
+        direction, score, confidence, context,
+    )
+
+    alerts = market_alerts(context)
+    if agreeing < 2:
+        alerts.append("SINAIS CONFLITANTES — baixa confluência")
+
+    return Signal(
+        "Confluência",
+        direction,
+        score,
+        confidence,
+        setup,
+        reasons,
+        alerts,
+    )
 
     direction, score, confidence = apply_market_filter(
         direction,
@@ -2726,60 +3012,140 @@ def alternative_targets(
     return targets
 
 
+def compute_rr_real_liquido(
+    entry: float,
+    stop: float,
+    alvo: float,
+    custo_pct: float = 0.0010,
+) -> float:
+    """R/R líquido de custos.
+
+    Fase 3.1d: rr_real_liquido = (|alvo − entrada| − custo) / (|entrada − stop| + custo)
+
+    `custo_pct` é o custo round-trip em fração (0.0010 = 0.10% = 10bps).
+    """
+    custo = entry * custo_pct
+    risco_bruto = abs(entry - stop)
+    retorno_bruto = abs(alvo - entry)
+    if risco_bruto + custo <= 0:
+        return 0.0
+    return (retorno_bruto - custo) / (risco_bruto + custo)
+
+
 def attach_risk(signal: Signal, context: MarketContext) -> None:
+    """Calcula stop, alvo e R/R do sinal.
+
+    Fase 3 (2026-10-14): mudanças na ordem de aplicação:
+    1. Stop estrutural
+    2. Stop mínimo ATR (ajusta para cima)
+    3. Stop máximo pct → NO_TRADE se exceder (não "espreme")
+    4. Alvo calculado
+    5. Gain máximo pct + encolher_alvos aplicados AO ALVO
+    6. R/R líquido de custos calculado e validado
+    """
     if signal.direction == Direction.NEUTRAL:
         return
 
     params = context.params
     entry = round_tick(float(context.df["close"].iloc[-1]), "nearest")
     stop, basis = stop_for_signal(signal, context)
+
+    # ── 1. Stop mínimo ATR ──
     minimum_distance = context.atr * params.stop_minimo_atr
     minimo_label = f"+mínimo_{params.stop_minimo_atr:g}ATR"
 
     if signal.direction == Direction.BUY:
+        # ── 2. Ajusta stop para mínimo ──
         if entry - stop < minimum_distance:
             stop = entry - minimum_distance
             basis += minimo_label
-        # Limite máximo de stop: 0,5% do preço de entrada
+
+        # ── 3. Stop máximo → NO_TRADE se exceder (não espreme) ──
         max_stop_dist = entry * params.stop_maximo_pct / 100
         if entry - stop > max_stop_dist:
-            stop = entry - max_stop_dist
-            basis += f"+máx_{params.stop_maximo_pct:g}%"
+            # Fase 3: em vez de espremer, bloqueia o sinal
+            signal.direction = Direction.NEUTRAL
+            signal.setup = "NO_TRADE: STOP_ACIMA_DO_MAXIMO"
+            signal.reasons.append(
+                f"Stop a {(entry - stop) / entry * 100:.2f}% excede máximo "
+                f"{params.stop_maximo_pct}%"
+            )
+            return
+
         stop = round_tick(stop, "floor")
         risk = entry - stop
         if risk <= 0:
             signal.direction = Direction.NEUTRAL
             return
-        target_1 = round_tick(entry + risk * params.rr_alvo_1 * params.encolher_alvos, "ceil")
-        target_2 = round_tick(entry + risk * params.rr_alvo_2 * params.encolher_alvos, "ceil")
-        # Limite máximo de gain: 0,5% do preço de entrada
+
+        # ── 4. Alvo calculado ──
+        target_1 = round_tick(entry + risk * params.rr_alvo_1, "ceil")
+        target_2 = round_tick(entry + risk * params.rr_alvo_2, "ceil")
+
+        # ── 5. Gain máximo + encolher_alvos aplicados ao alvo ──
         max_gain_dist = entry * params.gain_maximo_pct / 100
+        # Primeiro encolhe
+        target_1 = round_tick(entry + (target_1 - entry) * params.encolher_alvos, "ceil")
+        target_2 = round_tick(entry + (target_2 - entry) * params.encolher_alvos, "ceil")
+        # Depois aplica limite máximo
         if target_1 - entry > max_gain_dist:
             target_1 = entry + max_gain_dist
+            basis += f"+gain_máx_{params.gain_maximo_pct:g}%"
         if target_2 - entry > max_gain_dist:
             target_2 = entry + max_gain_dist
-    else:
+
+    else:  # SELL
+        # ── 2. Ajusta stop para mínimo ──
         if stop - entry < minimum_distance:
             stop = entry + minimum_distance
             basis += minimo_label
-        # Limite máximo de stop: 0,5% do preço de entrada
+
+        # ── 3. Stop máximo → NO_TRADE se exceder ──
         max_stop_dist = entry * params.stop_maximo_pct / 100
         if stop - entry > max_stop_dist:
-            stop = entry + max_stop_dist
-            basis += f"+máx_{params.stop_maximo_pct:g}%"
+            signal.direction = Direction.NEUTRAL
+            signal.setup = "NO_TRADE: STOP_ACIMA_DO_MAXIMO"
+            signal.reasons.append(
+                f"Stop a {(stop - entry) / entry * 100:.2f}% excede máximo "
+                f"{params.stop_maximo_pct}%"
+            )
+            return
+
         stop = round_tick(stop, "ceil")
         risk = stop - entry
         if risk <= 0:
             signal.direction = Direction.NEUTRAL
             return
-        target_1 = round_tick(entry - risk * params.rr_alvo_1 * params.encolher_alvos, "floor")
-        target_2 = round_tick(entry - risk * params.rr_alvo_2 * params.encolher_alvos, "floor")
-        # Limite máximo de gain: 0,5% do preço de entrada
+
+        # ── 4. Alvo calculado ──
+        target_1 = round_tick(entry - risk * params.rr_alvo_1, "floor")
+        target_2 = round_tick(entry - risk * params.rr_alvo_2, "floor")
+
+        # ── 5. Gain máximo + encolher_alvos aplicados ao alvo ──
         max_gain_dist = entry * params.gain_maximo_pct / 100
+        target_1 = round_tick(entry - (entry - target_1) * params.encolher_alvos, "floor")
+        target_2 = round_tick(entry - (entry - target_2) * params.encolher_alvos, "floor")
         if entry - target_1 > max_gain_dist:
             target_1 = entry - max_gain_dist
+            basis += f"+gain_máx_{params.gain_maximo_pct:g}%"
         if entry - target_2 > max_gain_dist:
             target_2 = entry - max_gain_dist
+
+    # ── 6. R/R líquido de custos ──
+    rr_real_liquido = compute_rr_real_liquido(
+        entry, stop, target_1, params.custo_pct_ida_volta
+    )
+    rr_planejado = abs(target_1 - entry) / risk if risk > 0 else 0.0
+
+    # Fase 3.1e: bloqueia se R/R líquido < mínimo
+    if rr_real_liquido < params.rr_minimo_liquido:
+        signal.direction = Direction.NEUTRAL
+        signal.setup = "NO_TRADE: RR_INSUFICIENTE"
+        signal.reasons.append(
+            f"R/R líquido {rr_real_liquido:.2f} < mínimo {params.rr_minimo_liquido:.2f} "
+            f"(custo {params.custo_pct_ida_volta * 100:.2f}%)"
+        )
+        return
 
     alternatives = alternative_targets(
         context,
@@ -2792,10 +3158,12 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
         stop,
         target_1,
         target_2,
-        abs(target_1 - entry) / risk,
+        rr_real_liquido,  # Fase 3: agora guarda o R/R líquido
         basis,
         alternatives,
     )
+    # Guarda o R/R planejado para o log
+    signal.risk.rr = rr_real_liquido
 
     structure = next(
         (

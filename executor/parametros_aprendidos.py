@@ -257,3 +257,36 @@ def modo_livre(setup: str, modo_atual: str) -> bool:
         return True  # LIVE -> PAPER -> SHADOW: automático
 
     return False  # PAPER -> LIVE ou SHADOW -> PAPER: precisa confirmação
+
+
+def verificar_rebaixamento(
+    setup: str,
+    modo_atual: str,
+    resultados_recentes: list[float],
+    drawdown_r: float = 0.0,
+) -> tuple[str, str]:
+    """Fase 5.5: rebaixamento automático LIVE → PAPER.
+
+    Critérios (qualquer um dispara):
+    - Média das últimas 20 ordens < 0R
+    - Drawdown > 10R
+
+    Promoção (PAPER → LIVE) NUNCA é automática.
+
+    Returns:
+        (novo_modo, motivo)
+    """
+    if modo_atual != "LIVE":
+        return (modo_atual, "")  # Só rebaixa LIVE
+
+    # Critério 1: média das últimas 20 ordens
+    if len(resultados_recentes) >= 5:  # mínimo 5 ordens para avaliar
+        media = sum(resultados_recentes[-20:]) / min(len(resultados_recentes), 20)
+        if media < 0:
+            return ("PAPER", f"REBAIXADO: média {media:.2f}R < 0 nas últimas {min(len(resultados_recentes), 20)} ordens")
+
+    # Critério 2: drawdown
+    if drawdown_r > 10:
+        return ("PAPER", f"REBAIXADO: drawdown {drawdown_r:.1f}R > 10R")
+
+    return (modo_atual, "")

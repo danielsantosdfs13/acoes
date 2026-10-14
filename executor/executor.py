@@ -152,8 +152,13 @@ TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10"))
 # Score mínimo por janela de operação.
 # Manhã (10:00–12:00): 79 pontos — janela principal, operação normal.
 # Tarde (14:00+): 91 pontos — apenas sinais fortes (score > 90).
+# Fase 5.1: score é apenas legado configurável — a decisão final vem
+# do veto do parametros_aprendizado.json.
 SCORE_MINIMO_MANHA = float(os.environ.get("EXECUTOR_SCORE_MINIMO_MANHA", "79"))
 SCORE_MINIMO_TARDE = float(os.environ.get("EXECUTOR_SCORE_MINIMO_TARDE", "91"))
+
+# Fase 5.2: LIVE exige fonte sem atraso (MT5). Com Yahoo só PAPER.
+FONTES_SEM_ATRASO = {"MT5", "API"}
 
 
 def _mercado_aberto(agora: datetime | None = None) -> bool:
@@ -529,6 +534,8 @@ def _extrair_detalhes_sinal(sinal: dict) -> dict:
     """Extrai detalhes do sinal para o log CSV.
 
     Os valores são gravados NO MOMENTO do sinal, sem recalcular depois.
+    Fase 6: adiciona colunas novas (entrada_modo, recuo_atr, rr_real_liquido,
+    fonte_dados, volume_tipo).
     """
     detalhes = sinal.get("detalhes") or {}
     return {
@@ -543,6 +550,13 @@ def _extrair_detalhes_sinal(sinal: dict) -> dict:
         "entrada": sinal.get("entrada"),
         "stop": sinal.get("stop"),
         "alvo": sinal.get("alvo_1"),
+        # Fase 6: colunas novas
+        "entrada_modo": detalhes.get("entrada_modo", "MERCADO"),
+        "recuo_atr": detalhes.get("recuo_atr"),
+        "rr_real_liquido": detalhes.get("rr_real_liquido"),
+        "fonte_dados": detalhes.get("fonte_dados", "API"),
+        "volume_tipo": detalhes.get("volume_tipo", "unknown"),
+        "regime": detalhes.get("regime", "INDEFINIDO"),
     }
 
 
@@ -747,16 +761,58 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
         sinal["stop"], sinal.get("alvo_1") or 0, sid,
     )
     try:
-        # `risco_maximo` e não `quantidade`: o dimensionamento acontece lá
-        # dentro, contra a cotação do envio. Ver `_quantidade_estimada`.
-        r = execucao.enviar_ordem_mercado(
-            symbol, sinal["direcao"],
-            risco_maximo=risco,
-            stop=sinal.get("stop"), alvo=sinal.get("alvo_1"),
-            comentario=f"auto {regra['modalidade'][:8]}",
-            atr=(sinal.get("detalhes") or {}).get("atr"),
-            rr=sinal.get("r_alvo_1"),
-        )
+        # ── Fase 2: ordem limitada com recuo ──
+        # Se entrada_modo == "LIMITADA", calcula o preço da limitada
+        # recuada do close do sinal e envia ordem limitada.
+        entrada_modo = (sinal.get("detalhes") or {}).get("entrada_modo", "MERCADO")
+
+        if entrada_modo == "LIMITADA":
+            # Calcula preço da limitada
+            atr = (sinal.get("detalhes") or {}).get("atr", 0)
+            recuo_atr = (sinal.get("detalhes") or {}).get("recuo_atr", 0.5)
+            close_sinal = sinal.get("entrada")  # entrada modelada = close do candle
+
+            if atr > 0 and close_sinal:
+                if sinal["direcao"] == "COMPRA":
+                    preco_limite = close_sinal - recuo_atr * atr
+                else:
+                    preco_limite = close_sinal + recuo_atr * atr
+
+                log.info(
+                    "ENVIANDO LIMITADA %s %s ~%.0f ações (limite %.2f, recuo %.1f ATR)",
+                    sinal["direcao"], symbol, estimada, preco_limite, recuo_atr,
+                )
+
+                r = execucao.enviar_ordem_limitada(
+                    symbol, sinal["direcao"],
+                    preco_limite=preco_limite,
+                    risco_maximo=risco,
+                    stop=sinal.get("stop"), alvo=sinal.get("alvo_1"),
+                    comentario=f"auto {regra['modalidade'][:8]}",
+                    atr=atr,
+                    rr=sinal.get("r_alvo_1"),
+                )
+            else:
+                # Sem ATR ou sem entrada, fallback para mercado
+                log.warning("sinal %s: sem ATR/entrada para limitada, usando mercado", sid)
+                r = execucao.enviar_ordem_mercado(
+                    symbol, sinal["direcao"],
+                    risco_maximo=risco,
+                    stop=sinal.get("stop"), alvo=sinal.get("alvo_1"),
+                    comentario=f"auto {regra['modalidade'][:8]}",
+                    atr=atr,
+                    rr=sinal.get("r_alvo_1"),
+                )
+        else:
+            # Comportamento antigo: ordem a mercado
+            r = execucao.enviar_ordem_mercado(
+                symbol, sinal["direcao"],
+                risco_maximo=risco,
+                stop=sinal.get("stop"), alvo=sinal.get("alvo_1"),
+                comentario=f"auto {regra['modalidade'][:8]}",
+                atr=(sinal.get("detalhes") or {}).get("atr"),
+                rr=sinal.get("r_alvo_1"),
+            )
     except execucao.OrdemRecusada as exc:
         log.warning("sinal %s recusado localmente: %s", sid, exc)
         _registrar(sid, {"status": "RECUSADA", "mensagem": str(exc)[:500]})
