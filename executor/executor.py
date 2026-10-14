@@ -623,6 +623,12 @@ def _gravar_sinal_log(
         saida_motivo=saida_motivo,
         resultado_r=resultado_r,
         resultado_brl=resultado_brl,
+        # Fase 6: colunas novas
+        entrada_modo=detalhes.get("entrada_modo"),
+        recuo_atr=detalhes.get("recuo_atr"),
+        rr_real_liquido=detalhes.get("rr_real_liquido"),
+        fonte_dados=detalhes.get("fonte_dados"),
+        volume_tipo=detalhes.get("volume_tipo"),
     )
 
 
