@@ -1,0 +1,20 @@
+{
+    "versao": 1,
+    "gerado_em": "2026-10-14T09:00:00-03:00",
+    "modos": {
+        "VWAP": "LIVE",
+        "SMC": "SHADOW",
+        "Confluência": "PAPER",
+        "CHATGPT": "LIVE",
+        "TPO/VWAP": "SHADOW"
+    },
+    "regras": {
+        "vol_percentil_min": 20,
+        "alvo_custo_min": 1.5,
+        "bloqueios": [
+            {"setup": "SMC", "regime": "LATERAL", "motivo": "SMC lateral: 30% acerto em 12 dias"},
+            {"setup": "Confluência", "regime": "LATERAL", "motivo": "Confluência lateral: herda problemas do SMC"}
+        ]
+    },
+    "modelo": null
+}
