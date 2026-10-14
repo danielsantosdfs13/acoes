@@ -357,7 +357,7 @@ class AnalysisParams:
     validade_candles: int = 3                   # candles de validade da limitada
 
     # --- Fase 3: Risco e R/R real (2026-10-14) --------------------------
-    custo_pct_ida_volta: float = 0.10           # custo round-trip em % (0.10% = 10bps)
+    custo_pct_ida_volta: float = 0.001         # custo round-trip em fração (0.001 = 0.1% = 10bps)
     rr_minimo_liquido: float = 1.0              # R/R líquido mínimo após custos
 
     # --- Estrutura (BOS/CHoCH) e Price Action ---------------------------
@@ -443,8 +443,11 @@ class AnalysisParams:
     encolher_alvos: float = 0.85
     # Limites máximos de distância em % do preço de entrada.
     # Stop e gain não podem ultrapassar estes limiares.
-    stop_maximo_pct: float = 0.5
-    gain_maximo_pct: float = 0.5
+    # Fase 3: stop_maximo_pct aumentado de 0.5% para 2.0% — com
+    # stop_minimo_atr=1.0, muitos stops legítimos ficavam acima de
+    # 0.5% e eram bloqueados (STOP_ACIMA_DO_MAXIMO).
+    stop_maximo_pct: float = 2.0
+    gain_maximo_pct: float = 2.0
 
     # --- Setup TPO/VWAP (2026-09-30) ------------------------------------
     # Fluxo: 1ª vela → VWAP → direção → qualidade → TPO → entrada → stop →
@@ -3232,9 +3235,17 @@ def stop_for_signal(
         ema = context.emas.iloc[-1]
         if direction == Direction.BUY:
             base = float(ema["ema_21"] if ema["ema_21"] < price else ema["ema_50"])
-            return base - context.atr * 0.3, "EMA21/EMA50"
+            stop = base - context.atr * 0.3
+            # Garante stop abaixo da entrada
+            if stop >= price:
+                stop = price - context.atr * 0.5
+            return stop, "EMA21/EMA50"
         base = float(ema["ema_21"] if ema["ema_21"] > price else ema["ema_50"])
-        return base + context.atr * 0.3, "EMA21/EMA50"
+        stop = base + context.atr * 0.3
+        # Garante stop acima da entrada
+        if stop <= price:
+            stop = price + context.atr * 0.5
+        return stop, "EMA21/EMA50"
 
     if signal.name == "IFR":
         # O IFR não tem nível de preço próprio: é leitura de momentum, não
