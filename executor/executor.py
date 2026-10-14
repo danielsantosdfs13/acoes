@@ -85,6 +85,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import daytrade_smc  # noqa: E402
 import execucao  # noqa: E402
 from daytrade_smc import _api_headers, fetch_signals  # noqa: E402
+import signal_logger  # noqa: E402
+import parametros_aprendidos  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("executor")
@@ -523,30 +525,219 @@ def _elegiveis(regra: dict, limite_idade: datetime) -> list[dict]:
     return candidatos
 
 
+def _extrair_detalhes_sinal(sinal: dict) -> dict:
+    """Extrai detalhes do sinal para o log CSV.
+
+    Os valores são gravados NO MOMENTO do sinal, sem recalcular depois.
+    """
+    detalhes = sinal.get("detalhes") or {}
+    return {
+        "er": detalhes.get("er"),
+        "adx": detalhes.get("adx"),
+        "atr_pct": detalhes.get("atr_pct"),
+        "vol_percentil": detalhes.get("vol_percentil"),
+        "vwap_dist_atr": detalhes.get("vwap_dist_atr"),
+        "vwap_slope_atr": detalhes.get("vwap_slope_atr"),
+        "volume_rel": detalhes.get("volume_rel"),
+        "score": sinal.get("score"),
+        "entrada": sinal.get("entrada"),
+        "stop": sinal.get("stop"),
+        "alvo": sinal.get("alvo_1"),
+    }
+
+
+def _determinar_regime(sinal: dict) -> str:
+    """Determina o regime de mercado a partir dos detalhes do sinal."""
+    detalhes = sinal.get("detalhes") or {}
+    adx = detalhes.get("adx")
+    if adx is None:
+        return "INDEFINIDO"
+    if adx >= 25:
+        return "TENDENCIA"
+    return "LATERAL"
+
+
+def _gravar_sinal_log(
+    sinal: dict,
+    regra: dict,
+    *,
+    modo: str,
+    decisao: str,
+    motivo: str,
+    resultado_r: float | None = None,
+    resultado_brl: float | None = None,
+    saida_timestamp: datetime | None = None,
+    saida_preco: float | None = None,
+    saida_motivo: str | None = None,
+) -> None:
+    """Grava o sinal no log CSV."""
+    detalhes = _extrair_detalhes_sinal(sinal)
+    direcao = "LONG" if sinal.get("direcao") == "COMPRA" else "SHORT"
+
+    # Timestamp do sinal (candle_time)
+    try:
+        ts_sinal = datetime.fromisoformat(sinal["candle_time"])
+    except (KeyError, ValueError):
+        ts_sinal = datetime.now(UTC)
+
+    signal_logger.gravar_sinal(
+        id=str(sinal.get("id", "")),
+        timestamp_sinal=ts_sinal,
+        ativo=sinal.get("symbol", ""),
+        setup=regra.get("modalidade", ""),
+        variante=regra.get("timeframe", ""),
+        modo=modo,
+        elegivel=True,
+        decisao=decisao,
+        motivo=motivo,
+        direcao=direcao,
+        regime=_determinar_regime(sinal),
+        er=detalhes.get("er"),
+        adx=detalhes.get("adx"),
+        atr_pct=detalhes.get("atr_pct"),
+        vol_percentil=detalhes.get("vol_percentil"),
+        vwap_dist_atr=detalhes.get("vwap_dist_atr"),
+        vwap_slope_atr=detalhes.get("vwap_slope_atr"),
+        volume_rel=detalhes.get("volume_rel"),
+        score=detalhes.get("score"),
+        entrada=detalhes.get("entrada"),
+        stop=detalhes.get("stop"),
+        alvo=detalhes.get("alvo"),
+        custo_pct=0.0005,  # 0.05% round-trip
+        saida_timestamp=saida_timestamp,
+        saida_preco=saida_preco,
+        saida_motivo=saida_motivo,
+        resultado_r=resultado_r,
+        resultado_brl=resultado_brl,
+    )
+
+
 def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
     """Um sinal virando ordem.
 
+    Fluxo:
+    1. Determina modo (LIVE/PAPER/SHADOW) via parâmetros aprendidos
+    2. Verifica veto (parâmetros aprendidos)
+    3. Se veto ou modo SHADOW: grava log e retorna (não envia)
+    4. Se PAPER: grava log e retorna (não envia)
+    5. Se LIVE: envia ordem normalmente
+
     `teste=True` é o caminho de quem está conferindo o encanamento à mão: a
     ordem sai igual, com as mesmas travas, mas a linha nasce marcada e fica
-    fora das estatísticas. O laço do serviço NUNCA passa isso — só chamada
-    manual passa, o que é exatamente o que distingue uma da outra.
-
-    Marcar em vez de apagar depois: a primeira ordem de validação teve que
-    ser removida na mão do banco, e apagar de tabela de auditoria some com um
-    evento que aconteceu de verdade."""
+    fora das estatísticas."""
     symbol, sid = sinal["symbol"], sinal["id"]
     risco = float(regra["risco_maximo"])
+    setup = regra.get("modalidade", "")
+
+    # 1. Determina modo
+    modo = parametros_aprendidos.modo_do_setup(setup)
+
+    # 2. Verifica veto (apenas se não for já SHADOW)
+    veto = False
+    motivo_veto = ""
+    if modo != "SHADOW":
+        detalhes = sinal.get("detalhes") or {}
+        veto, motivo_veto = parametros_aprendidos.verificar_veto(
+            setup=setup,
+            regime=_determinar_regime(sinal),
+            direcao=sinal.get("direcao", ""),
+            er=detalhes.get("er"),
+            adx=detalhes.get("adx"),
+            atr_pct=detalhes.get("atr_pct"),
+            vol_percentil=detalhes.get("vol_percentil"),
+            vwap_dist_atr=detalhes.get("vwap_dist_atr"),
+            vwap_slope_atr=detalhes.get("vwap_slope_atr"),
+            volume_rel=detalhes.get("volume_rel"),
+            score=sinal.get("score"),
+            entrada=sinal.get("entrada"),
+            alvo=sinal.get("alvo_1"),
+        )
+
+    # 3. Se veto ou SHADOW: grava log e retorna
+    if veto or modo == "SHADOW":
+        motivo = motivo_veto if veto else "MODO_SHADOW"
+        log.info("sinal %s %s: VETO (%s) — gravação SHADOW", symbol, sid, motivo)
+
+        # Simula saída para SHADOW
+        resultado_r = None
+        resultado_brl = None
+        saida_ts = None
+        saida_preco = None
+        saida_motivo = None
+        if sinal.get("entrada") and sinal.get("stop") and sinal.get("alvo_1"):
+            # Tenta buscar velas para simulação (pode falhar)
+            try:
+                velas = _buscar_velas_simulacao(symbol, regra.get("timeframe", "M15"))
+                if velas:
+                    saida_motivo, saida_preco, resultado_r = signal_logger.simular_saida(
+                        direcao=sinal.get("direcao", "COMPRA"),
+                        entrada=sinal["entrada"],
+                        stop=sinal["stop"],
+                        alvo=sinal["alvo_1"],
+                        velas=velas,
+                    )
+                    saida_ts = datetime.now(UTC)
+                    # Calcula resultado em reais
+                    risco_acao = abs(sinal["entrada"] - sinal["stop"])
+                    if risco_acao > 0:
+                        resultado_brl = resultado_r * risco_acao * 100  # ~100 ações
+            except Exception as exc:
+                log.debug("simulação SHADOW falhou para %s: %s", symbol, exc)
+
+        _gravar_sinal_log(
+            sinal, regra,
+            modo="SHADOW",
+            decisao="NO_TRADE",
+            motivo=motivo,
+            resultado_r=resultado_r,
+            resultado_brl=resultado_brl,
+            saida_timestamp=saida_ts,
+            saida_preco=saida_preco,
+            saida_motivo=saida_motivo,
+        )
+        return
+
+    # 4. Se PAPER: grava log e retorna
+    if modo == "PAPER":
+        log.info("sinal %s %s: modo PAPER — não envia, grava log", symbol, sid)
+        _gravar_sinal_log(
+            sinal, regra,
+            modo="PAPER",
+            decisao="NO_TRADE",
+            motivo="MODO_PAPER",
+        )
+        return
+
+    # 5. Modo LIVE: fluxo normal
     estimada = _quantidade_estimada(sinal, risco)
     if estimada is None:
+        _gravar_sinal_log(
+            sinal, regra,
+            modo="LIVE",
+            decisao="NO_TRADE",
+            motivo="QUANTIDADE_INVALIDA",
+        )
         return
 
     if _tem_posicao(symbol):
         log.info("%s: já tem posição aberta, pulando sinal %s.", symbol, sid)
+        _gravar_sinal_log(
+            sinal, regra,
+            modo="SHADOW",
+            decisao="NO_TRADE",
+            motivo="POSICAO_ABERTA",
+        )
         return
 
     ordem, duplicado = _reservar(sinal, risco, teste=teste)
     if duplicado:
         log.debug("sinal %s já tinha ordem (%s), pulando.", sid, ordem["status"])
+        _gravar_sinal_log(
+            sinal, regra,
+            modo="SHADOW",
+            decisao="NO_TRADE",
+            motivo=f"DUPLICADO_{ordem['status']}",
+        )
         return
 
     log.info(
@@ -564,21 +755,27 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
             stop=sinal.get("stop"), alvo=sinal.get("alvo_1"),
             comentario=f"auto {regra['modalidade'][:8]}",
             atr=(sinal.get("detalhes") or {}).get("atr"),
-            # O R/R sai do próprio sinal (`r_alvo_1`), e não do perfil: é a
-            # razão que o motor de fato conseguiu depois de arredondar o alvo
-            # ao tique, que é a que se quer reproduzir sobre o risco real.
             rr=sinal.get("r_alvo_1"),
         )
     except execucao.OrdemRecusada as exc:
-        # RECUSADA e não FALHOU: as travas locais barraram, nada saiu da
-        # máquina. A distinção importa na auditoria — uma é configuração
-        # errada aqui, a outra é a corretora dizendo não.
         log.warning("sinal %s recusado localmente: %s", sid, exc)
         _registrar(sid, {"status": "RECUSADA", "mensagem": str(exc)[:500]})
+        _gravar_sinal_log(
+            sinal, regra,
+            modo="LIVE",
+            decisao="TRADE",
+            motivo=f"RECUSADA: {str(exc)[:100]}",
+        )
         return
     except Exception as exc:  # noqa: BLE001
         log.error("sinal %s falhou no envio: %s", sid, exc)
         _registrar(sid, {"status": "FALHOU", "mensagem": str(exc)[:500]})
+        _gravar_sinal_log(
+            sinal, regra,
+            modo="LIVE",
+            decisao="TRADE",
+            motivo=f"FALHOU: {str(exc)[:100]}",
+        )
         return
 
     _registrar(sid, {
@@ -588,18 +785,50 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
         "servidor": r["servidor"], "tipo_conta": r["tipo_conta"],
         "ticket": r.get("ticket"), "retcode": r.get("retcode"),
         "mensagem": (r.get("comentario") or "")[:500],
-        # O alvo que REALMENTE saiu, que não é mais o `alvo_1` reservado
-        # antes do envio — ver `execucao._alvo_por_rr`. Sem regravar, a
-        # coluna mostraria um alvo que a corretora nunca recebeu.
         "alvo": r.get("alvo"),
         "desvio_entrada_r": _desvio_entrada_r(sinal, r.get("preco_executado")),
     })
+
+    # Grava log da ordem enviada
+    _gravar_sinal_log(
+        sinal, regra,
+        modo="LIVE",
+        decisao="TRADE",
+        motivo="ENVIADA",
+    )
+
     log.info(
         "%s ticket=%s preço=%s vol=%s risco R$%.2f de R$%.2f (%s)",
         "ENVIADA" if r["enviado"] else "FALHOU",
         r.get("ticket"), r.get("preco_executado"), r.get("volume_executado"),
         r.get("risco_efetivo") or 0.0, risco, r.get("comentario"),
     )
+
+
+def _buscar_velas_simulacao(symbol: str, timeframe: str, count: int = 10) -> list[dict]:
+    """Busca velas para simulação de saída SHADOW."""
+    try:
+        resp = requests.get(
+            f"{API_URL}/candles",
+            params={"symbol": symbol, "timeframe": timeframe, "count": count},
+            headers=_api_headers(),
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        candles = data.get("candles", [])
+        # Converte para o formato esperado pelo simulador
+        return [
+            {
+                "open": c.get("open", 0),
+                "high": c.get("high", 0),
+                "low": c.get("low", 0),
+                "close": c.get("close", 0),
+            }
+            for c in candles
+        ]
+    except Exception:
+        return []
 
 
 def _um_ciclo() -> None:

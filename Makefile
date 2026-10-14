@@ -92,7 +92,9 @@ SCRAPER_SUB_FILES  := scraper/scraper.py scraper/config.py
 # é DLL de Windows. Ele é um SERVIÇO separado na VM (nssm), não um modo do
 # scraper — o scraper não pode parar de coletar porque o envio de ordem
 # quebrou, e vice-versa.
-EXECUTOR_FILES     := executor/executor.py
+# signal_logger.py e parametros_aprendidos.py são módulos do executor:
+# log CSV de sinais e veto por parâmetros aprendidos pelo Laboratório.
+EXECUTOR_FILES     := executor/executor.py executor/signal_logger.py executor/parametros_aprendidos.py
 SCRAPER_REQS       := requirements.txt requirements-local.txt scraper/requirements.txt
 
 # Tag = sha curto do HEAD, mais `-dirty.<timestamp>` se a árvore tiver mudança
