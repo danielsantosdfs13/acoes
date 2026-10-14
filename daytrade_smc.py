@@ -508,6 +508,19 @@ class AnalysisParams:
     chatgpt_horario_inicio_tarde: str = "14:00"
     chatgpt_horario_fim_tarde: str = "16:00"
 
+    # --- Setup RENKO_TOURO_URSO (2026-10-14) ------------------------------
+    # Renko NR (regra do Profit): tijolos de N ticks, reversão em (2N-1)·t
+    renko_touro_urso_enabled: bool = False     # ativa/desativa o setup
+    renko_n: int = 12                          # N ticks por tijolo (continuação)
+    renko_tick_size: float = 0.0               # 0 = auto-detectar do ativo
+    renko_media_tijolos: int = 20              # SMA dos fechamentos dos tijolos
+    renko_lookback_tentativa: int = 4          # tijolos anteriores para detectar tentativa
+    renko_alvo_tijolos: int = 2                # alvo em tijolos (testar 3)
+    renko_janela_inicio: str = "10:15"         # início da janela de entrada
+    renko_janela_fim: str = "16:30"            # fim da janela de entrada
+    renko_zerar_ate: str = "16:50"             # zerar posição até este horário
+    renko_liberado_conta_real: bool = False    # trava de segurança: conta real
+
     def to_items(self) -> tuple[tuple[str, object], ...]:
         """Forma canônica e hasheável, ordenada por nome do campo.
 
@@ -2426,50 +2439,8 @@ def confluence_signal(
     )
 
     alerts = market_alerts(context)
-    if agreeing < 2:
-        alerts.append("SINAIS CONFLITANTES — baixa confluência")
-
-    return Signal(
-        "Confluência",
-        direction,
-        score,
-        confidence,
-        setup,
-        reasons,
-        alerts,
-    )
-
-    direction, score, confidence = apply_market_filter(
-        direction,
-        score,
-        confidence,
-        context,
-    )
-
-    event = last_recent_event(context)
-    if direction == Direction.NEUTRAL:
-        setup = "Sem setup operável"
-    elif event and event.kind == "CHOCH" and event.direction == direction:
-        setup = "Reversão de tendência (CHoCH)"
-    elif (
-        direction == Direction.BUY and context.bullish_retest
-    ) or (
-        direction == Direction.SELL and context.bearish_retest
-    ):
-        setup = "Rompimento + Reteste"
-    elif context.vwap_rejection and weights.get("VWAP", 0) > 0:
-        setup = "Pullback na VWAP"
-    elif context.fvg_setup:
-        setup = "FVG + Retorno"
-    elif params.rsi_filtro and rsi is not None and rsi.direction == direction and rsi.score >= params.normalizacao_score:
-        setup = "Exaustão de IFR"
-    elif event and event.direction == direction:
-        setup = "Continuação de tendência (BOS)"
-    else:
-        setup = "Confluência técnica"
-
-    alerts = market_alerts(context)
-    if agreeing < 3:
+    # Fase 4.1d: alerta se apenas uma família confirma
+    if n_familias < 2:
         alerts.append("SINAIS CONFLITANTES — baixa confluência")
 
     return Signal(
@@ -2851,6 +2822,357 @@ def chatgpt_signal(context: MarketContext) -> Signal:
     )
 
 
+# ── Setup RENKO_TOURO_URSO (2026-10-14) ────────────────────────────────────
+
+@dataclass
+class RenkoBrick:
+    """Um tijolo Renko."""
+    direction: str          # "ALTA" ou "BAIXA"
+    open: float
+    close: float
+    high: float
+    low: float
+    volume: float           # volume acumulado durante a formação
+    timestamp: datetime     # quando o tijolo fechou
+    index: int              # índice do tijolo na sequência
+
+
+def build_renko_bricks(
+    df: pd.DataFrame,
+    n: int = 12,
+    tick_size: float = 0.0,
+) -> list[RenkoBrick]:
+    """Constrói tijolos Renko pela regra NR do Profit.
+
+    Regra NR:
+    - Continuação: preço anda N·t além do fechamento do último tijolo
+    - Reversão: preço anda (2N−1)·t além do fechamento
+    - Corpo do tijolo: (N−1)·t
+
+    `tick_size` = 0 detecta automaticamente do DataFrame (mínima diferença
+    entre high/low dos candles).
+
+    Montado a partir dos candles de 1 minuto (ou ticks, se disponível).
+    """
+    if len(df) < 2:
+        return []
+
+    # Detecta tick_size se não informado
+    if tick_size <= 0:
+        # Para ações B3, tick padrão é 0.01
+        # Para WINFUT/WINV26, seria 5 ou 10 (configurar explicitamente)
+        tick_size = 0.01
+
+    body_size = (n - 1) * tick_size
+    continuation = n * tick_size
+    reversal = (2 * n - 1) * tick_size
+
+    bricks: list[RenkoBrick] = []
+    if not bricks:
+        # Primeiro tijolo: usa o close do primeiro candle como referência
+        last_close = float(df["close"].iloc[0])
+        last_direction = None  # indefinido
+
+    vol_accum = 0.0
+    for i in range(1, len(df)):
+        open_price = float(df["open"].iloc[i])
+        high = float(df["high"].iloc[i])
+        low = float(df["low"].iloc[i])
+        close = float(df["close"].iloc[i])
+        volume = float(df["volume"].iloc[i]) if "volume" in df.columns else 0.0
+        timestamp = df.index[i] if hasattr(df.index[i], 'to_pydatetime') else datetime.now()
+        vol_accum += volume
+
+        # Verifica formação de tijolo
+        if last_direction is None:
+            # Primeiro tijolo: precisa de movimento suficiente
+            if close >= last_close + continuation:
+                brick = RenkoBrick(
+                    direction="ALTA",
+                    open=last_close,
+                    close=last_close + body_size,
+                    high=last_close + body_size,
+                    low=last_close,
+                    volume=vol_accum,
+                    timestamp=timestamp,
+                    index=len(bricks),
+                )
+                bricks.append(brick)
+                last_close = brick.close
+                last_direction = "ALTA"
+                vol_accum = 0.0
+            elif close <= last_close - continuation:
+                brick = RenkoBrick(
+                    direction="BAIXA",
+                    open=last_close,
+                    close=last_close - body_size,
+                    high=last_close,
+                    low=last_close - body_size,
+                    volume=vol_accum,
+                    timestamp=timestamp,
+                    index=len(bricks),
+                )
+                bricks.append(brick)
+                last_close = brick.close
+                last_direction = "BAIXA"
+                vol_accum = 0.0
+        elif last_direction == "ALTA":
+            # Continuação de alta
+            if close >= last_close + continuation:
+                brick = RenkoBrick(
+                    direction="ALTA",
+                    open=last_close,
+                    close=last_close + body_size,
+                    high=last_close + body_size,
+                    low=last_close,
+                    volume=vol_accum,
+                    timestamp=timestamp,
+                    index=len(bricks),
+                )
+                bricks.append(brick)
+                last_close = brick.close
+                vol_accum = 0.0
+            # Reversão
+            elif close <= last_close - reversal:
+                brick = RenkoBrick(
+                    direction="BAIXA",
+                    open=last_close,
+                    close=last_close - body_size,
+                    high=last_close,
+                    low=last_close - body_size,
+                    volume=vol_accum,
+                    timestamp=timestamp,
+                    index=len(bricks),
+                )
+                bricks.append(brick)
+                last_close = brick.close
+                last_direction = "BAIXA"
+                vol_accum = 0.0
+        else:  # last_direction == "BAIXA"
+            # Continuação de baixa
+            if close <= last_close - continuation:
+                brick = RenkoBrick(
+                    direction="BAIXA",
+                    open=last_close,
+                    close=last_close - body_size,
+                    high=last_close,
+                    low=last_close - body_size,
+                    volume=vol_accum,
+                    timestamp=timestamp,
+                    index=len(bricks),
+                )
+                bricks.append(brick)
+                last_close = brick.close
+                vol_accum = 0.0
+            # Reversão
+            elif close >= last_close + reversal:
+                brick = RenkoBrick(
+                    direction="ALTA",
+                    open=last_close,
+                    close=last_close + body_size,
+                    high=last_close + body_size,
+                    low=last_close,
+                    volume=vol_accum,
+                    timestamp=timestamp,
+                    index=len(bricks),
+                )
+                bricks.append(brick)
+                last_close = brick.close
+                last_direction = "ALTA"
+                vol_accum = 0.0
+
+    return bricks
+
+
+def compute_renko_vwap(
+    df: pd.DataFrame,
+    signal_time: datetime,
+) -> float:
+    """VWAP da sessão até o momento do sinal.
+
+    Usa o volume de TODOS os negócios até `signal_time`.
+    Nunca usa dados posteriores ao sinal.
+    """
+    if len(df) == 0:
+        return 0.0
+
+    # Filtra candles até o momento do sinal
+    if hasattr(df.index, 'tz') and df.index.tz is not None:
+        # Index tem timezone
+        mask = df.index <= signal_time
+    else:
+        mask = df.index.tz_localize("UTC") <= signal_time if df.index.tz is None else df.index <= signal_time
+
+    df_ate = df[mask]
+    if len(df_ate) == 0:
+        return 0.0
+
+    # VWAP = Σ(preço × volume) / Σ(volume)
+    typical_price = (df_ate["high"] + df_ate["low"] + df_ate["close"]) / 3
+    volume = df_ate["volume"] if "volume" in df_ate.columns else pd.Series(1.0, index=df_ate.index)
+
+    total_vol = volume.sum()
+    if total_vol <= 0:
+        return float(df_ate["close"].iloc[-1])
+
+    vwap = (typical_price * volume).sum() / total_vol
+    return float(vwap)
+
+
+def renko_touro_urso_signal(context: MarketContext) -> Signal:
+    """Setup RENKO_TOURO_URSO: sinal de reversão baseado em tijolos Renko.
+
+    Lógica (regra do Profit "NR"):
+    - URSO (venda): tijolo de BAIXA fecha abaixo da média E da VWAP;
+      nos 4 tijolos anteriores houve ao menos um tijolo de ALTA que
+      fechou acima da média OU da VWAP (tentativa de rompimento);
+      o tijolo anterior não estava abaixo das duas.
+    - TOURO (compra): espelho exato.
+
+    Entrada: ordem STOP no fechamento do tijolo.
+    Stop: nível de reversão = fechamento ± (2N−1)·t.
+    Alvo: fechamento ∓ alvo_tijolos·N·t.
+    """
+    params = context.params
+
+    # Verifica se o setup está habilitado
+    if not params.renko_touro_urso_enabled:
+        return Signal("RENKO_TOURO_URSO", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: setup desabilitado", [], [], [])
+
+    df = context.df
+    n = params.renko_n
+    tick_size = params.renko_tick_size
+
+    # ── 1. Constrói tijolos Renko ──
+    bricks = build_renko_bricks(df, n=n, tick_size=tick_size)
+    if len(bricks) < params.renko_lookback_tentativa + 2:
+        return Signal("RENKO_TOURO_URSO", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: poucos tijolos",
+                      [], [f"{len(bricks)} tijolos < {params.renko_lookback_tentativa + 2}"], [])
+
+    # ── 2. Média dos fechamentos dos tijolos ──
+    closes = [b.close for b in bricks]
+    media_periodo = min(params.renko_media_tijolos, len(closes))
+    media = sum(closes[-media_periodo:]) / media_periodo
+
+    # ── 3. VWAP da sessão até o último tijolo ──
+    ultimo_tijolo = bricks[-1]
+    vwap = compute_renko_vwap(df, ultimo_tijolo.timestamp)
+    if vwap <= 0:
+        return Signal("RENKO_TOURO_URSO", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: VWAP indisponível", [], [], [])
+
+    # ── 4. Verifica janela de entrada ──
+    from zoneinfo import ZoneInfo
+    agora = datetime.now(ZoneInfo(LOCAL_TZ))
+    janela_inicio = datetime.strptime(params.renko_janela_inicio, "%H:%M").time()
+    janela_fim = datetime.strptime(params.renko_janela_fim, "%H:%M").time()
+    if not (janela_inicio <= agora.time() <= janela_fim):
+        return Signal("RENKO_TOURO_URSO", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: fora da janela de entrada",
+                      [], [f"janela {params.renko_janela_inicio}-{params.renko_janela_fim}"], [])
+
+    # ── 5. Lógica do sinal ──
+    tijolo_atual = bricks[-1]
+    tijolo_anterior = bricks[-2]
+    lookback = bricks[-(params.renko_lookback_tentativa + 1):-1]
+
+    # Verifica tentativa de rompimento nos tijolos anteriores
+    tentativa_alta = any(
+        b.direction == "ALTA" and (b.close > media or b.close > vwap)
+        for b in lookback
+    )
+    tentativa_baixa = any(
+        b.direction == "BAIXA" and (b.close < media or b.close < vwap)
+        for b in lookback
+    )
+
+    # ── SINAL URSO (venda) ──
+    if (tijolo_atual.direction == "BAIXA" and
+        tijolo_atual.close < media and
+        tijolo_atual.close < vwap and
+        tentativa_alta and
+        not (tijolo_anterior.close < media and tijolo_anterior.close < vwap)):
+
+        direction = Direction.SELL
+        setup = "RENKO URSO"
+        reasons = [
+            f"Tijolo BAIXA fecha {tijolo_atual.close:.2f} < média {media:.2f} e VWAP {vwap:.2f}",
+            f"Tentativa de rompimento de alta detectada nos últimos {params.renko_lookback_tentativa} tijolos",
+            f"Tijolo anterior ({tijolo_anterior.close:.2f}) não estava abaixo das duas",
+        ]
+
+    # ── SINAL TOURO (compra) ──
+    elif (tijolo_atual.direction == "ALTA" and
+          tijolo_atual.close > media and
+          tijolo_atual.close > vwap and
+          tentativa_baixa and
+          not (tijolo_anterior.close > media and tijolo_anterior.close > vwap)):
+
+        direction = Direction.BUY
+        setup = "RENKO TOURO"
+        reasons = [
+            f"Tijolo ALTA fecha {tijolo_atual.close:.2f} > média {media:.2f} e VWAP {vwap:.2f}",
+            f"Tentativa de rompimento de baixa detectada nos últimos {params.renko_lookback_tentativa} tijolos",
+            f"Tijolo anterior ({tijolo_anterior.close:.2f}) não estava acima das duas",
+        ]
+    else:
+        return Signal("RENKO_TOURO_URSO", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: sem sinal",
+                      [], ["Condições de TOURO/URSO não atendidas"], [])
+
+    # ── 6. Preços de entrada, stop e alvo ──
+    entrada = tijolo_atual.close  # fechamento do tijolo (ordem STOP)
+    tick = tick_size if tick_size > 0 else 0.01
+
+    if direction == Direction.SELL:
+        # Stop: nível de reversão = fechamento + (2N-1)·t
+        stop = tijolo_atual.close + (2 * n - 1) * tick
+        # Alvo: fechamento - alvo_tijolos·N·t
+        alvo = tijolo_atual.close - params.renko_alvo_tijolos * n * tick
+    else:  # BUY
+        stop = tijolo_atual.close - (2 * n - 1) * tick
+        alvo = tijolo_atual.close + params.renko_alvo_tijolos * n * tick
+
+    # ── 7. Score ──
+    # Score base: qualidade do sinal
+    score = 70.0
+
+    # Bônus por força do tijolo (volume)
+    if tijolo_atual.volume > 0:
+        # Compara com volume médio dos tijolos
+        volumes = [b.volume for b in bricks[-20:]]
+        vol_medio = sum(volumes) / len(volumes) if volumes else 0
+        if vol_medio > 0 and tijolo_atual.volume > vol_medio * 1.5:
+            score += 10
+            reasons.append(f"Volume do tijolo {tijolo_atual.volume/vol_medio:.1f}x acima da média")
+
+    # Bônus por afastamento da média
+    dist_media_pct = abs(tijolo_atual.close - media) / media * 100 if media > 0 else 0
+    if dist_media_pct > 0.5:
+        score += 5
+
+    score = min(95.0, score)
+
+    # ── 8. R/R ──
+    risco = abs(entrada - stop)
+    recompensa = abs(alvo - entrada)
+    rr = recompensa / risco if risco > 0 else 0
+
+    reasons.append(f"R/R: 1:{rr:.2f} (alvo {params.renko_alvo_tijolos} tijolos)")
+
+    return Signal(
+        "RENKO_TOURO_URSO",
+        direction,
+        score,
+        min(100.0, score * 1.05),
+        setup,
+        reasons,
+        [],  # alerts
+    )
+
+
 def round_tick(price: float, mode: str, tick: float = 0.01) -> float:
     scaled = price / tick
     if mode == "floor":
@@ -2882,6 +3204,20 @@ def stop_for_signal(
 ) -> tuple[float, str]:
     price = float(context.df["close"].iloc[-1])
     direction = signal.direction
+
+    # ── RENKO_TOURO_URSO: stop e alvo já calculados no sinal ──
+    # O stop é o nível de reversão do Renko: fechamento ± (2N-1)·t
+    if signal.name == "RENKO_TOURO_URSO":
+        params = context.params
+        n = params.renko_n
+        tick = params.renko_tick_size if params.renko_tick_size > 0 else 0.01
+        # A entrada é o fechamento do tijolo (armazenado no setup)
+        # O stop é o nível de reversão
+        if direction == Direction.BUY:
+            stop = price - (2 * n - 1) * tick
+        else:
+            stop = price + (2 * n - 1) * tick
+        return stop, f"renko_reversao_{n}N"
 
     if signal.name in ("Confluência", "SMC"):
         return structural_stop(context, direction)
@@ -3042,12 +3378,50 @@ def attach_risk(signal: Signal, context: MarketContext) -> None:
     4. Alvo calculado
     5. Gain máximo pct + encolher_alvos aplicados AO ALVO
     6. R/R líquido de custos calculado e validado
+
+    RENKO_TOURO_URSO: stop e alvo já calculados no sinal (regra NR).
     """
     if signal.direction == Direction.NEUTRAL:
         return
 
     params = context.params
     entry = round_tick(float(context.df["close"].iloc[-1]), "nearest")
+
+    # ── RENKO: stop e alvo pré-calculados ──
+    if signal.name == "RENKO_TOURO_URSO":
+        n = params.renko_n
+        tick = params.renko_tick_size if params.renko_tick_size > 0 else 0.01
+        alvo_tijolos = params.renko_alvo_tijolos
+
+        stop, basis = stop_for_signal(signal, context)
+
+        if signal.direction == Direction.BUY:
+            target_1 = round_tick(entry + alvo_tijolos * n * tick, "ceil")
+            target_2 = round_tick(entry + alvo_tijolos * n * tick * 1.5, "ceil")
+        else:
+            target_1 = round_tick(entry - alvo_tijolos * n * tick, "floor")
+            target_2 = round_tick(entry - alvo_tijolos * n * tick * 1.5, "floor")
+
+        risk = abs(entry - stop)
+        if risk <= 0:
+            signal.direction = Direction.NEUTRAL
+            return
+
+        rr_real_liquido = compute_rr_real_liquido(
+            entry, stop, target_1, params.custo_pct_ida_volta
+        )
+
+        signal.risk = RiskPlan(
+            entry,
+            stop,
+            target_1,
+            target_2,
+            rr_real_liquido,
+            basis,
+            [],  # alternatives
+        )
+        return
+
     stop, basis = stop_for_signal(signal, context)
 
     # ── 1. Stop mínimo ATR ──
@@ -3227,7 +3601,9 @@ def analyze(
     tpo_vwap = tpo_vwap_signal(context)
     # Setup CHATGPT: EMA 200 + EMA 21 + VWAP + Volume + ATR
     chatgpt = chatgpt_signal(context)
-    signals = [confluence, *isolated, rsi, tpo_vwap, chatgpt]
+    # Setup RENKO_TOURO_URSO: tijolos Renko NR + média + VWAP
+    renko_touro_urso = renko_touro_urso_signal(context)
+    signals = [confluence, *isolated, rsi, tpo_vwap, chatgpt, renko_touro_urso]
 
     for signal in signals:
         attach_risk(signal, context)
@@ -3252,7 +3628,7 @@ class MultiTimeframeResult:
     confirmed_direction: Direction
 
 
-MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR", "TPO/VWAP", "CHATGPT")
+MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR", "TPO/VWAP", "CHATGPT", "RENKO_TOURO_URSO")
 ALL_MODALITIES_OPTION = "Todas as modalidades"
 MODALITY_CHOICES = (ALL_MODALITIES_OPTION, *MODALITIES)
 
