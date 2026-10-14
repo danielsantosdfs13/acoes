@@ -4191,6 +4191,16 @@ def signal_payload(
             "atr": float(context.atr),
             "atr_pct": float(context.atr_pct),
             "rvol": float(context.rvol),
+            # Fase 1/4: campos novos do contexto
+            "vol_percentil": float(context.vol_percentil),
+            "regime": context.regime,
+            # Fase 2/3: campos novos do risk plan
+            "entrada_modo": params.entrada_modo,
+            "recuo_atr": params.recuo_atr if params.entrada_modo == "LIMITADA" else None,
+            "rr_real_liquido": risk.rr,
+            # Fase 1.2: fonte de dados
+            "fonte_dados": context.df.attrs.get("fonte_dados", "API"),
+            "volume_tipo": context.df.attrs.get("volume_tipo", "unknown"),
         },
     }
 
