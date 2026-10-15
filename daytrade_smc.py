@@ -443,11 +443,10 @@ class AnalysisParams:
     encolher_alvos: float = 0.85
     # Limites máximos de distância em % do preço de entrada.
     # Stop e gain não podem ultrapassar estes limiares.
-    # Fase 3: stop_maximo_pct aumentado de 0.5% para 2.0% — com
-    # stop_minimo_atr=1.0, muitos stops legítimos ficavam acima de
-    # 0.5% e eram bloqueados (STOP_ACIMA_DO_MAXIMO).
+    # Fase 3: stop_maximo_pct=2.0%, gain_maximo_pct=5.0% — com ATR ~0.76%,
+    # um R/R 1.5 dá alvo a ~2.37% do preço, que era cortado por 2.0%.
     stop_maximo_pct: float = 2.0
-    gain_maximo_pct: float = 2.0
+    gain_maximo_pct: float = 5.0
 
     # --- Setup TPO/VWAP (2026-09-30) ------------------------------------
     # Fluxo: 1ª vela → VWAP → direção → qualidade → TPO → entrada → stop →
