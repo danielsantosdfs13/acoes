@@ -71,6 +71,7 @@ Ver scraper/README.md para o padrão de serviço Windows via NSSM.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -87,6 +88,8 @@ import execucao  # noqa: E402
 from daytrade_smc import _api_headers, fetch_signals  # noqa: E402
 import signal_logger  # noqa: E402
 import parametros_aprendidos  # noqa: E402
+import carteiras  # noqa: E402
+import notificador  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("executor")
@@ -583,6 +586,7 @@ def _gravar_sinal_log(
     saida_timestamp: datetime | None = None,
     saida_preco: float | None = None,
     saida_motivo: str | None = None,
+    livro: str | None = None,
 ) -> None:
     """Grava o sinal no log CSV."""
     detalhes = _extrair_detalhes_sinal(sinal)
@@ -593,6 +597,10 @@ def _gravar_sinal_log(
         ts_sinal = datetime.fromisoformat(sinal["candle_time"])
     except (KeyError, ValueError):
         ts_sinal = datetime.now(UTC)
+
+    # Determina livro se não informado
+    if livro is None:
+        livro = carteiras.carteira_do_setup(regra.get("modalidade", ""))
 
     signal_logger.gravar_sinal(
         id=str(sinal.get("id", "")),
@@ -617,42 +625,74 @@ def _gravar_sinal_log(
         entrada=detalhes.get("entrada"),
         stop=detalhes.get("stop"),
         alvo=detalhes.get("alvo"),
-        custo_pct=0.0005,  # 0.05% round-trip
+        custo_pct=0.0005,
         saida_timestamp=saida_timestamp,
         saida_preco=saida_preco,
         saida_motivo=saida_motivo,
         resultado_r=resultado_r,
         resultado_brl=resultado_brl,
-        # Fase 6: colunas novas
+        # Fase 6
         entrada_modo=detalhes.get("entrada_modo"),
         recuo_atr=detalhes.get("recuo_atr"),
         rr_real_liquido=detalhes.get("rr_real_liquido"),
         fonte_dados=detalhes.get("fonte_dados"),
         volume_tipo=detalhes.get("volume_tipo"),
+        # Multi-carteira
+        livro=livro,
     )
 
 
 def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
-    """Um sinal virando ordem.
+    """Um sinal virando ordem (multi-carteira).
 
     Fluxo:
-    1. Determina modo (LIVE/PAPER/SHADOW) via parâmetros aprendidos
-    2. Verifica veto (parâmetros aprendidos)
-    3. Se veto ou modo SHADOW: grava log e retorna (não envia)
-    4. Se PAPER: grava log e retorna (não envia)
-    5. Se LIVE: envia ordem normalmente
-
-    `teste=True` é o caminho de quem está conferindo o encanamento à mão: a
-    ordem sai igual, com as mesmas travas, mas a linha nasce marcada e fica
-    fora das estatísticas."""
+    1. Verifica se setup está habilitado em config/setups.json
+    2. Determina carteira (SOMADOS ou RENKO)
+    3. Verifica limites da carteira (posições, trades, perda diária)
+    4. Determina modo (LIVE/PAPER/SHADOW)
+    5. Verifica veto
+    6. Se LIVE: envia ordem e notifica
+    7. Se PAPER/SHADOW: grava log e notifica bloqueio
+    """
     symbol, sid = sinal["symbol"], sinal["id"]
     risco = float(regra["risco_maximo"])
     setup = regra.get("modalidade", "")
 
-    # 1. Determina modo
-    modo = parametros_aprendidos.modo_do_setup(setup)
+    # 1. Verifica se setup está habilitado
+    if not carteiras.setup_habilitado(setup):
+        log.debug("setup %s desabilitado — pulando", setup)
+        return
 
-    # 2. Verifica veto (apenas se não for já SHADOW)
+    # 2. Determina carteira
+    livro = carteiras.carteira_do_setup(setup)
+
+    # 3. Verifica limites da carteira
+    pode, motivo_limite = carteiras.pode_operar(livro, symbol)
+    if not pode:
+        log.info("sinal %s %s: bloqueado (%s) — carteira %s", symbol, sid, motivo_limite, livro)
+        _gravar_sinal_log(
+            sinal, regra,
+            modo="SHADOW",
+            decisao="NO_TRADE",
+            motivo=motivo_limite,
+            livro=livro,
+        )
+        # Notifica bloqueio
+        asyncio.get_event_loop().run_until_complete(
+            notificador.notificar_sinal_bloqueado(
+                setup=setup, livro=livro, ativo=symbol, motivo=motivo_limite,
+            )
+        )
+        return
+
+    # 4. Determina modo (config/setups.json tem prioridade sobre parâmetros aprendidos)
+    modo_cfg = carteiras.modo_do_setup(setup)
+    modo_aprendido = parametros_aprendidos.modo_do_setup(setup)
+    # Usa o mais restritivo
+    ordem_modos = {"LIVE": 0, "PAPER": 1, "SHADOW": 2}
+    modo = modo_cfg if ordem_modos.get(modo_cfg, 0) <= ordem_modos.get(modo_aprendido, 0) else modo_aprendido
+
+    # 5. Verifica veto (apenas se não for já SHADOW)
     veto = False
     motivo_veto = ""
     if modo != "SHADOW":
@@ -673,7 +713,22 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
             alvo=sinal.get("alvo_1"),
         )
 
-    # 3. Se veto ou SHADOW: grava log e retorna
+    # Notifica sinal gerado (se LIVE ou PAPER)
+    if modo in ("LIVE", "PAPER") and not veto:
+        asyncio.get_event_loop().run_until_complete(
+            notificador.notificar_sinal(
+                setup=setup, livro=livro, ativo=symbol,
+                lado=sinal.get("direcao", "?"),
+                preco=sinal.get("entrada", 0),
+                stop=sinal.get("stop", 0),
+                alvo=sinal.get("alvo_1", 0),
+                rr=sinal.get("r_alvo_1", 0),
+                score=sinal.get("score", 0),
+                modo=modo,
+            )
+        )
+
+    # 6. Se veto ou SHADOW: grava log e retorna
     if veto or modo == "SHADOW":
         motivo = motivo_veto if veto else "MODO_SHADOW"
         log.info("sinal %s %s: VETO (%s) — gravação SHADOW", symbol, sid, motivo)
@@ -685,7 +740,6 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
         saida_preco = None
         saida_motivo = None
         if sinal.get("entrada") and sinal.get("stop") and sinal.get("alvo_1"):
-            # Tenta buscar velas para simulação (pode falhar)
             try:
                 velas = _buscar_velas_simulacao(symbol, regra.get("timeframe", "M15"))
                 if velas:
@@ -697,10 +751,9 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
                         velas=velas,
                     )
                     saida_ts = datetime.now(UTC)
-                    # Calcula resultado em reais
                     risco_acao = abs(sinal["entrada"] - sinal["stop"])
                     if risco_acao > 0:
-                        resultado_brl = resultado_r * risco_acao * 100  # ~100 ações
+                        resultado_brl = resultado_r * risco_acao * 100
             except Exception as exc:
                 log.debug("simulação SHADOW falhou para %s: %s", symbol, exc)
 
@@ -714,10 +767,11 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
             saida_timestamp=saida_ts,
             saida_preco=saida_preco,
             saida_motivo=saida_motivo,
+            livro=livro,
         )
         return
 
-    # 4. Se PAPER: grava log e retorna
+    # 7. Se PAPER: grava log e retorna
     if modo == "PAPER":
         log.info("sinal %s %s: modo PAPER — não envia, grava log", symbol, sid)
         _gravar_sinal_log(
@@ -725,10 +779,11 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
             modo="PAPER",
             decisao="NO_TRADE",
             motivo="MODO_PAPER",
+            livro=livro,
         )
         return
 
-    # 5. Modo LIVE: fluxo normal
+    # 8. Modo LIVE: fluxo normal
     estimada = _quantidade_estimada(sinal, risco)
     if estimada is None:
         _gravar_sinal_log(
@@ -736,6 +791,7 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
             modo="LIVE",
             decisao="NO_TRADE",
             motivo="QUANTIDADE_INVALIDA",
+            livro=livro,
         )
         return
 
@@ -746,6 +802,12 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
             modo="SHADOW",
             decisao="NO_TRADE",
             motivo="POSICAO_ABERTA",
+            livro=livro,
+        )
+        asyncio.get_event_loop().run_until_complete(
+            notificador.notificar_sinal_bloqueado(
+                setup=setup, livro=livro, ativo=symbol, motivo="ATIVO_POSICIONADO",
+            )
         )
         return
 
@@ -757,37 +819,31 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
             modo="SHADOW",
             decisao="NO_TRADE",
             motivo=f"DUPLICADO_{ordem['status']}",
+            livro=livro,
         )
         return
 
     log.info(
-        "ENVIANDO%s %s %s ~%.0f ações (risco R$%.2f, stop %.2f, alvo %.2f) sinal=%s",
+        "ENVIANDO%s [%s] %s %s ~%.0f ações (risco R$%.2f, stop %.2f, alvo %.2f) sinal=%s",
         " [TESTE]" if teste else "",
+        livro,
         sinal["direcao"], symbol, estimada, risco,
         sinal["stop"], sinal.get("alvo_1") or 0, sid,
     )
     try:
-        # ── Fase 2: ordem limitada com recuo ──
-        # Se entrada_modo == "LIMITADA", calcula o preço da limitada
-        # recuada do close do sinal e envia ordem limitada.
+        # Ordem limitada com recuo (se configurado)
         entrada_modo = (sinal.get("detalhes") or {}).get("entrada_modo", "MERCADO")
 
         if entrada_modo == "LIMITADA":
-            # Calcula preço da limitada
             atr = (sinal.get("detalhes") or {}).get("atr", 0)
             recuo_atr = (sinal.get("detalhes") or {}).get("recuo_atr", 0.5)
-            close_sinal = sinal.get("entrada")  # entrada modelada = close do candle
+            close_sinal = sinal.get("entrada")
 
             if atr > 0 and close_sinal:
                 if sinal["direcao"] == "COMPRA":
                     preco_limite = close_sinal - recuo_atr * atr
                 else:
                     preco_limite = close_sinal + recuo_atr * atr
-
-                log.info(
-                    "ENVIANDO LIMITADA %s %s ~%.0f ações (limite %.2f, recuo %.1f ATR)",
-                    sinal["direcao"], symbol, estimada, preco_limite, recuo_atr,
-                )
 
                 r = execucao.enviar_ordem_limitada(
                     symbol, sinal["direcao"],
@@ -799,8 +855,6 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
                     rr=sinal.get("r_alvo_1"),
                 )
             else:
-                # Sem ATR ou sem entrada, fallback para mercado
-                log.warning("sinal %s: sem ATR/entrada para limitada, usando mercado", sid)
                 r = execucao.enviar_ordem_mercado(
                     symbol, sinal["direcao"],
                     risco_maximo=risco,
@@ -810,7 +864,6 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
                     rr=sinal.get("r_alvo_1"),
                 )
         else:
-            # Comportamento antigo: ordem a mercado
             r = execucao.enviar_ordem_mercado(
                 symbol, sinal["direcao"],
                 risco_maximo=risco,
@@ -827,6 +880,13 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
             modo="LIVE",
             decisao="TRADE",
             motivo=f"RECUSADA: {str(exc)[:100]}",
+            livro=livro,
+        )
+        asyncio.get_event_loop().run_until_complete(
+            notificador.notificar_sinal_bloqueado(
+                setup=setup, livro=livro, ativo=symbol,
+                motivo="RECUSADA", detalhe=str(exc)[:100],
+            )
         )
         return
     except Exception as exc:  # noqa: BLE001
@@ -837,6 +897,10 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
             modo="LIVE",
             decisao="TRADE",
             motivo=f"FALHOU: {str(exc)[:100]}",
+            livro=livro,
+        )
+        asyncio.get_event_loop().run_until_complete(
+            notificador.notificar_erro(f"Falha ao enviar ordem {symbol}: {exc}")
         )
         return
 
@@ -851,17 +915,54 @@ def _processar(sinal: dict, regra: dict, *, teste: bool = False) -> None:
         "desvio_entrada_r": _desvio_entrada_r(sinal, r.get("preco_executado")),
     })
 
+    # Registra na carteira
+    carteiras.registrar_abertura(livro, symbol, {
+        "setup": setup,
+        "ticket": r.get("ticket"),
+        "direcao": sinal["direcao"],
+        "stop": sinal.get("stop"),
+        "alvo": sinal.get("alvo_1"),
+    })
+
     # Grava log da ordem enviada
     _gravar_sinal_log(
         sinal, regra,
         modo="LIVE",
         decisao="TRADE",
         motivo="ENVIADA",
+        livro=livro,
     )
 
+    # Notifica ordem enviada
+    asyncio.get_event_loop().run_until_complete(
+        notificador.notificar_ordem_enviada(
+            setup=setup, livro=livro, ativo=symbol,
+            lado=sinal["direcao"],
+            preco_pedido=r["preco_pedido"],
+            stop=sinal.get("stop", 0),
+            alvo=sinal.get("alvo_1", 0),
+            volume=r["volume"],
+            ticket=r.get("ticket", 0),
+        )
+    )
+
+    # Notifica execução (se executada)
+    if r.get("enviado") and r.get("preco_executado"):
+        asyncio.get_event_loop().run_until_complete(
+            notificador.notificar_ordem_executada(
+                setup=setup, livro=livro, ativo=symbol,
+                lado=sinal["direcao"],
+                preco_executado=r["preco_executado"],
+                preco_pedido=r["preco_pedido"],
+                volume=r.get("volume_executado", r["volume"]),
+                ticket=r.get("ticket", 0),
+            )
+        )
+
     log.info(
-        "%s ticket=%s preço=%s vol=%s risco R$%.2f de R$%.2f (%s)",
+        "%s [%s] ticket=%s preço=%s vol=%s risco R$%.2f de R$%.2f (%s)",
         "ENVIADA" if r["enviado"] else "FALHOU",
+        livro,
         r.get("ticket"), r.get("preco_executado"), r.get("volume_executado"),
         r.get("risco_efetivo") or 0.0, risco, r.get("comentario"),
     )

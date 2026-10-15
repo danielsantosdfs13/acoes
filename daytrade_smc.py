@@ -3608,10 +3608,12 @@ def analyze(
     # confirmar/contrariar/definir a direção depois. É por isso que o IFR
     # é calculado ANTES e passado — não anexado à lista `isolated`.
     confluence = confluence_signal(context, isolated, rsi)
-    # Setup TPO/VWAP: fluxo independente com VWAP + TPO + 1ª vela
-    tpo_vwap = tpo_vwap_signal(context)
-    # Setup CHATGPT: EMA 200 + EMA 21 + VWAP + Volume + ATR
-    chatgpt = chatgpt_signal(context)
+    # Setup TPO/VWAP: DESATIVADO (código mantido, retorna NEUTRO)
+    tpo_vwap = Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
+                      "NO_TRADE: setup desabilitado", [], [], [])
+    # Setup CHATGPT: DESATIVADO (código mantido, retorna NEUTRO)
+    chatgpt = Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
+                     "NO_TRADE: setup desabilitado", [], [], [])
     # Setup RENKO_TOURO_URSO: tijolos Renko NR + média + VWAP
     renko_touro_urso = renko_touro_urso_signal(context)
     signals = [confluence, *isolated, rsi, tpo_vwap, chatgpt, renko_touro_urso]
@@ -3639,7 +3641,9 @@ class MultiTimeframeResult:
     confirmed_direction: Direction
 
 
-MODALITIES = ("Confluência", "SMC", "Price Action", "Médias Móveis", "VWAP", "IFR", "TPO/VWAP", "CHATGPT", "RENKO_TOURO_URSO")
+MODALITIES = ("Confluência", "SMC", "Médias Móveis", "VWAP", "IFR", "RENKO_TOURO_URSO")
+# Setups desativados (código mantido, mas não geram sinal)
+MODALITIES_DESATIVADAS = ("CHATGPT", "Price Action", "TPO/VWAP")
 ALL_MODALITIES_OPTION = "Todas as modalidades"
 MODALITY_CHOICES = (ALL_MODALITIES_OPTION, *MODALITIES)
 

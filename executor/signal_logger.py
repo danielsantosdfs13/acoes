@@ -39,7 +39,7 @@ log = logging.getLogger("executor.signal_logger")
 # Fuso de Brasília para o timestamp do sinal
 TZ_BRASILIA = ZoneInfo("America/Sao_Paulo")
 
-# Ordem fixa das colunas (Fase 6: colunas novas adicionadas)
+# Ordem fixa das colunas (Fase 6 + multi-carteira)
 COLUNAS = [
     "id", "timestamp_sinal", "ativo", "setup", "variante", "modo",
     "elegivel", "decisao", "motivo", "direcao", "regime",
@@ -47,8 +47,10 @@ COLUNAS = [
     "vwap_slope_atr", "volume_rel", "score", "entrada", "stop", "alvo",
     "custo_pct", "saida_timestamp", "saida_preco", "saida_motivo",
     "resultado_r", "resultado_brl",
-    # Fase 6: colunas novas
+    # Fase 6
     "entrada_modo", "recuo_atr", "rr_real_liquido", "fonte_dados", "volume_tipo",
+    # Multi-carteira
+    "livro", "deslizamento_entrada", "deslizamento_saida",
 ]
 
 # Diretório padrão do log (relativo ao executor)
@@ -108,6 +110,10 @@ def gravar_sinal(
     rr_real_liquido: float | None = None,
     fonte_dados: str | None = None,
     volume_tipo: str | None = None,
+    # Multi-carteira
+    livro: str | None = None,
+    deslizamento_entrada: float | None = None,
+    deslizamento_saida: float | None = None,
 ) -> None:
     """Grava uma linha no log CSV.
 
@@ -159,6 +165,10 @@ def gravar_sinal(
             "rr_real_liquido": _fmt(rr_real_liquido),
             "fonte_dados": fonte_dados or "",
             "volume_tipo": volume_tipo or "",
+            # Multi-carteira
+            "livro": livro or "",
+            "deslizamento_entrada": _fmt(deslizamento_entrada),
+            "deslizamento_saida": _fmt(deslizamento_saida),
         }
 
         with open(caminho, "a", newline="", encoding="utf-8") as f:
