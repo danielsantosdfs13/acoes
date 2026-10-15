@@ -83,6 +83,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import daytrade_smc  # noqa: E402
 import execucao  # noqa: E402
 from daytrade_smc import _api_headers, fetch_signals  # noqa: E402
