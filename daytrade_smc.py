@@ -440,11 +440,10 @@ class AnalysisParams:
     rr_alvo_1: float = 1.5
     rr_alvo_2: float = 3.0
     stop_minimo_atr: float = 1.0
-    # Alvos contratados a `encolher_alvos` da distância original (0.85 =
-    # 85%): aproxima o alvo e sobe a taxa de acerto, no mesmo espírito do
-    # upstream `TARGET_SHRINK`. Não toca nos alvos alternativos
-    # (Fibonacci/estrutura/expectativa), que continuam na medida completa.
-    encolher_alvos: float = 0.85
+    # Alvos contratados a `encolher_alvos` da distância original.
+    # 1.0 = sem encolhimento (comportamento original antes da Fase 3).
+    # 0.85 encolhia o alvo em 15%, deixando R/R abaixo de 1.0 após custos.
+    encolher_alvos: float = 1.0
     # Limites máximos de distância em % do preço de entrada.
     # Stop e gain não podem ultrapassar estes limiares.
     # Fase 3: stop_maximo_pct=2.0%, gain_maximo_pct=5.0% — com ATR ~0.76%,
