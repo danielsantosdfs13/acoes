@@ -342,7 +342,10 @@ class AnalysisParams:
     # --- Fase 1: Parâmetros novos (2026-10-14) --------------------------
     # Volatilidade por percentil (Fase 1.5): em vez de corte fixo ATR%,
     # compara com o mesmo horário nas 20 sessões anteriores.
-    vol_percentil_habilitado: bool = True       # False = usar corte fixo (legado)
+    # DESATIVADO por padrão: o filtro de percentil bloqueava sinais em
+    # dias de volatilidade incomum (ex: ATR%=0.34% classificado como
+    # EXCESSIVA porque estava no percentil 85 do histórico).
+    vol_percentil_habilitado: bool = False      # False = usar corte fixo (legado)
     vol_percentil_sessoes: int = 20             # sessões anteriores para comparação
     vol_percentil_min: float = 20.0             # abaixo disso = volatilidade baixa
     # Fase 4: Regime de mercado
