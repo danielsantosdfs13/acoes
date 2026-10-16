@@ -2476,19 +2476,19 @@ def tpo_vwap_signal(context: MarketContext) -> Signal:
     if not primeira.get("valid"):
         return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
                       f"NO_TRADE: {primeira.get('reason', '1ª vela inválida')}",
-                      [], ["1ª vela não passou nos filtros"], [])
+                      [], ["1ª vela não passou nos filtros"])
 
     # ── 2. VWAP: direção ──
     vwap = context.vwap
     if vwap <= 0:
         return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
-                      "NO_TRADE: VWAP indisponível", [], ["sem VWAP"], [])
+                      "NO_TRADE: VWAP indisponível", [], ["sem VWAP"])
 
     vwap_dist = abs(context.vwap_distance_pct)
     if vwap_dist < params.vwap_min_distance_pct:
         return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: preço muito perto da VWAP",
-                      [], [f"distância {vwap_dist:.2f}% < {params.vwap_min_distance_pct}%"], [])
+                      [], [f"distância {vwap_dist:.2f}% < {params.vwap_min_distance_pct}%"])
 
     # Direção pela VWAP
     if context.vwap_distance_pct > 0:
@@ -2502,7 +2502,7 @@ def tpo_vwap_signal(context: MarketContext) -> Signal:
     tpo = compute_tpo(df)
     if tpo["poc"] is None:
         return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
-                      "NO_TRADE: TPO indisponível", [], ["sem dados TPO"], [])
+                      "NO_TRADE: TPO indisponível", [], ["sem dados TPO"])
 
     # Contexto TPO
     tpo_contexto = tpo["contexto"]
@@ -2527,11 +2527,11 @@ def tpo_vwap_signal(context: MarketContext) -> Signal:
         if vwap_direction == Direction.BUY and context.vwap_distance_pct > 0:
             return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
                           "NO_TRADE: preço longe demais da VWAP",
-                          [], [f"distância {context.vwap_distance_pct:.2f}% > {params.max_distance_from_vwap_pct}%"], [])
+                          [], [f"distância {context.vwap_distance_pct:.2f}% > {params.max_distance_from_vwap_pct}%"])
         if vwap_direction == Direction.SELL and context.vwap_distance_pct < 0:
             return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
                           "NO_TRADE: preço longe demais da VWAP",
-                          [], [f"distância {abs(context.vwap_distance_pct):.2f}% > {params.max_distance_from_vwap_pct}%"], [])
+                          [], [f"distância {abs(context.vwap_distance_pct):.2f}% > {params.max_distance_from_vwap_pct}%"])
 
     # ── 5. Direção final ──
     # VWAP define a direção; 1ª vela confirma
@@ -2545,12 +2545,12 @@ def tpo_vwap_signal(context: MarketContext) -> Signal:
         # 1ª vela contradiz a VWAP → NO_TRADE
         return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: 1ª vela contradiz a VWAP",
-                      [], [f"vela={primeira['direction']}, vwap={vwap_label}"], [])
+                      [], [f"vela={primeira['direction']}, vwap={vwap_label}"])
 
     if direction == Direction.NEUTRAL:
         return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: sem direção clara",
-                      [], ["vela neutra ou VWAP neutra"], [])
+                      [], ["vela neutra ou VWAP neutra"])
 
     # ── 6. Stop estrutural ──
     if params.stop_basis == "FIRST_CANDLE":
@@ -2581,7 +2581,7 @@ def tpo_vwap_signal(context: MarketContext) -> Signal:
     if risk_atr < params.min_risk_atr:
         return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: stop dentro do ruído",
-                      [], [f"risco {risk_atr:.2f} ATR < {params.min_risk_atr}"], [])
+                      [], [f"risco {risk_atr:.2f} ATR < {params.min_risk_atr}"])
 
     # ── 7. Alvo ──
     if params.target_mode == "FIXED_RR":
@@ -2606,7 +2606,7 @@ def tpo_vwap_signal(context: MarketContext) -> Signal:
     if actual_rr < params.minimum_rr:
         return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: R/R abaixo do mínimo",
-                      [], [f"R/R {actual_rr:.2f} < {params.minimum_rr}"], [])
+                      [], [f"R/R {actual_rr:.2f} < {params.minimum_rr}"])
 
     # ── 8. Score ──
     vwap_score = 1.0 if abs(context.vwap_distance_pct) >= params.vwap_min_distance_pct * 2 else 0.5
@@ -2629,7 +2629,7 @@ def tpo_vwap_signal(context: MarketContext) -> Signal:
     if score < params.minimum_signal_score:
         return Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
                       f"NO_TRADE: score {score:.0f} < {params.minimum_signal_score:.0f}",
-                      [], [f"score insuficiente"], [])
+                      [], [f"score insuficiente"])
 
     # ── 9. Montar reasons e alerts ──
     reasons = [
@@ -2683,7 +2683,7 @@ def chatgpt_signal(context: MarketContext) -> Signal:
         ema21 = float(context.emas["ema_21"].iloc[-1])
     except (KeyError, IndexError, TypeError):
         return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
-                      "NO_TRADE: EMAs indisponíveis", [], ["sem dados EMA"], [])
+                      "NO_TRADE: EMAs indisponíveis", [], ["sem dados EMA"])
 
     # Tendência de alta: preço > EMA200, EMA21 > EMA200
     tendencia_alta = price > ema200 and ema21 > ema200
@@ -2693,7 +2693,7 @@ def chatgpt_signal(context: MarketContext) -> Signal:
     if not tendencia_alta and not tendencia_baixa:
         return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: sem tendência definida",
-                      [], [f"preço={price:.2f}, EMA21={ema21:.2f}, EMA200={ema200:.2f}"], [])
+                      [], [f"preço={price:.2f}, EMA21={ema21:.2f}, EMA200={ema200:.2f}"])
 
     # ── 2. Filtro de lateralização ──
     if params.chatgpt_filtrar_lateral:
@@ -2705,7 +2705,7 @@ def chatgpt_signal(context: MarketContext) -> Signal:
                 if ema21_var < 0.1:
                     return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
                                   "NO_TRADE: lateralização (EMA21 horizontal)",
-                                  [], [f"EMA21 variação {ema21_var:.3f}% < 0.1%"], [])
+                                  [], [f"EMA21 variação {ema21_var:.3f}% < 0.1%"])
         except (KeyError, IndexError, TypeError):
             pass  # sem dados de EMA, pula o filtro
 
@@ -2714,13 +2714,13 @@ def chatgpt_signal(context: MarketContext) -> Signal:
     volume_media = float(df["volume"].tail(params.chatgpt_volume_media_periodo).mean())
     if volume_media <= 0:
         return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
-                      "NO_TRADE: volume médio zero", [], ["sem dados volume"], [])
+                      "NO_TRADE: volume médio zero", [], ["sem dados volume"])
 
     volume_ratio = volume_atual / volume_media
     if volume_ratio < params.chatgpt_volume_min_ratio:
         return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: volume abaixo do mínimo",
-                      [], [f"volume {volume_ratio:.2f}× < {params.chatgpt_volume_min_ratio}×"], [])
+                      [], [f"volume {volume_ratio:.2f}× < {params.chatgpt_volume_min_ratio}×"])
 
     # ── 4. Direção ──
     if tendencia_alta:
@@ -2734,23 +2734,23 @@ def chatgpt_signal(context: MarketContext) -> Signal:
     vwap = context.vwap
     if vwap <= 0:
         return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
-                      "NO_TRADE: VWAP indisponível", [], ["sem VWAP"], [])
+                      "NO_TRADE: VWAP indisponível", [], ["sem VWAP"])
 
     vwap_dist = context.vwap_distance_pct
     if direction == Direction.BUY and vwap_dist < 0:
         return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: preço abaixo da VWAP em tendência de alta",
-                      [], [f"distância VWAP {vwap_dist:.2f}%"], [])
+                      [], [f"distância VWAP {vwap_dist:.2f}%"])
     if direction == Direction.SELL and vwap_dist > 0:
         return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: preço acima da VWAP em tendência de baixa",
-                      [], [f"distância VWAP {vwap_dist:.2f}%"], [])
+                      [], [f"distância VWAP {vwap_dist:.2f}%"])
 
     # ── 6. Stop estrutural ──
     atr = context.atr
     if atr <= 0:
         return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
-                      "NO_TRADE: ATR indisponível", [], ["sem ATR"], [])
+                      "NO_TRADE: ATR indisponível", [], ["sem ATR"])
 
     if direction == Direction.BUY:
         # Stop abaixo do fundo do pullback + folga ATR
@@ -2768,7 +2768,7 @@ def chatgpt_signal(context: MarketContext) -> Signal:
     risk = abs(price - stop)
     if risk <= 0:
         return Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
-                      "NO_TRADE: stop inválido", [], ["risco zero"], [])
+                      "NO_TRADE: stop inválido", [], ["risco zero"])
 
     # ── 7. Alvo ──
     rr = params.chatgpt_rr_alvo
@@ -3043,7 +3043,7 @@ def renko_touro_urso_signal(context: MarketContext) -> Signal:
     # Verifica se o setup está habilitado
     if not params.renko_touro_urso_enabled:
         return Signal("RENKO_TOURO_URSO", Direction.NEUTRAL, 0, 0,
-                      "NO_TRADE: setup desabilitado", [], [], [])
+                      "NO_TRADE: setup desabilitado", [], [])
 
     df = context.df
     n = params.renko_n
@@ -3054,7 +3054,7 @@ def renko_touro_urso_signal(context: MarketContext) -> Signal:
     if len(bricks) < params.renko_lookback_tentativa + 2:
         return Signal("RENKO_TOURO_URSO", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: poucos tijolos",
-                      [], [f"{len(bricks)} tijolos < {params.renko_lookback_tentativa + 2}"], [])
+                      [], [f"{len(bricks)} tijolos < {params.renko_lookback_tentativa + 2}"])
 
     # ── 2. Média dos fechamentos dos tijolos ──
     closes = [b.close for b in bricks]
@@ -3066,7 +3066,7 @@ def renko_touro_urso_signal(context: MarketContext) -> Signal:
     vwap = compute_renko_vwap(df, ultimo_tijolo.timestamp)
     if vwap <= 0:
         return Signal("RENKO_TOURO_URSO", Direction.NEUTRAL, 0, 0,
-                      "NO_TRADE: VWAP indisponível", [], [], [])
+                      "NO_TRADE: VWAP indisponível", [], [])
 
     # ── 4. Verifica janela de entrada ──
     from zoneinfo import ZoneInfo
@@ -3076,7 +3076,7 @@ def renko_touro_urso_signal(context: MarketContext) -> Signal:
     if not (janela_inicio <= agora.time() <= janela_fim):
         return Signal("RENKO_TOURO_URSO", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: fora da janela de entrada",
-                      [], [f"janela {params.renko_janela_inicio}-{params.renko_janela_fim}"], [])
+                      [], [f"janela {params.renko_janela_inicio}-{params.renko_janela_fim}"])
 
     # ── 5. Lógica do sinal ──
     tijolo_atual = bricks[-1]
@@ -3125,7 +3125,7 @@ def renko_touro_urso_signal(context: MarketContext) -> Signal:
     else:
         return Signal("RENKO_TOURO_URSO", Direction.NEUTRAL, 0, 0,
                       "NO_TRADE: sem sinal",
-                      [], ["Condições de TOURO/URSO não atendidas"], [])
+                      [], ["Condições de TOURO/URSO não atendidas"])
 
     # ── 6. Preços de entrada, stop e alvo ──
     entrada = tijolo_atual.close  # fechamento do tijolo (ordem STOP)
@@ -3612,10 +3612,10 @@ def analyze(
     confluence = confluence_signal(context, isolated, rsi)
     # Setup TPO/VWAP: DESATIVADO (código mantido, retorna NEUTRO)
     tpo_vwap = Signal("TPO/VWAP", Direction.NEUTRAL, 0, 0,
-                      "NO_TRADE: setup desabilitado", [], [], [])
+                      "NO_TRADE: setup desabilitado", [], [])
     # Setup CHATGPT: DESATIVADO (código mantido, retorna NEUTRO)
     chatgpt = Signal("CHATGPT", Direction.NEUTRAL, 0, 0,
-                     "NO_TRADE: setup desabilitado", [], [], [])
+                     "NO_TRADE: setup desabilitado", [], [])
     # Setup RENKO_TOURO_URSO: tijolos Renko NR + média + VWAP
     renko_touro_urso = renko_touro_urso_signal(context)
     signals = [confluence, *isolated, rsi, tpo_vwap, chatgpt, renko_touro_urso]
